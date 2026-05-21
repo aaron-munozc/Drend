@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tauri_plugin_http::reqwest::Client;
 use tokio::sync::mpsc;
+use crate::core::types::{ChatMetadata, Platform};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskStatus {

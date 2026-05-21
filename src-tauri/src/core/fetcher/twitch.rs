@@ -189,16 +189,17 @@ impl TwitchFetcher {
             }
         }
 
-        let username = video.owner.and_then(|o| o.display_name.or(o.login)).unwrap_or_default();
+        // 1. Add `.as_ref()` here so video.owner isn't destroyed
+        let username = video.owner.as_ref().and_then(|o| o.display_name.clone().or(o.login.clone())).unwrap_or_default();
         let thumbnail = video.thumbnail_urls.and_then(|mut urls| urls.pop());
 
+        // 2. Now video.owner is still alive and well to be borrowed a second time here
         let channel_slug = video.owner.as_ref().and_then(|o| o.login.clone()).unwrap_or_default();
         let chat_info = Some(ChatMetadata {
             chat_id: video_id.to_string(),
             channel_slug,
             platform: Platform::Twitch,
         });
-
         Ok(Some(UnifiedMetadata {
             platform: Platform::Twitch,
             media_type: MediaType::Vod,
@@ -212,6 +213,7 @@ impl TwitchFetcher {
         }))
     }
     /// Fetches Clip Data directly via GraphQL and extracts MP4 direct links
+    /// Fetches Clip Data directly via GraphQL and extracts MP4 direct links
     async fn fetch_clip(&self, client: &Client, slug: &str) -> AppResult<Option<UnifiedMetadata>> {
         let body = format!(
             r#"{{"query":"query($slug: ID!) {{ clip(slug: $slug) {{ id title durationSeconds thumbnailURL broadcaster {{ displayName login }} videoQualities {{ frameRate quality sourceURL }} }} }}","variables":{{"slug":"{}"}}}}"#,
@@ -222,7 +224,6 @@ impl TwitchFetcher {
             .header("Client-ID", TWITCH_CLIENT_ID)
             .body(body)
             .send().await?;
-
 
         let bytes = resp.bytes().await?;
         let parsed: GqlResponse<GqlClipData> = serde_json::from_slice(&bytes)?;
@@ -247,17 +248,27 @@ impl TwitchFetcher {
             }
         }
 
-        let username = clip.broadcaster.and_then(|b| b.display_name.or(b.login)).unwrap_or_default();
+        let username = clip.broadcaster.as_ref().and_then(|b| b.display_name.clone().or(b.login.clone())).unwrap_or_default();
+        let channel_slug = clip.broadcaster.as_ref().and_then(|b| b.login.clone()).unwrap_or_default();
+
+        // Define unique tracking context for Twitch Clip chat processing
+        let clip_id = clip.id.unwrap_or_else(|| slug.to_string());
+        let chat_info = Some(ChatMetadata {
+            chat_id: clip_id.clone(),
+            channel_slug,
+            platform: Platform::Twitch,
+        });
 
         Ok(Some(UnifiedMetadata {
             platform: Platform::Twitch,
             media_type: MediaType::Clip,
-            id: clip.id.unwrap_or_else(|| slug.to_string()),
+            id: clip_id,
             title: clip.title.unwrap_or_else(|| format!("Clip by {}", username)),
             username,
             thumbnail_url: clip.thumbnail_url,
             duration_ms: (clip.duration_seconds.unwrap_or(0.0) * 1000.0) as u64,
-            qualities, // Clips can have an array of MP4 choices!
+            qualities,
+            chat_info,
         }))
     }
 }

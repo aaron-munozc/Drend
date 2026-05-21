@@ -1,6 +1,5 @@
 use tauri::State;
-use crate::core::download::manager::{DownloadManager, DownloadTask};
-use crate::core::fetcher::types::ChatMetadata;
+use crate::core::types::ChatMetadata;
 use crate::types::AppResult;
 
 #[tauri::command]

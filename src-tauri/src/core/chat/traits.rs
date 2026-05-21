@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use tauri_plugin_http::reqwest::Client;
 use crate::types::AppResult;
 
@@ -15,6 +16,8 @@ pub trait ChatDownloader: Send + Sync {
         client: &Client,
         chat_id: &str,
         channel_slug: &str,
+        start_time: DateTime<Utc>,
+        duration_ms: u64,
         output_path: &std::path::Path,
         progress_callback: Box<dyn Fn(ChatProgressPayload) + Send + Sync>,
     ) -> AppResult<()>;

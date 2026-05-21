@@ -1,5 +1,5 @@
 mod fetcher;
-mod types;
+pub mod types;
 mod traits;
 mod twitch;
 mod kick;

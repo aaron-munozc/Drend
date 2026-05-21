@@ -9,7 +9,6 @@ use crate::core::fetcher::types::{ChatMetadata, MediaType, Platform, StreamQuali
 use crate::core::fetcher::types::kick::{ChannelField, KickVideoResponse};
 use crate::types::AppResult;
 
-
 // --- Internal Routing Enum ---
 #[derive(Debug, PartialEq, Eq)]
 enum KickStream {
@@ -19,7 +18,6 @@ enum KickStream {
 }
 
 // --- Clip API Structures (v2) ---
-// Since this wasn't in your old types.rs, we define it here specifically for the Clip fetcher
 #[derive(Debug, Deserialize)]
 struct KickClipResponse {
     pub clip: KickClipData,
@@ -29,10 +27,12 @@ struct KickClipResponse {
 struct KickClipData {
     pub id: String,
     pub title: String,
-    pub video_url: String, // Direct MP4 link
-    pub duration: f32,     // Usually in seconds
+    pub video_url: String,
+    pub duration: f32,
     pub thumbnail_url: Option<String>,
     pub channel: KickClipChannel,
+    pub channel_id: u64, // 🟢 We need this for the chat_id
+    pub started_at: String, // 🟢 Kept here in case you add it to UnifiedMetadata later
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,32 +119,49 @@ impl KickFetcher {
         if !resp.status().is_success() {
             return Ok(None);
         }
+
         let bytes = resp.bytes().await?;
         let parsed: KickVideoResponse = serde_json::from_slice(&bytes)?;
-        let mut chat_info = None;
 
         let playback_url = parsed.playback_url.or(parsed.source).unwrap_or_default();
 
-        let (title, username, duration, thumbnail) = match parsed.livestream {
-            Some(ls) => {
-                let uname = match &ls.channel {
-                    Some(ChannelField::Obj(ch)) => {
-                        // Extract chat information if object is fully populated
-                        if let (Some(c_id), Some(slug)) = (ch.chatroom.as_ref().and_then(|c| c.id), &ch.slug) {
-                            chat_info = Some(ChatMetadata {
-                                chat_id: c_id.to_string(),
-                                channel_slug: slug.clone(),
-                                platform: Platform::Kick,
-                            });
-                        }
-                        ch.user.as_ref().and_then(|u| u.username.clone()).unwrap_or_default()
-                    },
-                    _ => "Unknown".to_string(),
-                };
-                (ls.session_title.unwrap_or_default(), uname, ls.duration.unwrap_or(0), ls.thumbnail)
+        // Safely extract the livestream object
+        let livestream_data = parsed.livestream.unwrap_or_default();
+
+        let title = livestream_data.session_title.clone().unwrap_or_else(|| "Kick VOD".to_string());
+        let thumbnail = livestream_data.thumbnail.clone();
+
+        // 🟢 FIX 1: Extract timing info to handle the "duration == 0" live edge case
+        let is_live = livestream_data.is_live.unwrap_or(false);
+        let raw_duration = livestream_data.duration.unwrap_or(0);
+        let start_time_str = livestream_data.start_time.clone().unwrap_or_default();
+
+        let duration_ms = if is_live && raw_duration == 0 {
+            if let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(&start_time_str) {
+                let elapsed = chrono::Utc::now().signed_duration_since(start_dt.with_timezone(&chrono::Utc));
+                elapsed.num_milliseconds().max(0) as u64
+            } else {
+                0
             }
-            None => ("Kick VOD".to_string(), "Unknown".to_string(), 0, None),
+        } else {
+            (raw_duration * 1000) as u64
         };
+
+        let mut username = "Unknown".to_string();
+        let mut chat_info = None;
+
+        if let Some(ChannelField::Obj(ch)) = livestream_data.channel {
+            username = ch.user.as_ref().and_then(|u| u.username.clone()).unwrap_or_else(|| "Unknown".to_string());
+
+            // 🟢 FIX 2: Use the numeric channel ID for Kick's Chatroom handle
+            if let Some(c_id) = ch.id {
+                chat_info = Some(ChatMetadata {
+                    chat_id: c_id.to_string(),
+                    channel_slug: ch.slug.clone().unwrap_or_default(),
+                    platform: Platform::Kick,
+                });
+            }
+        }
 
         Ok(Some(UnifiedMetadata {
             platform: Platform::Kick,
@@ -153,7 +170,7 @@ impl KickFetcher {
             title,
             username,
             thumbnail_url: thumbnail,
-            duration_ms: (duration * 1000) as u64,
+            duration_ms,
             qualities: vec![
                 StreamQuality {
                     index: 0,
@@ -182,6 +199,15 @@ impl KickFetcher {
         let bytes = resp.bytes().await?;
         let parsed: KickClipResponse = serde_json::from_slice(&bytes)?;
 
+        let channel_slug = parsed.clip.channel.username.clone();
+
+        // 🟢 FIX 3: Pass Clip's channel_id as the unique chat handle
+        let chat_info = Some(ChatMetadata {
+            chat_id: parsed.clip.channel_id.to_string(),
+            channel_slug,
+            platform: Platform::Kick,
+        });
+
         Ok(Some(UnifiedMetadata {
             platform: Platform::Kick,
             media_type: MediaType::Clip,
@@ -189,14 +215,15 @@ impl KickFetcher {
             title: parsed.clip.title,
             username: parsed.clip.channel.username,
             thumbnail_url: parsed.clip.thumbnail_url,
-            duration_ms: parsed.clip.duration as u64,
+            duration_ms: (parsed.clip.duration * 1000.0) as u64, // Normalized safely to ms
             qualities: vec![
                 StreamQuality {
                     index: 0,
                     label: "Source MP4".to_string(),
-                    download_url: parsed.clip.video_url, // For Clips, this is the direct .mp4 file
+                    download_url: parsed.clip.video_url,
                 }
             ],
+            chat_info,
         }))
     }
 }

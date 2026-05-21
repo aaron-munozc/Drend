@@ -96,6 +96,12 @@ impl From<tauri_plugin_http::reqwest::Error> for AppError {
     }
 }
 
+impl From<std::io::Error> for AppError {
+    fn from(e: std::io::Error) -> Self {
+        Self::FileIo(e.to_string())
+    }
+}
+
 
 fn to_s<S, T>(err: &T, s: S) -> Result<S::Ok, S::Error>
 where S: serde::Serializer, T: std::fmt::Display {

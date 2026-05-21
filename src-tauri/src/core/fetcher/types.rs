@@ -205,7 +205,6 @@ pub mod kick {
         pub playback_url: Option<String>,
         pub livestream: Option<Livestream>,
     }
-
     #[derive(Debug, Deserialize, Clone)]
     pub struct KickChannelResponse {
         pub id: Option<i64>,
