@@ -9,6 +9,7 @@
     "core:default",
     "opener:default",
     "log:default",
-    "http:default"
+    "http:default",
+    "dialog:default"
   ]
 }

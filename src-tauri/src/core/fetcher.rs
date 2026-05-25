@@ -1,8 +1,7 @@
 mod fetcher;
-pub mod types;
+mod kick;
 mod traits;
 mod twitch;
-mod kick;
-
+pub mod types;
 
 pub use fetcher::analyze_stream_url;

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -26,9 +27,11 @@ impl fmt::Display for Platform {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMetadata {
-    pub chat_id: String,       // Opaque backend handle (Twitch VOD ID or Kick Chatroom ID)
-    pub channel_slug: String,  // Needed for certain platform endpoints
+    pub chat_id: String, // Opaque backend handle (Twitch VOD ID or Kick Chatroom ID)
+    pub channel_slug: String, // Needed for certain platform endpoints
     pub platform: Platform,
+    pub start_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,24 +90,46 @@ where
     match v {
         Value::String(s) => {
             let s = s.trim();
-            if s.is_empty() { return Ok(None); }
-            if s.contains(' ') && s.contains('w') { Ok(parse_srcset(s)) } else { Ok(Some(s.to_string())) }
+            if s.is_empty() {
+                return Ok(None);
+            }
+            if s.contains(' ') && s.contains('w') {
+                Ok(parse_srcset(s))
+            } else {
+                Ok(Some(s.to_string()))
+            }
         }
         Value::Object(map) => {
-            let best_link = map.get("responsive").or_else(|| map.get("srcset"))
-                .and_then(|v| v.as_str()).and_then(|s| parse_srcset(s));
-            if best_link.is_some() { return Ok(best_link); }
-            let fallback = map.get("url").or_else(|| map.get("src"))
-                .and_then(|v| v.as_str()).map(|s| s.to_string());
-            if fallback.is_some() { return Ok(fallback); }
-            let any_url = map.values().filter_map(|v| v.as_str())
-                .find(|s| s.starts_with("http")).map(|s| s.to_string());
+            let best_link = map
+                .get("responsive")
+                .or_else(|| map.get("srcset"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_srcset(s));
+            if best_link.is_some() {
+                return Ok(best_link);
+            }
+            let fallback = map
+                .get("url")
+                .or_else(|| map.get("src"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if fallback.is_some() {
+                return Ok(fallback);
+            }
+            let any_url = map
+                .values()
+                .filter_map(|v| v.as_str())
+                .find(|s| s.starts_with("http"))
+                .map(|s| s.to_string());
             Ok(any_url)
         }
         Value::Array(arr) => {
             let found = arr.iter().find_map(|item| match item {
                 Value::String(s) if s.starts_with("http") => Some(s.to_string()),
-                Value::Object(_) => item.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                Value::Object(_) => item
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 _ => None,
             });
             Ok(found)

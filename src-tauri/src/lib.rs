@@ -1,11 +1,12 @@
+use crate::core::*;
+use crate::types::AppState;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::http::{HeaderMap, HeaderValue};
-use tauri_plugin_http::reqwest::Client;
+use tauri::Manager;
 use tauri_plugin_http::reqwest::cookie::Jar;
+use tauri_plugin_http::reqwest::Client;
 use tauri_plugin_log::fern::colors::{Color, ColoredLevelConfig};
-use crate::core::*;
-use crate::types::AppState;
 
 mod core;
 mod error;
@@ -70,8 +71,8 @@ pub fn run() {
     let client = Client::builder()
         .default_headers(headers)
         .cookie_provider(jar.clone())
-        .timeout(Duration::from_secs(30))         // Added from old code
-        .pool_max_idle_per_host(10)               // Added from old code
+        .timeout(Duration::from_secs(30)) // Added from old code
+        .pool_max_idle_per_host(10) // Added from old code
         .http2_adaptive_window(true)
         .build()
         .expect("Failed to build client");
@@ -79,11 +80,23 @@ pub fn run() {
     let app_state = AppState { client };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .plugin(log_plugin.build())
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
-        .invoke_handler(tauri::generate_handler![analyze_stream_url])
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            let client = app.state::<AppState>().client.clone();
+            let manager = TaskManager::new(app_handle, client);
+            app.manage(manager);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            analyze_stream_url,
+            queue_chat_download,
+            get_download_queue
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

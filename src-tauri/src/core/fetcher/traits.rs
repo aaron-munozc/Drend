@@ -1,6 +1,6 @@
-use tauri_plugin_http::reqwest::Client;
 use crate::core::fetcher::types::UnifiedMetadata;
 use crate::types::AppResult;
+use tauri_plugin_http::reqwest::Client;
 
 #[async_trait::async_trait]
 pub trait MetadataFetcher: Send + Sync {

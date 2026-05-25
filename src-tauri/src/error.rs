@@ -3,6 +3,7 @@ use thiserror::Error;
 
 /// Combined Error type.
 /// The serde attributes here replace the need for a separate ErrorKind enum.
+#[allow(dead_code)]
 #[derive(Debug, Error, Serialize)]
 #[serde(tag = "kind", content = "message", rename_all = "camelCase")]
 pub enum AppError {
@@ -31,7 +32,11 @@ pub enum AppError {
     InvalidQualityIndex(usize),
 
     #[error("JSON error: {0}")]
-    Json(#[from] #[serde(serialize_with = "to_s")] serde_json::Error),
+    Json(
+        #[from]
+        #[serde(serialize_with = "to_s")]
+        serde_json::Error,
+    ),
 
     #[error("Parquet deserialization failed: {0}")]
     Parquet(String),
@@ -83,12 +88,15 @@ pub enum AppError {
     EmoteCache(String),
 
     #[error("Image error: {0}")]
-    Image(String),
+    Image(
+        #[from]
+        #[serde(serialize_with = "to_s")]
+        image::ImageError,
+    ),
 
     #[error("Error: {0}")]
     Generic(String),
 }
-
 
 impl From<tauri_plugin_http::reqwest::Error> for AppError {
     fn from(e: tauri_plugin_http::reqwest::Error) -> Self {
@@ -102,18 +110,26 @@ impl From<std::io::Error> for AppError {
     }
 }
 
-
 fn to_s<S, T>(err: &T, s: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer, T: std::fmt::Display {
+where
+    S: serde::Serializer,
+    T: std::fmt::Display,
+{
     s.serialize_str(&err.to_string())
 }
 
+#[allow(dead_code)]
 pub trait Contextualize<T> {
-    fn with_context<F>(self, f: F) -> Result<T, AppError> where F: FnOnce(String) -> AppError;
+    fn with_context<F>(self, f: F) -> Result<T, AppError>
+    where
+        F: FnOnce(String) -> AppError;
 }
 
 impl<T, E: std::fmt::Display> Contextualize<T> for Result<T, E> {
-    fn with_context<F>(self, f: F) -> Result<T, AppError> where F: FnOnce(String) -> AppError {
+    fn with_context<F>(self, f: F) -> Result<T, AppError>
+    where
+        F: FnOnce(String) -> AppError,
+    {
         self.map_err(|e| f(e.to_string()))
     }
 }

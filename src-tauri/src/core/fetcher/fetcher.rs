@@ -12,10 +12,8 @@ pub async fn analyze_stream_url(
     let client = &client_state.client;
 
     // Register your platform processing strategies
-    let fetchers: Vec<Box<dyn MetadataFetcher>> = vec![
-        Box::new(TwitchFetcher),
-        Box::new(KickFetcher),
-    ];
+    let fetchers: Vec<Box<dyn MetadataFetcher>> =
+        vec![Box::new(TwitchFetcher), Box::new(KickFetcher)];
 
     // Find the first processing pipeline that recognizes the domain layout
     for fetcher in fetchers {
@@ -25,6 +23,9 @@ pub async fn analyze_stream_url(
         }
     }
 
-    log::warn!("User provided an unsupported streaming address link signature: {}", url);
+    log::warn!(
+        "User provided an unsupported streaming address link signature: {}",
+        url
+    );
     Ok(None)
 }

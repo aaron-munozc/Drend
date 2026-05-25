@@ -5,10 +5,9 @@ use url::Url;
 use urlencoding::encode;
 
 use crate::core::fetcher::traits::MetadataFetcher;
-use crate::core::fetcher::types::{ChatMetadata, MediaType, Platform, StreamQuality, UnifiedMetadata};
-use crate::core::fetcher::types::kick::KickVideoResponse;
-use crate::core::fetcher::types::twitch::{
-    GqlClipData, GqlResponse, GqlVideoData, GqlVideoTokenData, TwitchAccessTokenResponse,
+use crate::core::fetcher::types::twitch::{GqlClipData, GqlResponse, GqlVideoData};
+use crate::core::fetcher::types::{
+    ChatMetadata, MediaType, Platform, StreamQuality, UnifiedMetadata,
 };
 use crate::error::AppError;
 use crate::types::AppResult;
@@ -45,7 +44,10 @@ impl MetadataFetcher for TwitchFetcher {
                 self.fetch_clip(client, &slug).await
             }
             TwitchStream::Invalid => {
-                warn!("URL provided is not a supported Twitch VOD or Clip: {}", url);
+                warn!(
+                    "URL provided is not a supported Twitch VOD or Clip: {}",
+                    url
+                );
                 Ok(None)
             }
         }
@@ -93,17 +95,23 @@ impl TwitchFetcher {
     /// Fetches VOD Data, resolves Usher token with legacy fallback, and extracts the M3U8 Master qualities
     /// Fetches VOD Data, resolves Usher token with legacy fallback, and extracts the M3U8 Master qualities
     /// Fetches VOD Data, resolves Usher token, and extracts the M3U8 Master qualities
-    async fn fetch_vod(&self, client: &Client, video_id: &str) -> AppResult<Option<UnifiedMetadata>> {
+    async fn fetch_vod(
+        &self,
+        client: &Client,
+        video_id: &str,
+    ) -> AppResult<Option<UnifiedMetadata>> {
         // 1. Fetch Video Metadata
         let metadata_body = format!(
             r#"{{"query":"query{{video(id:\"{}\"){{title,thumbnailURLs(height:720,width:1280),lengthSeconds,owner{{id,displayName,login}}}}}}","variables":{{}}}}"#,
             video_id
         );
 
-        let meta_resp = client.post(TWITCH_GQL_URL)
+        let meta_resp = client
+            .post(TWITCH_GQL_URL)
             .header("Client-ID", TWITCH_CLIENT_ID)
             .body(metadata_body)
-            .send().await?;
+            .send()
+            .await?;
 
         let bytes = meta_resp.bytes().await?;
         let meta_data: GqlResponse<GqlVideoData> = serde_json::from_slice(&bytes)?;
@@ -123,10 +131,12 @@ impl TwitchFetcher {
         let mut token_value: Option<String> = None;
 
         // Sent with ONLY the Client-ID, exactly like the old code.
-        let token_resp = client.post(TWITCH_GQL_URL)
+        let token_resp = client
+            .post(TWITCH_GQL_URL)
             .header("Client-ID", TWITCH_CLIENT_ID)
             .body(token_body)
-            .send().await?;
+            .send()
+            .await?;
 
         // Read as text first so we can log it if it fails!
         let token_text = token_resp.text().await?;
@@ -135,20 +145,37 @@ impl TwitchFetcher {
             if let Some(tok_obj) = v.pointer("/data/videoPlaybackAccessToken") {
                 if tok_obj.is_null() {
                     log::warn!("Twitch returned null for the access token! Is this VOD Sub-only or deleted? Response: {}", token_text);
-                } else if let (Some(value), Some(sig)) = (tok_obj.get("value"), tok_obj.get("signature")) {
+                } else if let (Some(value), Some(sig)) =
+                    (tok_obj.get("value"), tok_obj.get("signature"))
+                {
                     token_value = value.as_str().map(|s| s.to_string());
                     signature = sig.as_str().map(|s| s.to_string());
                 }
             } else {
-                log::error!("GQL Response did not contain videoPlaybackAccessToken. Raw: {}", token_text);
+                log::error!(
+                    "GQL Response did not contain videoPlaybackAccessToken. Raw: {}",
+                    token_text
+                );
             }
         } else {
-            log::error!("Failed to parse Twitch GQL response as JSON. Raw: {}", token_text);
+            log::error!(
+                "Failed to parse Twitch GQL response as JSON. Raw: {}",
+                token_text
+            );
         }
 
         // Validate final parsing results explicitly before execution
-        let sig = signature.ok_or_else(|| AppError::Http(format!("Failed to retrieve VOD token signature. Check terminal logs! Raw: {}", token_text).into()))?;
-        let token = token_value.ok_or_else(|| AppError::Http("Failed to retrieve VOD token string value.".into()))?;
+        let sig = signature.ok_or_else(|| {
+            AppError::Http(
+                format!(
+                    "Failed to retrieve VOD token signature. Check terminal logs! Raw: {}",
+                    token_text
+                )
+                .into(),
+            )
+        })?;
+        let token = token_value
+            .ok_or_else(|| AppError::Http("Failed to retrieve VOD token string value.".into()))?;
 
         // 3. Construct Usher URL and Fetch Master Playlist
         let master_url = format!(
@@ -169,7 +196,11 @@ impl TwitchFetcher {
             if trimmed.starts_with("#EXT-X-STREAM-INF:") {
                 if let Some(vid_caps) = video_re.captures(trimmed) {
                     let vid = vid_caps.get(1).unwrap().as_str();
-                    current_label = if vid == "chunked" { "Source (Auto)".to_string() } else { vid.to_string() };
+                    current_label = if vid == "chunked" {
+                        "Source (Auto)".to_string()
+                    } else {
+                        vid.to_string()
+                    };
                 } else if let Some(res_caps) = res_re.captures(trimmed) {
                     current_label = res_caps.get(1).unwrap().as_str().to_string();
                 }
@@ -177,7 +208,11 @@ impl TwitchFetcher {
                 let download_url = if trimmed.starts_with("http") {
                     trimmed.to_string()
                 } else {
-                    Url::parse(&master_url).unwrap().join(trimmed).unwrap().to_string()
+                    Url::parse(&master_url)
+                        .unwrap()
+                        .join(trimmed)
+                        .unwrap()
+                        .to_string()
                 };
 
                 qualities.push(StreamQuality {
@@ -190,15 +225,26 @@ impl TwitchFetcher {
         }
 
         // 1. Add `.as_ref()` here so video.owner isn't destroyed
-        let username = video.owner.as_ref().and_then(|o| o.display_name.clone().or(o.login.clone())).unwrap_or_default();
+        let username = video
+            .owner
+            .as_ref()
+            .and_then(|o| o.display_name.clone().or(o.login.clone()))
+            .unwrap_or_default();
         let thumbnail = video.thumbnail_urls.and_then(|mut urls| urls.pop());
 
         // 2. Now video.owner is still alive and well to be borrowed a second time here
-        let channel_slug = video.owner.as_ref().and_then(|o| o.login.clone()).unwrap_or_default();
+        let channel_slug = video
+            .owner
+            .as_ref()
+            .and_then(|o| o.login.clone())
+            .unwrap_or_default();
+        let duration_ms = (video.length_seconds.unwrap_or(0) * 1000) as u64;
         let chat_info = Some(ChatMetadata {
             chat_id: video_id.to_string(),
             channel_slug,
             platform: Platform::Twitch,
+            start_time: None,
+            duration_ms,
         });
         Ok(Some(UnifiedMetadata {
             platform: Platform::Twitch,
@@ -207,7 +253,7 @@ impl TwitchFetcher {
             title: video.title.unwrap_or_else(|| format!("{} VOD", username)),
             username,
             thumbnail_url: thumbnail,
-            duration_ms: (video.length_seconds.unwrap_or(0) * 1000) as u64,
+            duration_ms,
             qualities,
             chat_info,
         }))
@@ -220,10 +266,12 @@ impl TwitchFetcher {
             slug
         );
 
-        let resp = client.post(TWITCH_GQL_URL)
+        let resp = client
+            .post(TWITCH_GQL_URL)
             .header("Client-ID", TWITCH_CLIENT_ID)
             .body(body)
-            .send().await?;
+            .send()
+            .await?;
 
         let bytes = resp.bytes().await?;
         let parsed: GqlResponse<GqlClipData> = serde_json::from_slice(&bytes)?;
@@ -238,7 +286,11 @@ impl TwitchFetcher {
         if let Some(vq_list) = clip.video_qualities {
             for vq in vq_list {
                 if let Some(source_url) = vq.source_url {
-                    let label = format!("{}p{}", vq.quality.unwrap_or_default(), vq.frame_rate.unwrap_or(30.0) as u32);
+                    let label = format!(
+                        "{}p{}",
+                        vq.quality.unwrap_or_default(),
+                        vq.frame_rate.unwrap_or(30.0) as u32
+                    );
                     qualities.push(StreamQuality {
                         index: qualities.len(),
                         label,
@@ -248,25 +300,38 @@ impl TwitchFetcher {
             }
         }
 
-        let username = clip.broadcaster.as_ref().and_then(|b| b.display_name.clone().or(b.login.clone())).unwrap_or_default();
-        let channel_slug = clip.broadcaster.as_ref().and_then(|b| b.login.clone()).unwrap_or_default();
+        let username = clip
+            .broadcaster
+            .as_ref()
+            .and_then(|b| b.display_name.clone().or(b.login.clone()))
+            .unwrap_or_default();
+        let channel_slug = clip
+            .broadcaster
+            .as_ref()
+            .and_then(|b| b.login.clone())
+            .unwrap_or_default();
 
         // Define unique tracking context for Twitch Clip chat processing
         let clip_id = clip.id.unwrap_or_else(|| slug.to_string());
+        let duration_ms = (clip.duration_seconds.unwrap_or(0.0) * 1000.0) as u64;
         let chat_info = Some(ChatMetadata {
             chat_id: clip_id.clone(),
             channel_slug,
             platform: Platform::Twitch,
+            start_time: None,
+            duration_ms,
         });
 
         Ok(Some(UnifiedMetadata {
             platform: Platform::Twitch,
             media_type: MediaType::Clip,
             id: clip_id,
-            title: clip.title.unwrap_or_else(|| format!("Clip by {}", username)),
+            title: clip
+                .title
+                .unwrap_or_else(|| format!("Clip by {}", username)),
             username,
             thumbnail_url: clip.thumbnail_url,
-            duration_ms: (clip.duration_seconds.unwrap_or(0.0) * 1000.0) as u64,
+            duration_ms,
             qualities,
             chat_info,
         }))
