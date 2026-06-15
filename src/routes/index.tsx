@@ -1,39 +1,91 @@
-import { createFileRoute } from '@tanstack/react-router';
-import { DownloadManager } from '../features/downloads/components/DownloadManager';
+import { createFileRoute } from "@tanstack/react-router";
+import { Plus, X, Loader2, AlertCircle } from "lucide-react";
+import { useTabStore } from "@/store/useTabStore.ts";
+import { StreamInput } from "@/features/downloads/components/StreamInput.tsx";
+import { StreamDetails } from "@/features/downloads/components/StreamDetails.tsx";
 
-export const Route = createFileRoute('/')({
-  component: IndexPage,
+export const Route = createFileRoute("/")({
+	component: IndexPage,
 });
 
 function IndexPage() {
-  return (
-    <div className="min-h-screen bg-zinc-950 text-white">
-      {/* Top bar */}
-      <header className="border-b border-zinc-800/60 px-6 py-4 flex items-center gap-3">
-        <div className="flex items-center gap-2">
-          <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-600">
-            <svg className="h-4 w-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
-            </svg>
-          </span>
-          <span className="text-sm font-semibold text-white tracking-tight">Stream Downloader</span>
-        </div>
-        <span className="ml-2 rounded-full border border-zinc-700 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400">
-          dev
-        </span>
-      </header>
+	const { tabs, activeTabId, addTab, closeTab, setActiveTab } = useTabStore();
 
-      {/* Page content */}
-      <main className="mx-auto max-w-6xl px-6 py-8">
-        <div className="mb-7">
-          <h1 className="text-xl font-bold text-white tracking-tight">Chat Downloads</h1>
-          <p className="text-sm text-zinc-500 mt-1">
-            Queue Twitch VODs or Kick streams — progress streams live from the backend.
-          </p>
-        </div>
+	if (!activeTabId && tabs.length > 0) {
+		setActiveTab(tabs[0].id);
+	}
 
-        <DownloadManager />
-      </main>
-    </div>
-  );
+	const activeTab = tabs.find((t) => t.id === activeTabId);
+
+	return (
+		<div className="flex h-screen w-full flex-col bg-background text-foreground overflow-hidden">
+			{/* TAB BAR */}
+			<div className="flex items-center gap-1 bg-muted px-2 pt-2 border-b border-border shadow-sm">
+				{tabs.map((tab) => (
+					<button
+						key={tab.id}
+						onClick={() => setActiveTab(tab.id)}
+						className={`group flex items-center gap-2 rounded-t-md border-x border-t px-4 py-2 text-sm transition-colors ${
+							activeTabId === tab.id
+								? "border-border bg-card text-card-foreground shadow-sm"
+								: "border-transparent text-muted-foreground hover:bg-accent/50"
+						}`}
+					>
+						<span className="max-w-30 truncate">{tab.title}</span>
+						<div
+							role="button"
+							tabIndex={0}
+							onClick={(e) => {
+								e.stopPropagation();
+								closeTab(tab.id);
+							}}
+							className="rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity"
+						>
+							<X className="h-3 w-3" />
+						</div>
+					</button>
+				))}
+				<button
+					onClick={addTab}
+					className="ml-1 rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
+				>
+					<Plus className="h-4 w-4" />
+				</button>
+			</div>
+
+			{/* TAB CONTENT VIEW - Added min-h-0 to fix grid layout scroll trap */}
+			<div className="flex-1 bg-card min-h-0">
+				{activeTab?.status === "idle" && <StreamInput tabId={activeTab.id} />}
+
+				{activeTab?.status === "loading" && (
+					<div className="flex h-full items-center justify-center flex-col gap-3">
+						<Loader2 className="h-8 w-8 animate-spin text-primary" />
+						<p className="text-sm text-muted-foreground">
+							Extracting metadata...
+						</p>
+					</div>
+				)}
+
+				{activeTab?.status === "error" && (
+					<div className="flex h-full items-center justify-center flex-col gap-3 text-destructive p-6 text-center">
+						<AlertCircle className="h-10 w-10" />
+						<h2 className="text-lg font-semibold">Analysis Failed</h2>
+						<p className="text-sm max-w-md">{activeTab.error}</p>
+						<button
+							onClick={() =>
+								useTabStore
+									.getState()
+									.updateTab(activeTab.id, { status: "idle" })
+							}
+							className="mt-4 rounded-md border border-input bg-transparent px-4 py-2 text-sm font-medium hover:bg-accent text-foreground"
+						>
+							Try Again
+						</button>
+					</div>
+				)}
+
+				{activeTab?.status === "analyzed" && <StreamDetails tab={activeTab} />}
+			</div>
+		</div>
+	);
 }

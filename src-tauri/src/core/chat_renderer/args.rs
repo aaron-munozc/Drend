@@ -67,6 +67,7 @@ impl From<&ObjectColor> for Color {
 pub enum BackgroundMode {
     #[default]
     Transparent,
+    LumaMatte,
     ChromaKeyGreen,
     CustomColor,
 }
@@ -147,7 +148,7 @@ impl Default for RenderVideoArgs {
             message_fade_out_seconds: 2,
             pinned_users: vec![],
             pin_duration_secs: 10,
-            skip_users: vec!["BotRix".into()],
+            skip_users: vec!["BotRix".into(), "KickBot".into()],
             start_ms: None,
             end_ms: None,
             time_zero_ms: None,

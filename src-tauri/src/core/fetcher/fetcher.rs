@@ -1,31 +1,32 @@
-use crate::core::fetcher::kick::KickFetcher;
-use crate::core::fetcher::traits::MetadataFetcher;
-use crate::core::fetcher::twitch::TwitchFetcher;
-use crate::core::fetcher::types::UnifiedMetadata;
-use crate::types::{AppResult, ClientState};
+use crate::types::{AppResult, Metadata};
+use crate::error::AppError;
+use crate::AppCache;
+use stream_extractor::{fetch_stream, StreamClient};
+use tauri::State;
 
 #[tauri::command]
 pub async fn analyze_stream_url(
-    client_state: ClientState<'_>,
     url: String,
-) -> AppResult<Option<UnifiedMetadata>> {
-    let client = &client_state.client;
+    client: State<'_, StreamClient>,
+    cache: State<'_, AppCache>,
+) -> AppResult<Metadata> {
+    let stream = fetch_stream(&client, &url).await?;
 
-    // Register your platform processing strategies
-    let fetchers: Vec<Box<dyn MetadataFetcher>> =
-        vec![Box::new(TwitchFetcher), Box::new(KickFetcher)];
+    let qualities = stream.get_qualities().await?;
 
-    // Find the first processing pipeline that recognizes the domain layout
-    for fetcher in fetchers {
-        if fetcher.can_handle(&url) {
-            log::info!("Routing url parsing pipeline to target adapter domain strategy");
-            return fetcher.fetch(client, &url).await;
-        }
-    }
+    let metadata = stream.into_inner();
 
-    log::warn!(
-        "User provided an unsupported streaming address link signature: {}",
-        url
-    );
-    Ok(None)
+    let mut lock = cache
+        .streams
+        .lock()
+        .map_err(|_| AppError::InternalError("Memory protection subsystem error (Lock Poisoned)".into()))?;
+
+    let metadata_with_qualities = Metadata {
+        stream_metadata: metadata.clone(),
+        qualities
+    };
+
+    lock.put(url, metadata_with_qualities.clone());
+
+    Ok(metadata_with_qualities)
 }

@@ -1,16 +1,19 @@
-use crate::core::*;
-use crate::types::AppState;
-use std::sync::Arc;
-use std::time::Duration;
-use tauri::http::{HeaderMap, HeaderValue};
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use tauri::Manager;
-use tauri_plugin_http::reqwest::cookie::Jar;
-use tauri_plugin_http::reqwest::Client;
 use tauri_plugin_log::fern::colors::{Color, ColoredLevelConfig};
+use crate::core::{analyze_stream_url, get_download_queue, queue_chat_download};
+use crate::core::commands::download::queue_vod_download;
+use crate::types::Metadata;
 
 mod core;
 mod error;
 mod types;
+
+pub struct AppCache {
+    pub streams: Mutex<LruCache<String, Metadata>>,
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -40,61 +43,30 @@ pub fn run() {
                 ))
         }
     };
-    let mut headers = HeaderMap::new();
 
-    headers.insert(
-        "user-agent",
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-                 AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/143.0.0.0 Safari/537.36",
-        ),
-    );
+    let cache_capacity = NonZeroUsize::new(50).unwrap();
+    let app_cache = AppCache {
+        streams: Mutex::new(LruCache::new(cache_capacity)),
+    };
 
-    headers.insert(
-        "accept",
-        HeaderValue::from_static(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,\
-                 image/avif,image/webp,image/apng,*/*;q=0.8",
-        ),
-    );
-
-    headers.insert("accept-language", HeaderValue::from_static("en;q=0.8"));
-
-    headers.insert("upgrade-insecure-requests", HeaderValue::from_static("1"));
-
-    headers.insert("cache-control", HeaderValue::from_static("max-age=0"));
-
-    let jar = Arc::new(Jar::default());
-
-    // Inside your AppClient::new implementation:
-    let client = Client::builder()
-        .default_headers(headers)
-        .cookie_provider(jar.clone())
-        .timeout(Duration::from_secs(30)) // Added from old code
-        .pool_max_idle_per_host(10) // Added from old code
-        .http2_adaptive_window(true)
-        .build()
-        .expect("Failed to build client");
-
-    let app_state = AppState { client };
+    let client = stream_extractor::StreamClient::new().expect("Failed to build client");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .plugin(log_plugin.build())
         .plugin(tauri_plugin_opener::init())
-        .manage(app_state)
-        .setup(|app| {
-            let app_handle = app.handle().clone();
-            let client = app.state::<AppState>().client.clone();
-            let manager = TaskManager::new(app_handle, client);
+        .manage(app_cache)
+        .manage(client)
+        .setup(move |app| {
+            let manager = core::TaskManager::new(app.handle().clone());
             app.manage(manager);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             analyze_stream_url,
             queue_chat_download,
+            queue_vod_download,
             get_download_queue
         ])
         .run(tauri::generate_context!())

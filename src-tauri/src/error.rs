@@ -87,6 +87,13 @@ pub enum AppError {
     #[error("Emote cache error: {0}")]
     EmoteCache(String),
 
+    #[error("Stream extractor error: {0}")]
+    StreamExtractor(
+        #[from]
+        #[serde(serialize_with = "to_s")]
+        stream_extractor::Error,
+    ),
+
     #[error("Image error: {0}")]
     Image(
         #[from]

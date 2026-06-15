@@ -62,8 +62,8 @@ pub fn resize_dynamic_image_preserve_aspect(img: DynamicImage, target_h: u32) ->
 }
 
 /// Decode raw bytes into EmoteData (static or animated GIF), resizing to target_h
+/// Decode raw bytes into EmoteData (static or animated GIF), resizing to target_h
 pub fn decode_emote_bytes_to_emote_data(bytes: &[u8], target_h: u32) -> AppResult<EmoteData> {
-    // This function mirrors previous decode logic but computes cumulative durations for animated emotes
     match image::guess_format(bytes) {
         Ok(image::ImageFormat::Gif) => {
             let cur = Cursor::new(bytes.to_vec());
@@ -78,27 +78,23 @@ pub fn decode_emote_bytes_to_emote_data(bytes: &[u8], target_h: u32) -> AppResul
                 let buffer = frame.buffer().clone();
                 let dyn_img = DynamicImage::ImageRgba8(buffer);
 
-                // resize to target_h
                 let resized = resize_dynamic_image_preserve_aspect(dyn_img, target_h);
-
-                // convert to raw rgba bytes and create skia image directly to avoid PNG re-encode
                 let rgba = resized.to_rgba8();
                 let (w, h) = rgba.dimensions();
                 let row_bytes = (w * 4) as usize;
                 let data = Data::new_copy(rgba.as_raw());
 
-                // Create skia image from raster data (fallback to encoded if not available)
+                // FIXED: Using AlphaType::Unpremul prevents black backgrounds on transparent emotes
                 if let Some(img) = images::raster_from_data(
                     &skia_safe::ImageInfo::new(
                         (w as i32, h as i32),
                         skia_safe::ColorType::RGBA8888,
-                        skia_safe::AlphaType::Premul,
+                        skia_safe::AlphaType::Unpremul,
                         None,
                     ),
                     &data,
                     row_bytes,
                 ) {
-                    // compute delay
                     let delay_ms = match frame.delay().numer_denom_ms() {
                         (numer, denom) if denom != 0 => numer / denom,
                         (numer, _) => numer,
@@ -106,7 +102,6 @@ pub fn decode_emote_bytes_to_emote_data(bytes: &[u8], target_h: u32) -> AppResul
                     durations_ms.push(delay_ms);
                     skia_frames.push(img);
                 } else {
-                    // fallback: encode to png and from_encoded
                     let mut png_bytes = Vec::new();
                     resized.write_to(&mut Cursor::new(&mut png_bytes), Png)?;
                     let data_e = Data::new_copy(&png_bytes);
@@ -148,7 +143,6 @@ pub fn decode_emote_bytes_to_emote_data(bytes: &[u8], target_h: u32) -> AppResul
             })
         }
         _ => {
-            // static path
             let dyn_img = image::ImageReader::new(Cursor::new(bytes.to_vec()))
                 .with_guessed_format()?
                 .decode()?;
@@ -157,11 +151,13 @@ pub fn decode_emote_bytes_to_emote_data(bytes: &[u8], target_h: u32) -> AppResul
             let (w, h) = rgba.dimensions();
             let row_bytes = (w * 4) as usize;
             let data = Data::new_copy(rgba.as_raw());
+
+            // FIXED: Using AlphaType::Unpremul
             if let Some(img) = images::raster_from_data(
                 &skia_safe::ImageInfo::new(
                     (w as i32, h as i32),
                     skia_safe::ColorType::RGBA8888,
-                    skia_safe::AlphaType::Premul,
+                    skia_safe::AlphaType::Unpremul,
                     None,
                 ),
                 &data,
@@ -173,7 +169,6 @@ pub fn decode_emote_bytes_to_emote_data(bytes: &[u8], target_h: u32) -> AppResul
                     h: h as i32,
                 })
             } else {
-                // fallback to encoded
                 let mut png_bytes = Vec::new();
                 resized.write_to(&mut Cursor::new(&mut png_bytes), Png)?;
                 let data2 = Data::new_copy(&png_bytes);

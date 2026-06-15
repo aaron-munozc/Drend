@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use stream_extractor::MessageSaved;
 use tauri::{AppHandle, Emitter};
 use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
 
-use crate::core::chat::types::UnifiedChatMessage;
 use crate::core::chat_renderer::args::{BackgroundMode, EvictionStrategy, RenderVideoArgs};
 use crate::core::chat_renderer::helpers::ease_out;
 use crate::core::chat_renderer::regex::{EMOTE_REGEX, IMAGE_URL_REGEX};
@@ -23,7 +23,8 @@ use crate::core::chat_renderer::types::{EmoteCache, EmoteData, ImageCache};
 use crate::error::AppError;
 use crate::types::AppResult;
 
-const EMOTE_SCALE: f32 = 1.15;
+const EMOTE_SCALE: f32 = 1.25;
+const EMOTE_MARGIN: f32 = 6.0;
 const PRE_RENDER_BATCH_SIZE: usize = 64;
 
 // 1. Thread Pool for Parallel Computations
@@ -260,12 +261,14 @@ fn render_message_to_image_blocking(
                     .map(|ed| ed.width() as f32)
                     .unwrap_or(emote_cache.target_height() as f32)
                     * EMOTE_SCALE;
-                if cur_w + ew > max_w && !current_line.is_empty() {
+                let padded_ew = ew + EMOTE_MARGIN;
+
+                if cur_w + padded_ew > max_w && !current_line.is_empty() {
                     lines.push(std::mem::take(&mut current_line));
                     cur_w = 0.0;
                 }
                 current_line.push(*seg);
-                cur_w += ew;
+                cur_w += padded_ew;
             }
             Segment::Media(url) => {
                 let mw = image_cache
@@ -273,12 +276,14 @@ fn render_message_to_image_blocking(
                     .map(|ed| ed.width() as f32)
                     .unwrap_or(image_cache.target_height() as f32)
                     * EMOTE_SCALE;
-                if cur_w + mw > max_w && !current_line.is_empty() {
+                let padded_mw = mw + EMOTE_MARGIN;
+
+                if cur_w + padded_mw > max_w && !current_line.is_empty() {
                     lines.push(std::mem::take(&mut current_line));
                     cur_w = 0.0;
                 }
                 current_line.push(*seg);
-                cur_w += mw;
+                cur_w += padded_mw;
             }
         }
     }
@@ -302,7 +307,7 @@ fn render_message_to_image_blocking(
                             emote_cache.target_height() as f32,
                             emote_cache.target_height() as f32,
                         ));
-                    lw += w * EMOTE_SCALE;
+                    lw += (w * EMOTE_SCALE) + EMOTE_MARGIN;
                     lh = lh.max(h * EMOTE_SCALE);
                 }
                 Segment::Media(url) => {
@@ -313,7 +318,7 @@ fn render_message_to_image_blocking(
                             image_cache.target_height() as f32,
                             image_cache.target_height() as f32,
                         ));
-                    lw += w * EMOTE_SCALE;
+                    lw += (w * EMOTE_SCALE) + EMOTE_MARGIN;
                     lh = lh.max((h * EMOTE_SCALE) + 8.0);
                 }
             }
@@ -414,11 +419,13 @@ fn render_message_to_image_blocking(
                                 y_cursor
                             };
 
+                            let draw_x = x_cursor + (EMOTE_MARGIN / 2.0);
+
                             let is_animated = match &*ed {
                                 EmoteData::Animated { .. } => true,
                                 EmoteData::Static { img, .. } => {
                                     canvas.save();
-                                    canvas.translate((x_cursor, draw_y));
+                                    canvas.translate((draw_x, draw_y));
                                     canvas.scale((EMOTE_SCALE, EMOTE_SCALE));
                                     canvas.draw_image(img, (0, 0), None);
                                     canvas.restore();
@@ -428,13 +435,13 @@ fn render_message_to_image_blocking(
                             placements.push(EmotePlacement {
                                 emote_id: Some(*id),
                                 media_url: None,
-                                x: x_cursor,
+                                x: draw_x,
                                 y: draw_y,
                                 w: sw as i32,
                                 h: sh as i32,
                                 animated: is_animated,
                             });
-                            x_cursor += sw;
+                            x_cursor += sw + EMOTE_MARGIN;
                         }
                     }
                     Segment::Media(url) => {
@@ -447,11 +454,13 @@ fn render_message_to_image_blocking(
                                 y_cursor
                             };
 
+                            let draw_x = x_cursor + (EMOTE_MARGIN / 2.0);
+
                             let is_animated = match &*ed {
                                 EmoteData::Animated { .. } => true,
                                 EmoteData::Static { img, .. } => {
                                     canvas.save();
-                                    canvas.translate((x_cursor, draw_y));
+                                    canvas.translate((draw_x, draw_y));
                                     canvas.scale((EMOTE_SCALE, EMOTE_SCALE));
                                     canvas.draw_image(img, (0, 0), None);
                                     canvas.restore();
@@ -461,13 +470,13 @@ fn render_message_to_image_blocking(
                             placements.push(EmotePlacement {
                                 emote_id: None,
                                 media_url: Some(url.to_string()),
-                                x: x_cursor,
+                                x: draw_x,
                                 y: draw_y,
                                 w: sw as i32,
                                 h: sh as i32,
                                 animated: is_animated,
                             });
-                            x_cursor += sw;
+                            x_cursor += sw + EMOTE_MARGIN;
                         }
                     }
                 }
@@ -488,7 +497,6 @@ pub async fn process_chat_render(
     cache_dir_base: PathBuf,
     cancel_flag: Arc<AtomicBool>,
 ) -> AppResult<()> {
-    // --- Helper to update task progress ---
     let emit_progress = |progress: f32, text: &str| {
         let mut locked = tasks.lock().unwrap();
         if let Some(task) = locked.get_mut(task_id) {
@@ -500,7 +508,6 @@ pub async fn process_chat_render(
 
     emit_progress(1.0, "Preparing FFmpeg and Scanning Metadata...");
 
-    // 1. DYNAMIC FFMPEG CONFIGURATION
     let (vcodec, pix_fmt, extension) = match args.background_mode {
         BackgroundMode::Transparent => ("prores_ks", "yuva444p10le", "mov"),
         _ => {
@@ -517,6 +524,9 @@ pub async fn process_chat_render(
         }
     };
 
+    let is_luma = matches!(args.background_mode, BackgroundMode::LumaMatte);
+    let actual_width = if is_luma { args.width * 2 } else { args.width };
+
     let raw_output_path = Path::new(&args.output_path);
     let output_file_str = raw_output_path
         .with_extension(extension)
@@ -530,7 +540,7 @@ pub async fn process_chat_render(
         "-pix_fmt".to_string(),
         "rgba".to_string(),
         "-s".to_string(),
-        format!("{}x{}", args.width, args.height),
+        format!("{}x{}", actual_width, args.height),
         "-r".to_string(),
         args.fps.to_string(),
         "-i".to_string(),
@@ -568,21 +578,30 @@ pub async fn process_chat_render(
         .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
     let mut ff_stdin = ffmpeg_child.stdin.take().unwrap();
 
-    // 2. PASS 1: SCAN THE JSONL FOR CACHING & TIMELINE LIMITS
     let file = File::open(&input_path).await?;
     let mut reader = tokio::io::BufReader::new(file).lines();
 
     let mut emote_ids = HashSet::new();
     let mut image_urls = HashSet::new();
     let mut max_offset_sec: f64 = 0.0;
+    let mut base_time_secs: Option<i64> = None;
     let skip_users_set: HashSet<String> = args.skip_users.clone().into_iter().collect();
 
+    // Pass 1: Scan Metadata and establish relative timing
     while let Some(line) = reader.next_line().await? {
-        if let Ok(msg) = serde_json::from_str::<UnifiedChatMessage>(&line) {
-            if skip_users_set.contains(&msg.username) {
+        if let Ok(msg) = serde_json::from_str::<MessageSaved>(&line) {
+            // New struct mapping for username
+            if skip_users_set.contains(&msg.sender.username) {
                 continue;
             }
-            max_offset_sec = max_offset_sec.max(msg.offset_sec);
+
+            // Calculate relative offset dynamically
+            if base_time_secs.is_none() {
+                base_time_secs = Some(args.time_zero_ms.map(|t| (t / 1000) as i64).unwrap_or(msg.created_at_secs));
+            }
+            let offset_sec = ((msg.created_at_secs - base_time_secs.unwrap()) as f64).max(0.0);
+            max_offset_sec = max_offset_sec.max(offset_sec);
+
             for caps in EMOTE_REGEX.captures_iter(&msg.content) {
                 if let Some(id) = caps.name("id").and_then(|m| m.as_str().parse::<i32>().ok()) {
                     emote_ids.insert(id);
@@ -596,7 +615,6 @@ pub async fn process_chat_render(
 
     emit_progress(5.0, "Hydrating caches...");
 
-    // 3. CACHE HYDRATION
     let target_emote_h = ((args.font_size + args.line_spacing as f32) * 0.85).ceil() as u32;
     let emote_cache = Arc::new(EmoteCache::new(
         cache_dir_base.join("emote_cache"),
@@ -616,7 +634,6 @@ pub async fn process_chat_render(
         .ensure_cached(&image_urls.into_iter().collect::<Vec<_>>())
         .await?;
 
-    // Font Configuration
     let font_mgr = FontMgr::new();
     let typeface = font_mgr
         .match_family_style(&args.font_name, FontStyle::normal())
@@ -629,11 +646,9 @@ pub async fn process_chat_render(
     let (_, metrics) = message_font.metrics();
     let msg_line_h = (metrics.descent - metrics.ascent) + args.line_spacing as f32;
 
-    // 4. PIPELINE SETUP (Memory safe streaming)
-    let (loader_tx, loader_rx) = crossbeam_channel::bounded::<UnifiedChatMessage>(2048);
+    let (loader_tx, loader_rx) = crossbeam_channel::bounded::<MessageSaved>(2048);
     let (stamp_tx, stamp_rx) = crossbeam_channel::bounded::<(u32, Arc<ScheduledMessage>)>(512);
 
-    // THREAD A: Loader Thread (Reads file safely without blowing up memory)
     let loader_path = input_path.clone();
     let loader_cancel = Arc::clone(&cancel_flag);
     std::thread::spawn(move || {
@@ -643,8 +658,9 @@ pub async fn process_chat_render(
             if loader_cancel.load(Ordering::SeqCst) {
                 break;
             }
-            if let Ok(msg) = serde_json::from_str::<UnifiedChatMessage>(&line) {
-                if !skip_users_set.contains(&msg.username) {
+            if let Ok(msg) = serde_json::from_str::<MessageSaved>(&line) {
+                // New struct mapping for username
+                if !skip_users_set.contains(&msg.sender.username) {
                     if loader_tx.send(msg).is_err() {
                         break;
                     }
@@ -653,22 +669,21 @@ pub async fn process_chat_render(
         }
     });
 
-    // THREAD B: Pre-render Thread (Batches and computes text layouts dynamically)
     let args_pr = args.clone();
     let emote_cache_pr = Arc::clone(&emote_cache);
     let img_cache_pr = Arc::clone(&img_cache);
     let pr_cancel = Arc::clone(&cancel_flag);
+    let base_time_pr = base_time_secs.unwrap_or(0);
 
     std::thread::spawn(move || {
         let mut batch = Vec::with_capacity(PRE_RENDER_BATCH_SIZE);
         let mut last_assigned_frame = -1i64;
 
-        let flush_batch = |batch_to_flush: Vec<UnifiedChatMessage>, last_frame: &mut i64| {
+        let flush_batch = |batch_to_flush: Vec<MessageSaved>, last_frame: &mut i64| {
             if batch_to_flush.is_empty() {
                 return;
             }
 
-            // Process text layouts concurrently
             let rendered: Vec<Option<ScheduledMessage>> = RENDER_POOL.install(|| {
                 batch_to_flush
                     .into_par_iter()
@@ -676,18 +691,19 @@ pub async fn process_chat_render(
                         PRE_RENDER_MEASURE_CACHE.with(|cache_cell| {
                             let mut measure_cache = cache_cell.borrow_mut();
 
-                            // ANTI-CLUMPING LOGIC: Spread messages out so they don't overlap completely
-                            let base_frame = (msg.offset_sec * args_pr.fps as f64).round() as i64;
+                            // Calculate offset and map to frame timeline
+                            let offset_sec = ((msg.created_at_secs - base_time_pr) as f64).max(0.0);
+                            let base_frame = (offset_sec * args_pr.fps as f64).round() as i64;
                             let assigned_frame = if base_frame <= *last_frame {
                                 *last_frame + 2
                             } else {
                                 base_frame
-                            }; // Minimum 2 frames apart
+                            };
 
                             match render_message_to_image_blocking(
                                 &msg.content,
-                                &msg.username,
-                                &msg.color,
+                                &msg.sender.username,         // New struct access
+                                &msg.sender.identity.color,   // New struct access
                                 &username_font,
                                 &message_font,
                                 Color::from(&args_pr.message_color),
@@ -732,23 +748,23 @@ pub async fn process_chat_render(
         flush_batch(batch, &mut last_assigned_frame);
     });
 
-    // 5. COORDINATOR LOOP (Assembles chunks, pushes to FFmpeg)
     let total_frames = ((max_offset_sec * args.fps as f64).round() as u32)
         + (args.message_hold_seconds * args.fps);
 
     let bg_color = match args.background_mode {
         BackgroundMode::Transparent => Color::TRANSPARENT,
+        BackgroundMode::LumaMatte => Color::BLACK,
         BackgroundMode::ChromaKeyGreen => Color::from_argb(255, 0, 255, 0),
         BackgroundMode::CustomColor => Color::from(&args.background_color),
     };
 
     let info = ImageInfo::new(
-        (args.width, args.height),
+        (actual_width, args.height),
         ColorType::RGBA8888,
         AlphaType::Premul,
         None,
     );
-    let num_bytes = (args.width * args.height * 4) as usize;
+    let num_bytes = (actual_width * args.height * 4) as usize;
     let pixel_pool = Arc::new(PixelBufferPool::default());
 
     let chunk_size = (args.fps as usize * 2).max(30);
@@ -763,7 +779,6 @@ pub async fn process_chat_render(
             break;
         }
 
-        // Only consume the exact layout items required for this precise frame tick
         loop {
             if next_stamp.is_none() {
                 next_stamp = stamp_rx.try_recv().ok();
@@ -778,7 +793,6 @@ pub async fn process_chat_render(
             break;
         }
 
-        // Apply automatic eviction rules (this is what deletes the unused bitmaps from RAM)
         active_bubbles.retain(|bubble| match args.eviction_strategy {
             EvictionStrategy::Timed => {
                 let age_secs = (f_idx - bubble.spawn_frame) as f32 / args.fps as f32;
@@ -801,7 +815,6 @@ pub async fn process_chat_render(
 
             let current_chunk = std::mem::take(&mut frame_chunk);
 
-            // CPU Thread Pool Assembly Line
             let rendered_pixels: Vec<Vec<u8>> = RENDER_POOL.install(|| {
                 current_chunk
                     .into_par_iter()
@@ -813,16 +826,17 @@ pub async fn process_chat_render(
 
                         SKIA_SURFACE.with(|surf_cell| {
                             let mut surf_opt = surf_cell.borrow_mut();
+
                             if surf_opt.is_none()
-                                || surf_opt.as_ref().unwrap().width() != args_block.width
+                                || surf_opt.as_ref().unwrap().width() != actual_width
                                 || surf_opt.as_ref().unwrap().height() != args_block.height
                             {
                                 *surf_opt = Some(
                                     surfaces::raster_n32_premul((
-                                        args_block.width,
+                                        actual_width,
                                         args_block.height,
                                     ))
-                                    .unwrap(),
+                                        .unwrap(),
                                 );
                             }
 
@@ -833,6 +847,14 @@ pub async fn process_chat_render(
                             let mut y_cursor = (args_block.height - args_block.padding) as f32;
                             let mut paint = Paint::default();
                             paint.set_anti_alias(true);
+
+                            let mut mask_paint = paint.clone();
+                            if is_luma {
+                                mask_paint.set_color_filter(skia_safe::color_filters::blend(
+                                    Color::WHITE,
+                                    skia_safe::BlendMode::SrcIn,
+                                ));
+                            }
 
                             for bubble in bubbles.iter() {
                                 let age_secs =
@@ -850,13 +872,14 @@ pub async fn process_chat_render(
                                     if age_secs > fade_start {
                                         alpha *= 1.0
                                             - ((age_secs - fade_start)
-                                                / args_block.message_fade_out_seconds as f32)
-                                                .clamp(0.0, 1.0);
+                                            / args_block.message_fade_out_seconds as f32)
+                                            .clamp(0.0, 1.0);
                                     }
                                 }
 
-                                paint.set_alpha((255.0 * alpha) as u8);
-                                canvas.save();
+                                let byte_alpha = (255.0 * alpha) as u8;
+                                paint.set_alpha(byte_alpha);
+                                mask_paint.set_alpha(byte_alpha);
 
                                 let img_h = bubble.img_h.unwrap_or(0);
                                 let top = y_cursor - img_h as f32;
@@ -869,6 +892,7 @@ pub async fn process_chat_render(
                                     final_x
                                 };
 
+                                canvas.save();
                                 canvas.translate((x_translate, top));
 
                                 if let Some(img) = &bubble.img {
@@ -902,17 +926,55 @@ pub async fn process_chat_render(
                                         }
                                     }
                                 }
-
                                 canvas.restore();
+
+                                if is_luma {
+                                    canvas.save();
+                                    canvas.translate((x_translate + args_block.width as f32, top));
+
+                                    if let Some(img) = &bubble.img {
+                                        canvas.draw_image(img, (0, 0), Some(&mask_paint));
+                                    }
+
+                                    if let Some(placements) = &bubble.placements {
+                                        for p in placements {
+                                            if p.animated {
+                                                let ed_opt = if let Some(id) = p.emote_id {
+                                                    rayon_emotes.get(id)
+                                                } else {
+                                                    p.media_url
+                                                        .as_ref()
+                                                        .and_then(|url| rayon_imgs.get(url))
+                                                };
+                                                if let Some(ed) = ed_opt {
+                                                    let t_ms = (frame_id as u64 * 1000)
+                                                        / args_block.fps as u64;
+                                                    if let Some(fi) = ed.frame_at(t_ms) {
+                                                        canvas.save();
+                                                        canvas.scale((EMOTE_SCALE, EMOTE_SCALE));
+                                                        canvas.draw_image(
+                                                            fi,
+                                                            (p.x / EMOTE_SCALE, p.y / EMOTE_SCALE),
+                                                            Some(&mask_paint),
+                                                        );
+                                                        canvas.restore();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    canvas.restore();
+                                }
+
                                 y_cursor -= img_h as f32 + args_block.message_spacing as f32;
                                 if y_cursor < 0.0 {
                                     break;
-                                } // Spatially Evicted
+                                }
                             }
                             surface.read_pixels(
                                 &info_clone,
                                 pixels.as_mut_slice(),
-                                (args_block.width * 4) as usize,
+                                (actual_width * 4) as usize,
                                 (0, 0),
                             );
                         });
@@ -921,13 +983,11 @@ pub async fn process_chat_render(
                     .collect()
             });
 
-            // Write all frames in deterministic order to FFmpeg
             for frame_pixels in rendered_pixels {
                 let _ = ff_stdin.write_all(&frame_pixels);
                 pixel_pool.release(frame_pixels);
             }
 
-            // Report Progress Upward
             let progress_percent = 10.0 + ((f_idx as f32 / total_frames as f32) * 90.0);
             emit_progress(
                 progress_percent,
@@ -936,7 +996,7 @@ pub async fn process_chat_render(
         }
     }
 
-    drop(ff_stdin); // Signifies to FFmpeg we are done writing
+    drop(ff_stdin);
 
     if cancel_flag.load(Ordering::SeqCst) {
         emit_progress(100.0, "Render Cancelled");
