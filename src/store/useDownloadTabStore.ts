@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { Metadata } from "@/features/downloads/types/types.ts";
 
-export interface Tab {
+export interface DownloadTab {
 	id: string;
 	title: string;
 	url: string;
@@ -10,23 +10,23 @@ export interface Tab {
 	error?: string;
 }
 
-interface TabStore {
-	tabs: Tab[];
+interface DownloadTabStore {
+	tabs: DownloadTab[];
 	activeTabId: string | null;
 	addTab: () => void;
 	closeTab: (id: string) => void;
 	setActiveTab: (id: string) => void;
-	updateTab: (id: string, data: Partial<Tab>) => void;
+	updateTab: (id: string, data: Partial<DownloadTab>) => void;
 }
 
-const createNewTab = (): Tab => ({
+const createNewTab = (): DownloadTab => ({
 	id: crypto.randomUUID(),
 	title: "New Download",
 	url: "",
 	status: "idle",
 });
 
-export const useTabStore = create<TabStore>((set) => ({
+export const useDownloadTabStore = create<DownloadTabStore>((set) => ({
 	tabs: [createNewTab()],
 	activeTabId: null,
 

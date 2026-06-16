@@ -3,8 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use tauri::Manager;
 use tauri_plugin_log::fern::colors::{Color, ColoredLevelConfig};
-use crate::core::{analyze_stream_url, get_download_queue, queue_chat_download};
-use crate::core::commands::download::queue_vod_download;
+use crate::core::{analyze_stream_url, get_download_queue, queue_chat_download, queue_chat_render, queue_vod_download};
 use crate::types::Metadata;
 
 mod core;
@@ -67,6 +66,7 @@ pub fn run() {
             analyze_stream_url,
             queue_chat_download,
             queue_vod_download,
+            queue_chat_render,
             get_download_queue
         ])
         .run(tauri::generate_context!())

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useTabStore } from "@/store/useTabStore.ts";
+import { useDownloadTabStore } from "@/store/useDownloadTabStore.ts";
 import {
 	FrontendChatOptions,
 	FrontendVodOptions,
@@ -7,19 +7,13 @@ import {
 } from "@/features/downloads/types/types.ts";
 
 export function useDownloader() {
-	const { updateTab } = useTabStore();
+	const { updateTab } = useDownloadTabStore();
 
 	const analyzeUrl = async (tabId: string, url: string) => {
 		updateTab(tabId, { url, status: "loading", error: undefined });
 		try {
 			// 1. Fetch raw payload (Rust might send snake_case)
-			const rawData = await invoke<any>("analyze_stream_url", { url });
-
-			// 2. Normalize to your frontend camelCase interface
-			const metadata: Metadata = {
-				streamMetadata: rawData.streamMetadata || rawData.stream_metadata,
-				qualities: rawData.qualities || [],
-			};
+			const metadata = await invoke<Metadata>("analyze_stream_url", { url });
 
 			// 3. Extract the nested title safely
 			updateTab(tabId, {
