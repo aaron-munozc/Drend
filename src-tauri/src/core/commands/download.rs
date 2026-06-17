@@ -46,7 +46,6 @@ pub async fn queue_chat_render(
     let args = options.unwrap_or_default();
     let input_path = PathBuf::from(json_file_path);
 
-    // Dynamically retrieve the system's runtime app cache directory base for rendering
     let cache_dir_base = app_handle
         .path()
         .app_cache_dir()

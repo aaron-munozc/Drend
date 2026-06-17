@@ -43,7 +43,7 @@ export function RenderView() {
 	return (
 		<div className="flex h-full w-full flex-col overflow-hidden bg-background text-foreground font-sans selection:bg-primary/20">
 			{/* MAC/VSCODE STYLE TAB BAR */}
-			<div className="flex items-end gap-[1px] bg-muted/40 px-3 pt-3 border-b border-border overflow-x-auto no-scrollbar">
+			<div className="flex items-end gap-px bg-muted/40 px-3 pt-3 border-b border-border overflow-x-auto no-scrollbar">
 				{tabs.map((tab) => (
 					<button
 						key={tab.id}
@@ -59,7 +59,7 @@ export function RenderView() {
 							<div className="absolute top-0 left-0 right-0 h-0.5 bg-primary rounded-t-lg" />
 						)}
 						<FileCode2 className="h-4 w-4 opacity-70" />
-						<span className="max-w-[140px] truncate">{tab.title}</span>
+						<span className="max-w-35 truncate">{tab.title}</span>
 						<div
 							role="button"
 							tabIndex={0}
@@ -166,7 +166,7 @@ function RenderConfiguration({ tab }: { tab: RenderTab }) {
 	}
 
 	return (
-		<div className="max-w-[1400px] mx-auto p-6 md:p-8 space-y-8 pb-32 animate-in fade-in duration-300">
+		<div className="max-w-350 mx-auto p-6 md:p-8 space-y-8 pb-32 animate-in fade-in duration-300">
 			{/* HEADER ACTIONS */}
 			<div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-card px-6 py-5 rounded-2xl border border-border shadow-sm">
 				<div className="flex items-center gap-4 overflow-hidden">
@@ -499,7 +499,7 @@ function RenderConfiguration({ tab }: { tab: RenderTab }) {
 
 			{/* STICKY BOTTOM BAR */}
 			<div className="fixed bottom-0 left-0 right-0 p-4 bg-background/80 backdrop-blur-xl border-t border-border z-40 shadow-[0_-10px_40px_-15px_rgba(0,0,0,0.1)]">
-				<div className="max-w-[1400px] mx-auto flex items-center justify-between">
+				<div className="max-w-350 mx-auto flex items-center justify-between">
 					<div className="hidden md:block text-sm text-muted-foreground font-medium">
 						Configure settings and render directly to video.
 					</div>
@@ -656,7 +656,7 @@ function ArrayInput({
 				{description && <p className="text-xs text-muted-foreground mt-1.5">{description}</p>}
 			</div>
 			<textarea
-				className="flex min-h-[80px] w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground shadow-sm transition-colors placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:border-ring resize-y"
+				className="flex min-h-20 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground shadow-sm transition-colors placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:border-ring resize-y"
 				value={value.join(", ")}
 				placeholder={placeholder}
 				onChange={(e) => {
