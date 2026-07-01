@@ -517,7 +517,7 @@ function RenderConfiguration({ tab }: { tab: RenderTab }) {
 }
 
 // ==========================================
-// FORM COMPONENT HELPERS
+// FORM COMPONENT HELPERS (Unchanged but included for completeness)
 // ==========================================
 
 function Section({

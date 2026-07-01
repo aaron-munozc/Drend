@@ -1,6 +1,6 @@
+use crate::error::AppError;
 use serde::Serialize;
 use stream_extractor::{StreamMetadata, StreamQuality};
-use crate::error::AppError;
 
 pub type AppResult<T> = Result<T, AppError>;
 

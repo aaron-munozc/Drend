@@ -1,5 +1,5 @@
-use crate::types::{AppResult, Metadata};
 use crate::error::AppError;
+use crate::types::{AppResult, Metadata};
 use crate::AppCache;
 use stream_extractor::{fetch_stream, StreamClient};
 use tauri::State;
@@ -16,14 +16,13 @@ pub async fn analyze_stream_url(
 
     let metadata = stream.into_inner();
 
-    let mut lock = cache
-        .streams
-        .lock()
-        .map_err(|_| AppError::InternalError("Memory protection subsystem error (Lock Poisoned)".into()))?;
+    let mut lock = cache.streams.lock().map_err(|_| {
+        AppError::InternalError("Memory protection subsystem error (Lock Poisoned)".into())
+    })?;
 
     let metadata_with_qualities = Metadata {
         stream_metadata: metadata.clone(),
-        qualities
+        qualities,
     };
 
     lock.put(url, metadata_with_qualities.clone());

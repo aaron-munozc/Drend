@@ -36,17 +36,18 @@ impl ObjectColor {
     }
 }
 
-fn clamp_f(v: i32) -> f32 {
-    v.clamp(0, 255) as f32
+fn to_unit(v: i32) -> f32 {
+    v.clamp(0, 255) as f32 / 255.0
 }
 
 impl From<&ObjectColor> for Color4f {
     fn from(obj: &ObjectColor) -> Self {
+        // Skia requires parameters in 0.0 -> 1.0 range, ordered r,g,b,a
         Color4f::new(
-            clamp_f(obj.alpha),
-            clamp_f(obj.red),
-            clamp_f(obj.green),
-            clamp_f(obj.blue),
+            to_unit(obj.red),
+            to_unit(obj.green),
+            to_unit(obj.blue),
+            to_unit(obj.alpha),
         )
     }
 }
@@ -80,6 +81,19 @@ pub enum EvictionStrategy {
     PushOnly,
 }
 
+/// Controls the quality/performance trade-off for the renderer.
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum QualityPreset {
+    /// Fast – nearest-neighbour emote scaling, no MSAA.
+    Draft,
+    #[default]
+    /// Balanced – Lanczos emote scaling, light anti-alias.
+    Standard,
+    /// Slow – highest-quality filter, full MSAA, sub-pixel text.
+    High,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RenderVideoArgs {
@@ -105,6 +119,9 @@ pub struct RenderVideoArgs {
     pub anim_slide: bool,
     pub anim_fade_in: bool,
     pub eviction_strategy: EvictionStrategy,
+    pub quality_preset: QualityPreset,
+    /// Maximum number of decoded emotes to keep in memory. 0 = unbounded.
+    pub max_cached_emotes: usize,
     pub message_hold_seconds: u32,
     pub message_fade_out_seconds: u32,
     pub pinned_users: Vec<String>,
@@ -116,7 +133,7 @@ pub struct RenderVideoArgs {
     pub group_messages: bool,
     pub group_messages_window_secs: u32,
     pub center_emotes_vertically: bool,
-    pub crate_premultiplied_alpha_emotes: bool,
+    pub create_premultiplied_alpha_emotes: bool,
 }
 
 impl Default for RenderVideoArgs {
@@ -144,6 +161,8 @@ impl Default for RenderVideoArgs {
             anim_slide: true,
             anim_fade_in: false,
             eviction_strategy: EvictionStrategy::PushOnly,
+            quality_preset: QualityPreset::Standard,
+            max_cached_emotes: 256,
             message_hold_seconds: 5,
             message_fade_out_seconds: 2,
             pinned_users: vec![],
@@ -155,7 +174,7 @@ impl Default for RenderVideoArgs {
             group_messages: false,
             group_messages_window_secs: 0,
             center_emotes_vertically: true,
-            crate_premultiplied_alpha_emotes: true,
+            create_premultiplied_alpha_emotes: true,
         }
     }
 }

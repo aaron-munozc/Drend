@@ -6,7 +6,7 @@
 		"useIgnoreFile": true
 	},
 	"files": {
-		"includes": ["**", "!!**/dist"]
+		"includes": ["**", "!!**/dist", "!**/*.css"]
 	},
 	"formatter": {
 		"enabled": true,
@@ -17,7 +17,8 @@
 		"enabled": false,
 		"rules": {
 			"preset": "recommended"
-		}
+		},
+		"includes": ["!**/*.css"]
 	},
 	"javascript": {
 		"formatter": {

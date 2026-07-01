@@ -17,9 +17,8 @@ import {
 	QualityPreference,
 	VideoFormat,
 } from "@/features/downloads/types/types.ts";
-import { useQueueStore } from "@/store/useQueueStore.ts"; // <--- INJECTED NEW QUEUE STORE
+import { useQueueStore } from "@/store/useQueueStore.ts";
 
-// Utility to format seconds into HH:MM:SS
 const formatTime = (totalSeconds: number): string => {
 	const h = Math.floor(totalSeconds / 3600);
 	const m = Math.floor((totalSeconds % 3600) / 60);
@@ -27,7 +26,6 @@ const formatTime = (totalSeconds: number): string => {
 	return [h, m, s].map((val) => val.toString().padStart(2, "0")).join(":");
 };
 
-// Converts HH:MM:SS or raw seconds into milliseconds
 const timeToMs = (timeStr: string): number | undefined => {
 	const trimmed = timeStr.trim();
 	if (!trimmed) return undefined;
@@ -51,45 +49,77 @@ const timeToMs = (timeStr: string): number | undefined => {
 };
 
 export function StreamDetails({ tab }: { tab: DownloadTab }) {
-	const { enqueueTask } = useQueueStore(); // <--- GRAB ENQUEUE METHOD
+	const { enqueueTask } = useQueueStore();
 	const payload = tab.metadata;
 
+	// Read defaults from the cloned tab if they exist
+	const initOpts = tab.initialOptions || {};
+	const isInitialChat = tab.initialTaskType === "chatDownload";
+
+	const initQuality = initOpts.quality
+		? typeof initOpts.quality === "object"
+			? initOpts.quality.index.toString()
+			: initOpts.quality
+		: "best";
+
+	const initialStartSec = initOpts.startMs
+		? Math.floor(initOpts.startMs / 1000)
+		: 0;
+
 	// Core States
-	const [downloadMode, setDownloadMode] = useState<"vod" | "chat">("vod");
-	const [showAdvanced, setShowAdvanced] = useState(false);
+	const [downloadMode, setDownloadMode] = useState<"vod" | "chat">(
+		tab.initialTaskType ? (isInitialChat ? "chat" : "vod") : "vod",
+	);
+	const [showAdvanced, setShowAdvanced] = useState(
+		Object.keys(initOpts).length > 0, // Auto-open if cloned parameters exist
+	);
 
 	// Form State Configurations
-	const [selectedQuality, setSelectedQuality] = useState<string>("best");
-	const [selectedFormat, setSelectedFormat] = useState<VideoFormat>("mp4");
+	const [selectedQuality, setSelectedQuality] = useState<string>(initQuality);
+	const [selectedFormat, setSelectedFormat] = useState<VideoFormat>(
+		initOpts.format || "mp4",
+	);
 
 	// Output Target States
-	const [saveFolder, setSaveFolder] = useState("");
-	const [fileName, setFileName] = useState("");
+	const [saveFolder, setSaveFolder] = useState(initOpts.saveFolder || "");
+	const [fileName, setFileName] = useState(initOpts.fileName || "");
 
 	// Advanced State Configurations
-	const [threads, setThreads] = useState(4);
-	const [bufferMs, setBufferMs] = useState(2000);
-	const [maxRetries, setMaxRetries] = useState(8);
-	const [kickConcurrency, setKickConcurrency] = useState(10);
-	const [emptyCycleThreshold, setEmptyCycleThreshold] = useState(6);
+	const [threads, setThreads] = useState(initOpts.threads || 4);
+	const [bufferMs, setBufferMs] = useState(initOpts.bufferMs || 2000);
+	const [maxRetries, setMaxRetries] = useState(initOpts.maxRetries || 8);
+	const [kickConcurrency, setKickConcurrency] = useState(
+		initOpts.kickConcurrency || 10,
+	);
+	const [emptyCycleThreshold, setEmptyCycleThreshold] = useState(
+		initOpts.emptyCycleThreshold || 6,
+	);
 
 	// Timeline States
 	const rawDurationMs = payload?.streamMetadata?.duration || 0;
 	const durationSec = Math.max(0, Math.floor(rawDurationMs / 1000));
 
-	const [startSec, setStartSec] = useState(0);
-	const [endSec, setEndSec] = useState(durationSec > 0 ? durationSec : 0);
-	const [startTimeText, setStartTimeText] = useState("00:00:00");
+	const [startSec, setStartSec] = useState(initialStartSec);
+	const [endSec, setEndSec] = useState(
+		initOpts.endMs ? Math.floor(initOpts.endMs / 1000) : durationSec > 0 ? durationSec : 0,
+	);
+	const [startTimeText, setStartTimeText] = useState(
+		formatTime(initialStartSec),
+	);
 	const [endTimeText, setEndTimeText] = useState(
-		durationSec > 0 ? formatTime(durationSec) : "",
+		initOpts.endMs
+			? formatTime(Math.floor(initOpts.endMs / 1000))
+			: durationSec > 0
+				? formatTime(durationSec)
+				: "",
 	);
 
 	useEffect(() => {
-		if (durationSec > 0 && endSec === 0) {
+		if (durationSec > 0 && endSec === 0 && !initOpts.endMs) {
 			setEndSec(durationSec);
 			setEndTimeText(formatTime(durationSec));
 		}
-	}, [durationSec]);
+	}, [durationSec, endSec, initOpts.endMs]);
 
 	const handleStartTextBlur = () => {
 		const ms = timeToMs(startTimeText);
@@ -149,7 +179,6 @@ export function StreamDetails({ tab }: { tab: DownloadTab }) {
 			else if (selectedQuality !== "best")
 				qualityParam = { index: parseInt(selectedQuality, 10) };
 
-			// Send to Pipeline
 			enqueueTask("vodDownload", targetTitle, {
 				url: tab.url,
 				options: {
@@ -164,7 +193,6 @@ export function StreamDetails({ tab }: { tab: DownloadTab }) {
 				},
 			});
 		} else {
-			// Send to Pipeline
 			enqueueTask("chatDownload", targetTitle, {
 				url: tab.url,
 				options: {

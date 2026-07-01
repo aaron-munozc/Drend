@@ -1,3 +1,4 @@
+use crate::core::chat_renderer::args::QualityPreset;
 use crate::core::chat_renderer::helpers::{decode_emote_bytes_to_emote_data, guess_ext};
 use crate::error::AppError;
 use crate::types::AppResult;
@@ -6,7 +7,7 @@ use lru::LruCache;
 use parking_lot::Mutex as PLMutex;
 use rustc_hash::{FxHashMap, FxHasher};
 use serde::{Deserialize, Serialize};
-use skia_safe::Image;
+use skia_safe::{Image, TextBlob};
 use std::fmt::Write as FmtWrite;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -24,7 +25,29 @@ pub struct ImageMetaSidecar {
     pub h: i32,
 }
 
-#[derive(Debug)]
+/// Pre-measured layout line for efficient draw loop mapping
+#[derive(Clone)]
+pub struct LayoutLine {
+    pub tokens: Vec<LayoutToken>,
+    pub line_height: f32,
+    pub total_width: f32,
+}
+#[derive(Clone)]
+pub enum LayoutToken {
+    Glyph {
+        blob: TextBlob,
+        x: f32,
+        y: f32,
+        width: f32,
+    },
+    Emote {
+        data: Arc<EmoteData>,
+        x: f32,
+        y: f32,
+    },
+}
+
+#[derive(Clone)]
 pub enum EmoteData {
     Static {
         img: Image,
@@ -32,9 +55,9 @@ pub enum EmoteData {
         h: i32,
     },
     Animated {
-        frames: Vec<Image>,
-        durations_ms: Vec<u32>,
-        cum_durations: Vec<u32>,
+        frames: Arc<Vec<Image>>,
+        durations_ms: Arc<Vec<u32>>,
+        cum_durations: Arc<Vec<u32>>,
         total_ms: u32,
         w: i32,
         h: i32,
@@ -66,39 +89,25 @@ impl EmoteData {
                 if frames.is_empty() || *total_ms == 0 {
                     return None;
                 }
-                let rel_ms = (t_ms % *total_ms as u64) as u32;
-                if frames.len() <= 8 {
-                    for (idx, &end_ms) in cum_durations.iter().enumerate() {
-                        if rel_ms < end_ms {
-                            return frames.get(idx);
-                        }
-                    }
-                    return frames.last();
-                }
-                let idx = match cum_durations.binary_search(&rel_ms) {
-                    Ok(i) => i + 1,
-                    Err(i) => i,
-                };
-                frames.get(idx.min(frames.len() - 1))
+                let looped = (t_ms % *total_ms as u64) as u32;
+                let idx = cum_durations
+                    .partition_point(|&c| c <= looped)
+                    .min(cum_durations.len().saturating_sub(1));
+                frames.get(idx)
             }
         }
     }
 }
 
-// ... (Keep the rest of your exact EmoteCache and ImageCache implementations here)
-// EmoteCache and ImageCache remain exactly as you provided them, as their
-// internal LRU/Disk architecture is perfectly sound for the new system.
-
 /// EmoteCache caches decoded emotes in memory (LRU) and on disk.
-/// It prevents duplicate concurrent downloads by an in-flight registry.
 pub struct EmoteCache {
     base: PathBuf,
     pub(crate) mem: Arc<PLMutex<LruCache<i32, Arc<EmoteData>>>>,
     inflight: Arc<PLMutex<FxHashMap<i32, Vec<oneshot::Sender<Result<Arc<EmoteData>, String>>>>>>,
-    /// Negative cache for disk misses: prevents repeated metadata calls for absent files.
     missing_disk: Arc<PLMutex<LruCache<i32, Instant>>>,
     client: Client,
     target_emote_h: u32,
+    quality: QualityPreset,
 }
 
 impl Clone for EmoteCache {
@@ -110,12 +119,18 @@ impl Clone for EmoteCache {
             missing_disk: self.missing_disk.clone(),
             client: self.client.clone(),
             target_emote_h: self.target_emote_h,
+            quality: self.quality.clone(),
         }
     }
 }
 
 impl EmoteCache {
-    pub(crate) fn new(base: PathBuf, capacity: usize, target_emote_h: u32) -> Self {
+    pub(crate) fn new(
+        base: PathBuf,
+        capacity: usize,
+        target_emote_h: u32,
+        quality: QualityPreset,
+    ) -> Self {
         let cap = capacity.max(1);
         let mem = LruCache::new(NonZeroUsize::new(cap).unwrap());
         let miss_cap = NonZeroUsize::new(cap.max(64)).unwrap();
@@ -126,6 +141,7 @@ impl EmoteCache {
             missing_disk: Arc::new(PLMutex::new(LruCache::new(miss_cap))),
             client: Client::new(),
             target_emote_h,
+            quality,
         }
     }
 
@@ -187,10 +203,14 @@ impl EmoteCache {
         }
     }
 
-    async fn decode_bytes_rayon(bytes: Vec<u8>, target_h: u32) -> AppResult<Arc<EmoteData>> {
+    async fn decode_bytes_rayon(
+        bytes: Vec<u8>,
+        target_h: u32,
+        quality: QualityPreset,
+    ) -> AppResult<Arc<EmoteData>> {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
-            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h)
+            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, &quality)
                 .map_err(|e| AppError::EmoteCache(e.to_string()))
                 .map(Arc::new);
             let _ = tx.send(decoded);
@@ -199,11 +219,6 @@ impl EmoteCache {
             .map_err(|_| AppError::InternalError("decode task dropped".into()))?
     }
 
-    /// Ensure the given emote ids are cached (disk or memory).
-    ///
-    /// - Uses a semaphore only for the download stage.
-    /// - Uses Rayon for decode so CPU-bound work spreads across cores.
-    /// - Uses a negative disk cache to avoid repeated metadata misses.
     pub(crate) async fn ensure_cached(&self, ids: &[i32]) -> AppResult<()> {
         tokio::fs::create_dir_all(&self.base).await?;
 
@@ -249,11 +264,10 @@ impl EmoteCache {
                     }
                 }
 
-                // Disk path lookup is cache-aware and only hits metadata when needed.
                 if let Some(path) = ec.disk_any_path_for_blocking(id) {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
-                    let arc = Self::decode_bytes_rayon(bytes, target_h).await?;
+                    let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
 
                     {
                         let mut m = ec.mem.lock();
@@ -270,7 +284,6 @@ impl EmoteCache {
                     return Ok(());
                 }
 
-                // Download stage only: semaphore does not cover decode.
                 let _permit = download_sem
                     .acquire_owned()
                     .await
@@ -309,12 +322,10 @@ impl EmoteCache {
                 tokio::fs::write(&tmp, &bytes).await?;
                 tokio::fs::rename(&tmp, &disk_path).await?;
 
-                // Decode is intentionally outside the download semaphore.
                 let target_h = ec.target_height();
-                let arc = Self::decode_bytes_rayon(bytes, target_h).await?;
+                let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
                 let (w, h) = (arc.width(), arc.height());
 
-                // Best-effort sidecar for future fast metadata reads.
                 ec.write_sidecar_blocking(id, w, h);
 
                 {
@@ -343,17 +354,15 @@ impl EmoteCache {
     }
 }
 
-/// ImageCache mirrors EmoteCache, but uses a stable u64 content hash key internally.
-/// This avoids hashing the full URL string repeatedly for the in-memory hot path.
 pub struct ImageCache {
     base: PathBuf,
     pub(crate) mem: Arc<PLMutex<LruCache<u64, Arc<EmoteData>>>>,
     inflight: Arc<PLMutex<FxHashMap<u64, Vec<oneshot::Sender<Result<Arc<EmoteData>, String>>>>>>,
     missing_disk: Arc<PLMutex<LruCache<u64, Instant>>>,
-    /// Optional small metadata cache: lets callers query size without forcing decode.
     meta: Arc<PLMutex<LruCache<u64, ImageMetaSidecar>>>,
     client: Client,
     target_emote_h: u32,
+    quality: QualityPreset,
 }
 
 impl Clone for ImageCache {
@@ -366,12 +375,18 @@ impl Clone for ImageCache {
             meta: self.meta.clone(),
             client: self.client.clone(),
             target_emote_h: self.target_emote_h,
+            quality: self.quality.clone(),
         }
     }
 }
 
 impl ImageCache {
-    pub(crate) fn new(base: PathBuf, capacity: usize, target_emote_h: u32) -> Self {
+    pub(crate) fn new(
+        base: PathBuf,
+        capacity: usize,
+        target_emote_h: u32,
+        quality: QualityPreset,
+    ) -> Self {
         let cap = capacity.max(1);
         let mem = LruCache::new(NonZeroUsize::new(cap).unwrap());
         let miss_cap = NonZeroUsize::new(cap.max(64)).unwrap();
@@ -384,6 +399,7 @@ impl ImageCache {
             meta: Arc::new(PLMutex::new(LruCache::new(meta_cap))),
             client: Client::new(),
             target_emote_h,
+            quality,
         }
     }
 
@@ -400,7 +416,6 @@ impl ImageCache {
 
     #[inline]
     fn hash_to_stem(hash: u64) -> String {
-        // Stable and compact; avoids the extra churn of decimal string conversion.
         let mut s = String::with_capacity(16);
         let _ = write!(&mut s, "{:016x}", hash);
         s
@@ -456,7 +471,6 @@ impl ImageCache {
         m.get(&key).cloned()
     }
 
-    /// Fast metadata path: callers can query width/height without requiring a decoded image.
     pub(crate) fn peek_dimensions(&self, url: &str) -> Option<(i32, i32)> {
         let key = self.hash_url(url);
         {
@@ -488,10 +502,14 @@ impl ImageCache {
         cache.put(hash, meta);
     }
 
-    async fn decode_bytes_rayon(bytes: Vec<u8>, target_h: u32) -> AppResult<Arc<EmoteData>> {
+    async fn decode_bytes_rayon(
+        bytes: Vec<u8>,
+        target_h: u32,
+        quality: QualityPreset,
+    ) -> AppResult<Arc<EmoteData>> {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
-            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h)
+            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, &quality)
                 .map_err(|e| AppError::EmoteCache(e.to_string()))
                 .map(Arc::new);
             let _ = tx.send(decoded);
@@ -550,7 +568,7 @@ impl ImageCache {
                 if let Some(path) = ec.disk_any_path_async_by_hash(key) {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
-                    let arc = Self::decode_bytes_rayon(bytes, target_h).await?;
+                    let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
                     let (w, h) = (arc.width(), arc.height());
                     ec.store_sidecar_blocking(key, w, h);
 
@@ -607,7 +625,7 @@ impl ImageCache {
                 tokio::fs::rename(&tmp, &disk_path).await?;
 
                 let target_h = ec.target_height();
-                let arc = Self::decode_bytes_rayon(bytes, target_h).await?;
+                let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
                 let (w, h) = (arc.width(), arc.height());
                 ec.store_sidecar_blocking(key, w, h);
 

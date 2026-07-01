@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { persist } from "zustand/middleware";
 
 export type AppView = "downloads" | "render" | "queue";
 
@@ -9,10 +10,17 @@ interface AppStore {
 	toggleSidebar: () => void;
 }
 
-export const useAppStore = create<AppStore>((set) => ({
-	activeView: "downloads",
-	setActiveView: (activeView) => set({ activeView }),
-	isSidebarCollapsed: false,
-	toggleSidebar: () =>
-		set((state) => ({ isSidebarCollapsed: !state.isSidebarCollapsed })),
-}));
+export const useAppStore = create<AppStore>()(
+	persist(
+		(set) => ({
+			activeView: "downloads",
+			setActiveView: (activeView) => set({ activeView }),
+			isSidebarCollapsed: false,
+			toggleSidebar: () =>
+				set((state) => ({ isSidebarCollapsed: !state.isSidebarCollapsed })),
+		}),
+		{
+			name: "app-view-storage",
+		}
+	)
+);

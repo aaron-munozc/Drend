@@ -12,9 +12,14 @@ import {
 	Square,
 	Trash2,
 	XCircle,
+	RefreshCw,
+	Edit,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { AppTask, TaskType, useQueueStore } from "@/store/useQueueStore.ts";
+import { useDownloadTabStore } from "@/store/useDownloadTabStore.ts";
+import { useRenderTabStore } from "@/store/useRenderTabStore.ts";
+import { useAppStore } from "@/store/useAppStore.ts";
 
 export function QueueView() {
 	const { tasks, isInitialized, initQueue, clearCompleted } = useQueueStore();
@@ -34,7 +39,6 @@ export function QueueView() {
 			t.status === "pending",
 	).length;
 
-	// Filter Logic mapped to camelCase
 	const filteredTasks = tasks.filter((t) => {
 		const isFailed = typeof t.status === "object" && "failed" in t.status;
 		const isActive =
@@ -134,7 +138,7 @@ export function QueueView() {
 // --- TASK CARD COMPONENT ---
 
 function TaskCard({ task }: { task: AppTask }) {
-	const { removeTask } = useQueueStore();
+	const { removeTask, retryTask } = useQueueStore();
 
 	const isFailed = typeof task.status === "object" && "failed" in task.status;
 	const isCompleted = task.status === "completed";
@@ -144,11 +148,29 @@ function TaskCard({ task }: { task: AppTask }) {
 
 	const handleCancel = async () => {
 		if (isPending) {
-			// If it's pending, Rust doesn't know about it yet. Just delete it from the UI queue.
 			removeTask(task.taskId);
 		} else {
-			// Send the signal to the Rust background worker
 			await emit(`cancel-task-${task.taskId}`);
+		}
+	};
+
+	const handleEditClone = () => {
+		if (!task.payload) return;
+
+		if (task.taskType === "chatRender") {
+			useRenderTabStore.getState().addConfiguredTab(
+				task.title,
+				task.payload.jsonFilePath,
+				task.payload.options
+			);
+			useAppStore.getState().setActiveView("render");
+		} else {
+			useDownloadTabStore.getState().addConfiguredTab(
+				task.payload.url,
+				task.taskType,
+				task.payload.options
+			);
+			useAppStore.getState().setActiveView("downloads");
 		}
 	};
 
@@ -226,6 +248,29 @@ function TaskCard({ task }: { task: AppTask }) {
 				</div>
 
 				<div className="flex gap-2 shrink-0">
+					{task.payload && (
+						<button
+							onClick={handleEditClone}
+							className="p-2 bg-muted text-muted-foreground hover:bg-primary/20 hover:text-primary rounded-md transition-colors"
+							title="Clone settings to a new tab"
+						>
+							<Edit className="w-4 h-4" />
+						</button>
+					)}
+
+					{isFailed && task.payload && (
+						<button
+							onClick={() => retryTask(task.taskId)}
+							className="group flex items-center gap-2 px-3 py-1.5 bg-green-500/10 text-green-600 hover:bg-green-500 hover:text-white rounded-md transition-colors"
+							title="Retry Task"
+						>
+							<RefreshCw className="w-4 h-4 group-hover:rotate-180 transition-transform duration-500" />
+							<span className="text-xs font-bold uppercase tracking-wider">
+								Retry
+							</span>
+						</button>
+					)}
+
 					{(isActive || isQueued || isPending) && (
 						<button
 							onClick={handleCancel}

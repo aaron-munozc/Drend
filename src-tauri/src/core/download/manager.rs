@@ -1,18 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
+use crate::core::chat_renderer::{process_chat_render, RenderVideoArgs};
+use crate::types::AppResult;
 use stream_extractor::{
     ChatOptions as ExtractorChatOptions, DownloadOptions as ExtractorDownloadOptions,
     ProgressPayload, QualityPreference, Stream, StreamClient, StreamMetadata, VideoFormat,
 };
-use crate::types::AppResult;
-use crate::core::chat_renderer::{process_chat_render, RenderVideoArgs};
 
 // 1. SPECIFIC FRONTEND CONFIGS
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -72,9 +72,19 @@ pub struct AppTask {
 }
 
 pub enum JobPayload {
-    ChatDownload { meta: StreamMetadata, options: FrontendChatOptions },
-    VodDownload { meta: StreamMetadata, options: FrontendVodOptions },
-    ChatRender { input_path: PathBuf, args: RenderVideoArgs, cache_dir_base: PathBuf },
+    ChatDownload {
+        meta: StreamMetadata,
+        options: FrontendChatOptions,
+    },
+    VodDownload {
+        meta: StreamMetadata,
+        options: FrontendVodOptions,
+    },
+    ChatRender {
+        input_path: PathBuf,
+        args: RenderVideoArgs,
+        cache_dir_base: PathBuf,
+    },
 }
 
 struct QueueItem {
@@ -112,18 +122,25 @@ impl TaskManager {
                 tauri::async_runtime::spawn(async move {
                     let result = match item.payload {
                         JobPayload::ChatDownload { meta, options } => {
-                            Self::process_chat(&app, state_map.clone(), &task_id, meta, options).await
+                            Self::process_chat(&app, state_map.clone(), &task_id, meta, options)
+                                .await
                         }
                         JobPayload::VodDownload { meta, options } => {
-                            Self::process_vod(&app, state_map.clone(), &task_id, meta, options).await
+                            Self::process_vod(&app, state_map.clone(), &task_id, meta, options)
+                                .await
                         }
-                        JobPayload::ChatRender { input_path, args, cache_dir_base } => {
+                        JobPayload::ChatRender {
+                            input_path,
+                            args,
+                            cache_dir_base,
+                        } => {
                             // Setup cancellation listener via AtomicBool to match signature requirements
                             let cancel_flag = Arc::new(AtomicBool::new(false));
                             let cancel_flag_clone = Arc::clone(&cancel_flag);
-                            let cancel_handler = app.listen(format!("cancel-task-{}", task_id), move |_| {
-                                cancel_flag_clone.store(true, Ordering::SeqCst);
-                            });
+                            let cancel_handler =
+                                app.listen(format!("cancel-task-{}", task_id), move |_| {
+                                    cancel_flag_clone.store(true, Ordering::SeqCst);
+                                });
 
                             let render_res = process_chat_render(
                                 &app,
@@ -133,7 +150,8 @@ impl TaskManager {
                                 args,
                                 cache_dir_base,
                                 cancel_flag,
-                            ).await;
+                            )
+                            .await;
 
                             app.unlisten(cancel_handler);
                             render_res
@@ -212,9 +230,7 @@ impl TaskManager {
             .map(PathBuf::from)
             .or_else(|| app.path().download_dir().ok());
 
-        let quality = opts
-            .quality
-            .unwrap_or(QualityPreference::Best);
+        let quality = opts.quality.unwrap_or(QualityPreference::Best);
 
         let engine_opts = ExtractorDownloadOptions {
             output_dir: out_dir,
@@ -296,7 +312,12 @@ impl TaskManager {
     }
 
     // --- ENQUEUE METHODS ---
-    pub fn enqueue_chat_render(&self, input_path: PathBuf, args: RenderVideoArgs, cache_dir_base: PathBuf) -> String {
+    pub fn enqueue_chat_render(
+        &self,
+        input_path: PathBuf,
+        args: RenderVideoArgs,
+        cache_dir_base: PathBuf,
+    ) -> String {
         let title = input_path
             .file_name()
             .map(|os_str| os_str.to_string_lossy().into_owned())
@@ -309,17 +330,32 @@ impl TaskManager {
             .to_string();
 
         let task_id = format!("render_{}", timestamp);
-        self.create_task(&task_id, TaskType::ChatRender, format!("Rendering: {}", title));
+        self.create_task(
+            &task_id,
+            TaskType::ChatRender,
+            format!("Rendering: {}", title),
+        );
 
         let _ = self.tx.send(QueueItem {
             task_id: task_id.clone(),
-            payload: JobPayload::ChatRender { input_path, args, cache_dir_base },
+            payload: JobPayload::ChatRender {
+                input_path,
+                args,
+                cache_dir_base,
+            },
         });
         task_id
     }
 
-    pub fn enqueue_chat_download(&self, meta: StreamMetadata, options: FrontendChatOptions) -> String {
-        let title = meta.title.clone().unwrap_or_else(|| "Unknown Stream".to_string());
+    pub fn enqueue_chat_download(
+        &self,
+        meta: StreamMetadata,
+        options: FrontendChatOptions,
+    ) -> String {
+        let title = meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "Unknown Stream".to_string());
 
         let id_str = meta.chat_id.map(|id| id.to_string()).unwrap_or_else(|| {
             std::time::SystemTime::now()
@@ -339,8 +375,15 @@ impl TaskManager {
         task_id
     }
 
-    pub fn enqueue_vod_download(&self, meta: StreamMetadata, options: FrontendVodOptions) -> String {
-        let title = meta.title.clone().unwrap_or_else(|| "Unknown Stream".to_string());
+    pub fn enqueue_vod_download(
+        &self,
+        meta: StreamMetadata,
+        options: FrontendVodOptions,
+    ) -> String {
+        let title = meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "Unknown Stream".to_string());
 
         let id_str = meta.vod_uuid.clone().unwrap_or_else(|| {
             std::time::SystemTime::now()

@@ -1,10 +1,13 @@
+use crate::core::{
+    analyze_stream_url, get_download_queue, queue_chat_download, queue_chat_render,
+    queue_vod_download,
+};
+use crate::types::Metadata;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use tauri::Manager;
 use tauri_plugin_log::fern::colors::{Color, ColoredLevelConfig};
-use crate::core::{analyze_stream_url, get_download_queue, queue_chat_download, queue_chat_render, queue_vod_download};
-use crate::types::Metadata;
 
 mod core;
 mod error;

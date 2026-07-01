@@ -1,4 +1,5 @@
 mod args;
+mod emote_providers;
 mod engine;
 mod helpers;
 mod regex;

@@ -1,10 +1,10 @@
-use std::path::PathBuf;
 use crate::core::chat_renderer::RenderVideoArgs;
 use crate::core::download::manager::{FrontendChatOptions, FrontendVodOptions};
 use crate::core::{AppTask, TaskManager};
 use crate::error::AppError;
 use crate::types::{AppResult, Metadata};
 use crate::AppCache;
+use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
@@ -46,10 +46,9 @@ pub async fn queue_chat_render(
     let args = options.unwrap_or_default();
     let input_path = PathBuf::from(json_file_path);
 
-    let cache_dir_base = app_handle
-        .path()
-        .app_cache_dir()
-        .map_err(|e| AppError::Generic(format!("Failed to parse application cache layout: {}", e)))?;
+    let cache_dir_base = app_handle.path().app_cache_dir().map_err(|e| {
+        AppError::Generic(format!("Failed to parse application cache layout: {}", e))
+    })?;
 
     let task_id = manager.enqueue_chat_render(input_path, args, cache_dir_base);
     Ok(task_id)
@@ -64,13 +63,18 @@ pub async fn get_download_queue(manager: State<'_, TaskManager>) -> AppResult<Ve
 // HELPERS
 // ==========================================
 
-fn fetch_cached_metadata(cache: &State<'_, AppCache>, target_url: &str) -> Result<Metadata, AppError> {
-    let mut lock = cache
-        .streams
-        .lock()
-        .map_err(|_| AppError::InternalError("Memory protection subsystem error (Lock Poisoned)".into()))?;
+fn fetch_cached_metadata(
+    cache: &State<'_, AppCache>,
+    target_url: &str,
+) -> Result<Metadata, AppError> {
+    let mut lock = cache.streams.lock().map_err(|_| {
+        AppError::InternalError("Memory protection subsystem error (Lock Poisoned)".into())
+    })?;
 
-    lock.get(target_url)
-        .cloned()
-        .ok_or_else(|| AppError::Generic("Target system index metadata expired or not found. Please analyze the URL again.".into()))
+    lock.get(target_url).cloned().ok_or_else(|| {
+        AppError::Generic(
+            "Target system index metadata expired or not found. Please analyze the URL again."
+                .into(),
+        )
+    })
 }

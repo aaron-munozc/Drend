@@ -2,7 +2,7 @@ use crate::core::AppTask;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use skia_safe::{
-    surfaces, AlphaType, Color, ColorType, Font, FontMgr, FontStyle, Image, ImageInfo, Paint,
+    surfaces, AlphaType, Color, ColorType, Font, FontMgr, FontStyle, ImageInfo, Paint, TextBlob,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,9 +17,11 @@ use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
 
 use crate::core::chat_renderer::args::{BackgroundMode, EvictionStrategy, RenderVideoArgs};
+use crate::core::chat_renderer::emote_providers::{tokenise, MessageToken, ResolvedEmote};
 use crate::core::chat_renderer::helpers::ease_out;
-use crate::core::chat_renderer::regex::{EMOTE_REGEX, IMAGE_URL_REGEX};
-use crate::core::chat_renderer::types::{EmoteCache, EmoteData, ImageCache};
+use crate::core::chat_renderer::types::{
+    EmoteCache, EmoteData, ImageCache, LayoutLine, LayoutToken,
+};
 use crate::error::AppError;
 use crate::types::AppResult;
 
@@ -27,7 +29,6 @@ const EMOTE_SCALE: f32 = 1.25;
 const EMOTE_MARGIN: f32 = 6.0;
 const PRE_RENDER_BATCH_SIZE: usize = 64;
 
-// 1. Thread Pool for Parallel Computations
 static RENDER_POOL: once_cell::sync::Lazy<rayon::ThreadPool> = once_cell::sync::Lazy::new(|| {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -42,7 +43,6 @@ static RENDER_POOL: once_cell::sync::Lazy<rayon::ThreadPool> = once_cell::sync::
         .expect("Failed to build render thread pool")
 });
 
-// 2. Performance Caches & Memory Recycling Pools
 thread_local! {
     static SKIA_SURFACE: RefCell<Option<skia_safe::Surface>> = RefCell::new(None);
     static PRE_RENDER_MEASURE_CACHE: RefCell<FxHashMap<String, f32>> = RefCell::new(FxHashMap::default());
@@ -69,35 +69,24 @@ impl PixelBufferPool {
     }
 }
 
-// 3. Layout Structs
 #[derive(Clone)]
 struct ScheduledMessage {
     spawn_frame: u32,
-    img: Option<Image>,
-    img_h: Option<i32>,
-    placements: Option<Vec<EmotePlacement>>,
+    lines: Vec<LayoutLine>,
+    bubble_w: i32,
+    bubble_h: i32,
+    bg_color: Color,
+    user_color: Color,
+    is_grouped: bool,
 }
 
-#[derive(Clone)]
-pub struct EmotePlacement {
-    emote_id: Option<i32>,
-    media_url: Option<String>,
-    x: f32,
-    y: f32,
-    w: i32,
-    h: i32,
-    animated: bool,
-}
-
-// 4. Core Render Pipeline
 #[allow(clippy::too_many_arguments)]
-fn render_message_to_image_blocking(
+fn layout_message_blocking(
     content: &str,
     username: &str,
     user_hex_color: &str,
     username_font: &Font,
     message_font: &Font,
-    message_color: Color,
     available_w: f32,
     msg_line_h: f32,
     message_ascent: f32,
@@ -105,14 +94,8 @@ fn render_message_to_image_blocking(
     image_cache: &ImageCache,
     args: &RenderVideoArgs,
     measure_cache: &mut FxHashMap<String, f32>,
-) -> Result<(Image, i32, i32, Vec<EmotePlacement>), AppError> {
-    #[derive(Clone, Copy)]
-    enum Segment<'a> {
-        Text(&'a str),
-        Emote(i32, &'a str),
-        Media(&'a str),
-    }
-
+    is_grouped: bool,
+) -> Result<(Vec<LayoutLine>, i32, i32, Color), AppError> {
     #[inline]
     fn measure_cached(font: &Font, key: &str, cache: &mut FxHashMap<String, f32>) -> f32 {
         if let Some(&v) = cache.get(key) {
@@ -165,48 +148,30 @@ fn render_message_to_image_blocking(
         out
     }
 
-    let mut matches = Vec::new();
-    for caps in EMOTE_REGEX.captures_iter(content) {
-        if let (Some(m), Some(id_cap), Some(name_cap)) =
-            (caps.get(0), caps.name("id"), caps.name("name"))
-        {
-            let id = id_cap.as_str().parse::<i32>().unwrap_or(0);
-            matches.push((m.start(), m.end(), Segment::Emote(id, name_cap.as_str())));
+    let parsed_user_color = if !user_hex_color.is_empty() {
+        let clean = user_hex_color.trim_start_matches('#');
+        if let Ok(val) = u32::from_str_radix(clean, 16) {
+            Color::from_rgb((val >> 16) as u8, (val >> 8) as u8, val as u8)
+        } else {
+            Color::WHITE
         }
-    }
-    for m in IMAGE_URL_REGEX.find_iter(content) {
-        matches.push((m.start(), m.end(), Segment::Media(m.as_str())));
-    }
-    matches.sort_by_key(|a| a.0);
+    } else {
+        Color::WHITE
+    };
 
-    let mut segments = Vec::new();
-    let mut last = 0;
-    for (start, end, seg) in matches {
-        if start < last {
-            continue;
-        }
-        if start > last {
-            segments.push(Segment::Text(&content[last..start]));
-        }
-        segments.push(seg);
-        last = end;
-    }
-    if last < content.len() {
-        segments.push(Segment::Text(&content[last..]));
-    }
-
+    let tokens = tokenise(content, None);
     let max_w = available_w.max(1.0);
     let prefix = format!("{}: ", username);
     let prefix_w = measure_cached(username_font, &prefix, measure_cache);
     let space_w = measure_cached(message_font, " ", measure_cache);
 
-    let mut lines: Vec<Vec<Segment>> = Vec::new();
+    let mut lines: Vec<Vec<MessageToken>> = Vec::new();
     let mut current_line = Vec::new();
-    let mut cur_w = prefix_w;
+    let mut cur_w = if is_grouped { 0.0 } else { prefix_w };
 
-    for seg in &segments {
-        match seg {
-            Segment::Text(s) => {
+    for token in &tokens {
+        match token {
+            MessageToken::Text(s) => {
                 for (pi, para) in s.split('\n').enumerate() {
                     if para.is_empty() && pi > 0 {
                         lines.push(std::mem::take(&mut current_line));
@@ -220,10 +185,10 @@ fn render_message_to_image_blocking(
 
                         if cur_w + needed_space + word_w <= max_w {
                             if !first_word {
-                                current_line.push(Segment::Text(" "));
+                                current_line.push(MessageToken::Text(" ".into()));
                                 cur_w += space_w;
                             }
-                            current_line.push(Segment::Text(raw_word));
+                            current_line.push(MessageToken::Text(raw_word.into()));
                             cur_w += word_w;
                         } else {
                             if !current_line.is_empty() {
@@ -239,7 +204,7 @@ fn render_message_to_image_blocking(
                                 );
                                 let flen = frags.len();
                                 for (fi, f) in frags.into_iter().enumerate() {
-                                    current_line.push(Segment::Text(f));
+                                    current_line.push(MessageToken::Text(f.into()));
                                     cur_w += measure_cached(message_font, f, measure_cache);
                                     if fi < flen - 1 {
                                         lines.push(std::mem::take(&mut current_line));
@@ -247,7 +212,7 @@ fn render_message_to_image_blocking(
                                     }
                                 }
                             } else {
-                                current_line.push(Segment::Text(raw_word));
+                                current_line.push(MessageToken::Text(raw_word.into()));
                                 cur_w = word_w;
                             }
                         }
@@ -255,9 +220,10 @@ fn render_message_to_image_blocking(
                     }
                 }
             }
-            Segment::Emote(id, _) => {
+            MessageToken::KickEmote { id, .. } => {
+                let parsed_id = id.parse::<i32>().unwrap_or(0);
                 let ew = emote_cache
-                    .get(*id)
+                    .get(parsed_id)
                     .map(|ed| ed.width() as f32)
                     .unwrap_or(emote_cache.target_height() as f32)
                     * EMOTE_SCALE;
@@ -267,10 +233,11 @@ fn render_message_to_image_blocking(
                     lines.push(std::mem::take(&mut current_line));
                     cur_w = 0.0;
                 }
-                current_line.push(*seg);
+                current_line.push(token.clone());
                 cur_w += padded_ew;
             }
-            Segment::Media(url) => {
+            MessageToken::ProviderEmote(ResolvedEmote { url, .. })
+            | MessageToken::ImageUrl(url) => {
                 let mw = image_cache
                     .get(url)
                     .map(|ed| ed.width() as f32)
@@ -282,7 +249,7 @@ fn render_message_to_image_blocking(
                     lines.push(std::mem::take(&mut current_line));
                     cur_w = 0.0;
                 }
-                current_line.push(*seg);
+                current_line.push(token.clone());
                 cur_w += padded_mw;
             }
         }
@@ -291,203 +258,135 @@ fn render_message_to_image_blocking(
         lines.push(current_line);
     }
 
+    let bubble_pad = args.bubble_padding.max(0) as f32;
+    let mut layout_lines = Vec::with_capacity(lines.len());
     let mut measured_max_w = 0f32;
-    let mut line_heights = Vec::with_capacity(lines.len());
+    let mut y_cursor = bubble_pad;
+
     for (li, line) in lines.iter().enumerate() {
-        let mut lw = if li == 0 { prefix_w } else { 0.0 };
+        let mut lw = if li == 0 && !is_grouped {
+            prefix_w
+        } else {
+            0.0
+        };
         let mut lh = msg_line_h;
-        for seg in line {
-            match seg {
-                Segment::Text(s) => lw += measure_cached(message_font, s, measure_cache),
-                Segment::Emote(id, _) => {
-                    let (w, h) = emote_cache
-                        .get(*id)
+
+        for token in line {
+            match token {
+                MessageToken::Text(s) => lw += measure_cached(message_font, s, measure_cache),
+                MessageToken::KickEmote { id, .. } => {
+                    let parsed_id = id.parse::<i32>().unwrap_or(0);
+                    let (_, h) = emote_cache
+                        .get(parsed_id)
                         .map(|ed| (ed.width() as f32, ed.height() as f32))
-                        .unwrap_or((
-                            emote_cache.target_height() as f32,
-                            emote_cache.target_height() as f32,
-                        ));
-                    lw += (w * EMOTE_SCALE) + EMOTE_MARGIN;
+                        .unwrap_or((0.0, emote_cache.target_height() as f32));
                     lh = lh.max(h * EMOTE_SCALE);
                 }
-                Segment::Media(url) => {
-                    let (w, h) = image_cache
+                MessageToken::ProviderEmote(ResolvedEmote { url, .. })
+                | MessageToken::ImageUrl(url) => {
+                    let (_, h) = image_cache
                         .get(url)
                         .map(|ed| (ed.width() as f32, ed.height() as f32))
-                        .unwrap_or((
-                            image_cache.target_height() as f32,
-                            image_cache.target_height() as f32,
-                        ));
-                    lw += (w * EMOTE_SCALE) + EMOTE_MARGIN;
+                        .unwrap_or((0.0, image_cache.target_height() as f32));
                     lh = lh.max((h * EMOTE_SCALE) + 8.0);
                 }
             }
         }
-        measured_max_w = measured_max_w.max(lw);
-        line_heights.push(lh);
+
+        let baseline = y_cursor + ((lh - msg_line_h) / 2.0).max(0.0) - message_ascent;
+        let mut x_cursor = bubble_pad;
+        let mut layout_tokens = Vec::new();
+
+        if li == 0 && !is_grouped {
+            if let Some(blob) = TextBlob::from_str(&prefix, username_font) {
+                layout_tokens.push(LayoutToken::Glyph {
+                    blob,
+                    x: x_cursor,
+                    y: baseline,
+                    width: prefix_w,
+                });
+            }
+            x_cursor += prefix_w;
+        }
+
+        for token in line {
+            match token {
+                MessageToken::Text(s) => {
+                    let w = measure_cached(message_font, s, measure_cache);
+                    if let Some(blob) = TextBlob::from_str(s, message_font) {
+                        layout_tokens.push(LayoutToken::Glyph {
+                            blob,
+                            x: x_cursor,
+                            y: baseline,
+                            width: w,
+                        });
+                    }
+                    x_cursor += w;
+                }
+                MessageToken::KickEmote { id, .. } => {
+                    let parsed_id = id.parse::<i32>().unwrap_or(0);
+                    if let Some(ed) = emote_cache.get(parsed_id) {
+                        let sw = ed.width() as f32 * EMOTE_SCALE;
+                        let sh = ed.height() as f32 * EMOTE_SCALE;
+                        let draw_y = if args.center_emotes_vertically {
+                            y_cursor + (lh - sh) / 2.0
+                        } else {
+                            y_cursor
+                        };
+                        let draw_x = x_cursor + (EMOTE_MARGIN / 2.0);
+
+                        layout_tokens.push(LayoutToken::Emote {
+                            data: ed,
+                            x: draw_x,
+                            y: draw_y,
+                        });
+                        x_cursor += sw + EMOTE_MARGIN;
+                    }
+                }
+                MessageToken::ProviderEmote(ResolvedEmote { url, .. })
+                | MessageToken::ImageUrl(url) => {
+                    if let Some(ed) = image_cache.get(url) {
+                        let sw = ed.width() as f32 * EMOTE_SCALE;
+                        let sh = ed.height() as f32 * EMOTE_SCALE;
+                        let draw_y = if args.center_emotes_vertically {
+                            y_cursor + (lh - sh) / 2.0
+                        } else {
+                            y_cursor
+                        };
+                        let draw_x = x_cursor + (EMOTE_MARGIN / 2.0);
+
+                        layout_tokens.push(LayoutToken::Emote {
+                            data: ed,
+                            x: draw_x,
+                            y: draw_y,
+                        });
+                        x_cursor += sw + EMOTE_MARGIN;
+                    }
+                }
+            }
+        }
+
+        measured_max_w = measured_max_w.max(x_cursor - bubble_pad);
+        layout_lines.push(LayoutLine {
+            tokens: layout_tokens,
+            line_height: lh,
+            total_width: x_cursor - bubble_pad,
+        });
+
+        y_cursor += lh;
     }
 
-    let bubble_pad = args.bubble_padding.max(0) as f32;
     let content_width = (measured_max_w + bubble_pad * 2.0).ceil() as i32;
     let final_width = if args.bubble_mode_full_width {
         (max_w.ceil() as i32).max(1)
     } else {
         content_width.max(1)
     };
-    let final_height = (line_heights.iter().sum::<f32>() + bubble_pad * 2.0).ceil() as i32;
+    let final_height = (y_cursor + bubble_pad).ceil() as i32;
 
-    SKIA_SURFACE.with(|surf_cell| {
-        let mut surf_opt = surf_cell.borrow_mut();
-        if surf_opt.is_none()
-            || surf_opt.as_ref().unwrap().width() != final_width
-            || surf_opt.as_ref().unwrap().height() != final_height
-        {
-            *surf_opt = Some(
-                surfaces::raster_n32_premul((final_width, final_height))
-                    .expect("Raster Allocation Failure"),
-            );
-        }
-        let surf = surf_opt.as_mut().unwrap();
-        let canvas = surf.canvas();
-        canvas.clear(Color::TRANSPARENT);
-
-        let mut paint = Paint::default();
-        paint.set_anti_alias(true);
-        paint.set_color(Color::from(&args.bubble_color));
-        canvas.draw_round_rect(
-            skia_safe::Rect::new(0.0, 0.0, final_width as f32, final_height as f32),
-            args.bubble_radius,
-            args.bubble_radius,
-            &paint,
-        );
-
-        let mut placements = Vec::new();
-        let mut y_cursor = bubble_pad;
-
-        let parsed_user_color = if !user_hex_color.is_empty() {
-            let clean = user_hex_color.trim_start_matches('#');
-            if let Ok(val) = u32::from_str_radix(clean, 16) {
-                Color::from_rgb((val >> 16) as u8, (val >> 8) as u8, val as u8)
-            } else {
-                Color::WHITE
-            }
-        } else {
-            Color::WHITE
-        };
-
-        for (li, line) in lines.iter().enumerate() {
-            let lh = line_heights[li];
-            let baseline = y_cursor + ((lh - msg_line_h) / 2.0).max(0.0) - message_ascent;
-            let mut x_cursor = bubble_pad;
-
-            if li == 0 {
-                if args.username_shadow {
-                    paint.set_color(Color::from_argb(180, 0, 0, 0));
-                    canvas.draw_str(
-                        &prefix,
-                        (x_cursor + 2.0, baseline + 2.0),
-                        username_font,
-                        &paint,
-                    );
-                }
-                if args.outline_usernames {
-                    paint.set_style(skia_safe::paint::Style::Stroke);
-                    paint.set_stroke_width(args.username_outline_width.unwrap_or(1.5));
-                    paint.set_color(Color::from_argb(200, 0, 0, 0));
-                    canvas.draw_str(&prefix, (x_cursor, baseline), username_font, &paint);
-                    paint.set_style(skia_safe::paint::Style::Fill);
-                }
-                paint.set_color(parsed_user_color);
-                canvas.draw_str(&prefix, (x_cursor, baseline), username_font, &paint);
-                x_cursor += prefix_w;
-            }
-
-            for seg in line {
-                match seg {
-                    Segment::Text(s) => {
-                        paint.set_color(message_color);
-                        canvas.draw_str(s, (x_cursor, baseline), message_font, &paint);
-                        x_cursor += measure_cached(message_font, s, measure_cache);
-                    }
-                    Segment::Emote(id, _) => {
-                        if let Some(ed) = emote_cache.get(*id) {
-                            let sw = ed.width() as f32 * EMOTE_SCALE;
-                            let sh = ed.height() as f32 * EMOTE_SCALE;
-                            let draw_y = if args.center_emotes_vertically {
-                                y_cursor + (lh - sh) / 2.0
-                            } else {
-                                y_cursor
-                            };
-
-                            let draw_x = x_cursor + (EMOTE_MARGIN / 2.0);
-
-                            let is_animated = match &*ed {
-                                EmoteData::Animated { .. } => true,
-                                EmoteData::Static { img, .. } => {
-                                    canvas.save();
-                                    canvas.translate((draw_x, draw_y));
-                                    canvas.scale((EMOTE_SCALE, EMOTE_SCALE));
-                                    canvas.draw_image(img, (0, 0), None);
-                                    canvas.restore();
-                                    false
-                                }
-                            };
-                            placements.push(EmotePlacement {
-                                emote_id: Some(*id),
-                                media_url: None,
-                                x: draw_x,
-                                y: draw_y,
-                                w: sw as i32,
-                                h: sh as i32,
-                                animated: is_animated,
-                            });
-                            x_cursor += sw + EMOTE_MARGIN;
-                        }
-                    }
-                    Segment::Media(url) => {
-                        if let Some(ed) = image_cache.get(url) {
-                            let sw = ed.width() as f32 * EMOTE_SCALE;
-                            let sh = ed.height() as f32 * EMOTE_SCALE;
-                            let draw_y = if args.center_emotes_vertically {
-                                y_cursor + (lh - sh) / 2.0
-                            } else {
-                                y_cursor
-                            };
-
-                            let draw_x = x_cursor + (EMOTE_MARGIN / 2.0);
-
-                            let is_animated = match &*ed {
-                                EmoteData::Animated { .. } => true,
-                                EmoteData::Static { img, .. } => {
-                                    canvas.save();
-                                    canvas.translate((draw_x, draw_y));
-                                    canvas.scale((EMOTE_SCALE, EMOTE_SCALE));
-                                    canvas.draw_image(img, (0, 0), None);
-                                    canvas.restore();
-                                    false
-                                }
-                            };
-                            placements.push(EmotePlacement {
-                                emote_id: None,
-                                media_url: Some(url.to_string()),
-                                x: draw_x,
-                                y: draw_y,
-                                w: sw as i32,
-                                h: sh as i32,
-                                animated: is_animated,
-                            });
-                            x_cursor += sw + EMOTE_MARGIN;
-                        }
-                    }
-                }
-            }
-            y_cursor += lh;
-        }
-        Ok((surf.image_snapshot(), final_width, final_height, placements))
-    })
+    Ok((layout_lines, final_width, final_height, parsed_user_color))
 }
 
-// 5. Main Engine Execution Process
 pub async fn process_chat_render(
     app: &AppHandle,
     tasks: Arc<Mutex<HashMap<String, AppTask>>>,
@@ -587,28 +486,36 @@ pub async fn process_chat_render(
     let mut base_time_secs: Option<i64> = None;
     let skip_users_set: HashSet<String> = args.skip_users.clone().into_iter().collect();
 
-    // Pass 1: Scan Metadata and establish relative timing
     while let Some(line) = reader.next_line().await? {
         if let Ok(msg) = serde_json::from_str::<MessageSaved>(&line) {
-            // New struct mapping for username
             if skip_users_set.contains(&msg.sender.username) {
                 continue;
             }
 
-            // Calculate relative offset dynamically
             if base_time_secs.is_none() {
-                base_time_secs = Some(args.time_zero_ms.map(|t| (t / 1000) as i64).unwrap_or(msg.created_at_secs));
+                base_time_secs = Some(
+                    args.time_zero_ms
+                        .map(|t| (t / 1000) as i64)
+                        .unwrap_or(msg.created_at_secs),
+                );
             }
             let offset_sec = ((msg.created_at_secs - base_time_secs.unwrap()) as f64).max(0.0);
             max_offset_sec = max_offset_sec.max(offset_sec);
 
-            for caps in EMOTE_REGEX.captures_iter(&msg.content) {
-                if let Some(id) = caps.name("id").and_then(|m| m.as_str().parse::<i32>().ok()) {
-                    emote_ids.insert(id);
+            let tokens = tokenise(&msg.content, None);
+            for t in &tokens {
+                match t {
+                    MessageToken::KickEmote { id, .. } => {
+                        if let Ok(i) = id.parse::<i32>() {
+                            emote_ids.insert(i);
+                        }
+                    }
+                    MessageToken::ProviderEmote(ResolvedEmote { url, .. })
+                    | MessageToken::ImageUrl(url) => {
+                        image_urls.insert(url.clone());
+                    }
+                    _ => {}
                 }
-            }
-            for mat in IMAGE_URL_REGEX.find_iter(&msg.content) {
-                image_urls.insert(mat.as_str().to_string());
             }
         }
     }
@@ -616,15 +523,18 @@ pub async fn process_chat_render(
     emit_progress(5.0, "Hydrating caches...");
 
     let target_emote_h = ((args.font_size + args.line_spacing as f32) * 0.85).ceil() as u32;
+
     let emote_cache = Arc::new(EmoteCache::new(
         cache_dir_base.join("emote_cache"),
-        512,
+        args.max_cached_emotes,
         target_emote_h,
+        args.quality_preset.clone(),
     ));
     let img_cache = Arc::new(ImageCache::new(
         cache_dir_base.join("image_cache"),
-        128,
+        args.max_cached_emotes,
         target_emote_h * 4,
+        args.quality_preset.clone(),
     ));
 
     emote_cache
@@ -646,22 +556,34 @@ pub async fn process_chat_render(
     let (_, metrics) = message_font.metrics();
     let msg_line_h = (metrics.descent - metrics.ascent) + args.line_spacing as f32;
 
-    let (loader_tx, loader_rx) = crossbeam_channel::bounded::<MessageSaved>(2048);
+    let (loader_tx, loader_rx) = crossbeam_channel::bounded::<(MessageSaved, bool)>(2048);
     let (stamp_tx, stamp_rx) = crossbeam_channel::bounded::<(u32, Arc<ScheduledMessage>)>(512);
 
     let loader_path = input_path.clone();
     let loader_cancel = Arc::clone(&cancel_flag);
+    let group_window = args.group_messages_window_secs as i64;
+    let group_enabled = args.group_messages;
+
     std::thread::spawn(move || {
         let f = std::fs::File::open(loader_path).unwrap();
         let reader = std::io::BufReader::new(f);
+        let mut last_user = String::new();
+        let mut last_time = -1i64;
+
         for line in std::io::BufRead::lines(reader).flatten() {
             if loader_cancel.load(Ordering::SeqCst) {
                 break;
             }
             if let Ok(msg) = serde_json::from_str::<MessageSaved>(&line) {
-                // New struct mapping for username
                 if !skip_users_set.contains(&msg.sender.username) {
-                    if loader_tx.send(msg).is_err() {
+                    let is_grouped = group_enabled
+                        && msg.sender.username == last_user
+                        && (msg.created_at_secs - last_time) <= group_window;
+
+                    last_user = msg.sender.username.clone();
+                    last_time = msg.created_at_secs;
+
+                    if loader_tx.send((msg, is_grouped)).is_err() {
                         break;
                     }
                 }
@@ -679,7 +601,7 @@ pub async fn process_chat_render(
         let mut batch = Vec::with_capacity(PRE_RENDER_BATCH_SIZE);
         let mut last_assigned_frame = -1i64;
 
-        let flush_batch = |batch_to_flush: Vec<MessageSaved>, last_frame: &mut i64| {
+        let flush_batch = |batch_to_flush: Vec<(MessageSaved, bool)>, last_frame: &mut i64| {
             if batch_to_flush.is_empty() {
                 return;
             }
@@ -687,11 +609,10 @@ pub async fn process_chat_render(
             let rendered: Vec<Option<ScheduledMessage>> = RENDER_POOL.install(|| {
                 batch_to_flush
                     .into_par_iter()
-                    .map(|msg| {
+                    .map(|(msg, is_grouped)| {
                         PRE_RENDER_MEASURE_CACHE.with(|cache_cell| {
                             let mut measure_cache = cache_cell.borrow_mut();
 
-                            // Calculate offset and map to frame timeline
                             let offset_sec = ((msg.created_at_secs - base_time_pr) as f64).max(0.0);
                             let base_frame = (offset_sec * args_pr.fps as f64).round() as i64;
                             let assigned_frame = if base_frame <= *last_frame {
@@ -700,27 +621,32 @@ pub async fn process_chat_render(
                                 base_frame
                             };
 
-                            match render_message_to_image_blocking(
+                            match layout_message_blocking(
                                 &msg.content,
-                                &msg.sender.username,         // New struct access
-                                &msg.sender.identity.color,   // New struct access
+                                &msg.sender.username,
+                                &msg.sender.identity.color,
                                 &username_font,
                                 &message_font,
-                                Color::from(&args_pr.message_color),
                                 (args_pr.width - 2 * args_pr.padding) as f32,
                                 msg_line_h,
                                 metrics.ascent,
                                 &emote_cache_pr,
                                 &img_cache_pr,
                                 &args_pr,
-                                &mut *measure_cache,
+                                &mut measure_cache,
+                                is_grouped,
                             ) {
-                                Ok((img, _w, h, placements)) => Some(ScheduledMessage {
-                                    spawn_frame: assigned_frame as u32,
-                                    img: Some(img),
-                                    img_h: Some(h),
-                                    placements: Some(placements),
-                                }),
+                                Ok((lines, bubble_w, bubble_h, user_color)) => {
+                                    Some(ScheduledMessage {
+                                        spawn_frame: assigned_frame as u32,
+                                        lines,
+                                        bubble_w,
+                                        bubble_h,
+                                        bg_color: Color::from(&args_pr.bubble_color),
+                                        user_color,
+                                        is_grouped,
+                                    })
+                                }
                                 Err(_) => None,
                             }
                         })
@@ -736,11 +662,11 @@ pub async fn process_chat_render(
             }
         };
 
-        while let Ok(msg) = loader_rx.recv() {
+        while let Ok(msg_tuple) = loader_rx.recv() {
             if pr_cancel.load(Ordering::SeqCst) {
                 break;
             }
-            batch.push(msg);
+            batch.push(msg_tuple);
             if batch.len() >= PRE_RENDER_BATCH_SIZE {
                 flush_batch(std::mem::take(&mut batch), &mut last_assigned_frame);
             }
@@ -809,176 +735,290 @@ pub async fn process_chat_render(
         if frame_chunk.len() >= chunk_size || f_idx == total_frames - 1 {
             let pool = Arc::clone(&pixel_pool);
             let args_block = args.clone();
-            let rayon_emotes = Arc::clone(&emote_cache);
-            let rayon_imgs = Arc::clone(&img_cache);
             let info_clone = info.clone();
 
             let current_chunk = std::mem::take(&mut frame_chunk);
+            let blocks: Vec<Vec<(u32, Vec<Arc<ScheduledMessage>>)>> =
+                current_chunk.chunks(16).map(|c| c.to_vec()).collect();
 
             let rendered_pixels: Vec<Vec<u8>> = RENDER_POOL.install(|| {
-                current_chunk
+                blocks
                     .into_par_iter()
-                    .map(move |(frame_id, bubbles)| {
-                        let mut pixels = pool.acquire(num_bytes);
-                        unsafe {
-                            pixels.set_len(num_bytes);
-                        }
+                    .flat_map(|block| {
+                        let mut out = Vec::with_capacity(block.len());
+                        let mut prev_pixels: Option<Vec<u8>> = None;
+                        let mut last_bubbles_len = 0;
 
-                        SKIA_SURFACE.with(|surf_cell| {
-                            let mut surf_opt = surf_cell.borrow_mut();
-
-                            if surf_opt.is_none()
-                                || surf_opt.as_ref().unwrap().width() != actual_width
-                                || surf_opt.as_ref().unwrap().height() != args_block.height
-                            {
-                                *surf_opt = Some(
-                                    surfaces::raster_n32_premul((
-                                        actual_width,
-                                        args_block.height,
-                                    ))
-                                        .unwrap(),
-                                );
+                        for (frame_id, bubbles) in block {
+                            let mut pixels = pool.acquire(num_bytes);
+                            unsafe {
+                                pixels.set_len(num_bytes);
                             }
 
-                            let surface = surf_opt.as_mut().unwrap();
-                            let canvas = surface.canvas();
-                            canvas.clear(bg_color);
+                            let is_dirty = bubbles.len() != last_bubbles_len
+                                || bubbles.iter().any(|b| {
+                                    let age =
+                                        (frame_id - b.spawn_frame) as f32 / args_block.fps as f32;
+                                    let sliding = args_block.anim_slide && age < 0.5;
+                                    let fading_in = args_block.anim_fade_in && age < 0.5;
+                                    let fading_out = matches!(
+                                        args_block.eviction_strategy,
+                                        EvictionStrategy::Timed
+                                    ) && age
+                                        > args_block.message_hold_seconds as f32;
+                                    let has_anim = b.lines.iter().any(|l| {
+                                        l.tokens.iter().any(|t| match t {
+                                            LayoutToken::Emote { data, .. } => {
+                                                matches!(**data, EmoteData::Animated { .. })
+                                            }
+                                            _ => false,
+                                        })
+                                    });
+                                    sliding || fading_in || fading_out || has_anim
+                                });
 
-                            let mut y_cursor = (args_block.height - args_block.padding) as f32;
-                            let mut paint = Paint::default();
-                            paint.set_anti_alias(true);
+                            last_bubbles_len = bubbles.len();
 
-                            let mut mask_paint = paint.clone();
-                            if is_luma {
-                                mask_paint.set_color_filter(skia_safe::color_filters::blend(
+                            if !is_dirty && prev_pixels.is_some() {
+                                pixels.copy_from_slice(prev_pixels.as_ref().unwrap());
+                                out.push(pixels);
+                                continue;
+                            }
+
+                            SKIA_SURFACE.with(|surf_cell| {
+                                let mut surf_opt = surf_cell.borrow_mut();
+
+                                if surf_opt.is_none()
+                                    || surf_opt.as_ref().unwrap().width() != actual_width
+                                    || surf_opt.as_ref().unwrap().height() != args_block.height
+                                {
+                                    *surf_opt = Some(
+                                        surfaces::raster_n32_premul((
+                                            actual_width,
+                                            args_block.height,
+                                        ))
+                                        .unwrap(),
+                                    );
+                                }
+
+                                let surface = surf_opt.as_mut().unwrap();
+                                let canvas = surface.canvas();
+                                canvas.clear(bg_color);
+
+                                let mut y_cursor = (args_block.height - args_block.padding) as f32;
+
+                                let mut paint_bg = Paint::default();
+                                paint_bg.set_anti_alias(true);
+
+                                let mut mask_bg = Paint::default();
+                                mask_bg.set_anti_alias(true);
+                                mask_bg.set_color_filter(skia_safe::color_filters::blend(
                                     Color::WHITE,
                                     skia_safe::BlendMode::SrcIn,
                                 ));
-                            }
 
-                            for bubble in bubbles.iter() {
-                                let age_secs =
-                                    (frame_id - bubble.spawn_frame) as f32 / args_block.fps as f32;
-                                let mut alpha = 1.0;
+                                let mut text_paint = Paint::default();
+                                text_paint.set_anti_alias(true);
 
-                                if args_block.anim_fade_in {
-                                    let intro = 0.5;
-                                    if age_secs < intro {
-                                        alpha *= age_secs / intro;
-                                    }
-                                }
-                                if matches!(args_block.eviction_strategy, EvictionStrategy::Timed) {
-                                    let fade_start = args_block.message_hold_seconds as f32;
-                                    if age_secs > fade_start {
-                                        alpha *= 1.0
-                                            - ((age_secs - fade_start)
-                                            / args_block.message_fade_out_seconds as f32)
-                                            .clamp(0.0, 1.0);
-                                    }
-                                }
+                                for bubble in bubbles.iter() {
+                                    let age_secs = (frame_id - bubble.spawn_frame) as f32
+                                        / args_block.fps as f32;
+                                    let mut alpha = 1.0;
 
-                                let byte_alpha = (255.0 * alpha) as u8;
-                                paint.set_alpha(byte_alpha);
-                                mask_paint.set_alpha(byte_alpha);
-
-                                let img_h = bubble.img_h.unwrap_or(0);
-                                let top = y_cursor - img_h as f32;
-                                let final_x = args_block.padding as f32;
-
-                                let x_translate = if args_block.anim_slide && age_secs < 0.5 {
-                                    let eased = ease_out(age_secs / 0.5);
-                                    final_x + (1.0 - eased) * (args_block.width as f32 - final_x)
-                                } else {
-                                    final_x
-                                };
-
-                                canvas.save();
-                                canvas.translate((x_translate, top));
-
-                                if let Some(img) = &bubble.img {
-                                    canvas.draw_image(img, (0, 0), Some(&paint));
-                                }
-
-                                if let Some(placements) = &bubble.placements {
-                                    for p in placements {
-                                        if p.animated {
-                                            let ed_opt = if let Some(id) = p.emote_id {
-                                                rayon_emotes.get(id)
-                                            } else {
-                                                p.media_url
-                                                    .as_ref()
-                                                    .and_then(|url| rayon_imgs.get(url))
-                                            };
-                                            if let Some(ed) = ed_opt {
-                                                let t_ms = (frame_id as u64 * 1000)
-                                                    / args_block.fps as u64;
-                                                if let Some(fi) = ed.frame_at(t_ms) {
-                                                    canvas.save();
-                                                    canvas.scale((EMOTE_SCALE, EMOTE_SCALE));
-                                                    canvas.draw_image(
-                                                        fi,
-                                                        (p.x / EMOTE_SCALE, p.y / EMOTE_SCALE),
-                                                        Some(&paint),
-                                                    );
-                                                    canvas.restore();
-                                                }
-                                            }
+                                    if args_block.anim_fade_in {
+                                        let intro = 0.5;
+                                        if age_secs < intro {
+                                            alpha *= age_secs / intro;
                                         }
                                     }
-                                }
-                                canvas.restore();
-
-                                if is_luma {
-                                    canvas.save();
-                                    canvas.translate((x_translate + args_block.width as f32, top));
-
-                                    if let Some(img) = &bubble.img {
-                                        canvas.draw_image(img, (0, 0), Some(&mask_paint));
+                                    if matches!(
+                                        args_block.eviction_strategy,
+                                        EvictionStrategy::Timed
+                                    ) {
+                                        let fade_start = args_block.message_hold_seconds as f32;
+                                        if age_secs > fade_start {
+                                            alpha *= 1.0
+                                                - ((age_secs - fade_start)
+                                                    / args_block.message_fade_out_seconds as f32)
+                                                    .clamp(0.0, 1.0);
+                                        }
                                     }
 
-                                    if let Some(placements) = &bubble.placements {
-                                        for p in placements {
-                                            if p.animated {
-                                                let ed_opt = if let Some(id) = p.emote_id {
-                                                    rayon_emotes.get(id)
-                                                } else {
-                                                    p.media_url
-                                                        .as_ref()
-                                                        .and_then(|url| rayon_imgs.get(url))
-                                                };
-                                                if let Some(ed) = ed_opt {
-                                                    let t_ms = (frame_id as u64 * 1000)
-                                                        / args_block.fps as u64;
-                                                    if let Some(fi) = ed.frame_at(t_ms) {
-                                                        canvas.save();
-                                                        canvas.scale((EMOTE_SCALE, EMOTE_SCALE));
-                                                        canvas.draw_image(
-                                                            fi,
-                                                            (p.x / EMOTE_SCALE, p.y / EMOTE_SCALE),
-                                                            Some(&mask_paint),
-                                                        );
-                                                        canvas.restore();
+                                    let byte_alpha = (255.0 * alpha) as u8;
+                                    let top = y_cursor - bubble.bubble_h as f32;
+                                    let final_x = args_block.padding as f32;
+
+                                    let x_translate = if args_block.anim_slide && age_secs < 0.5 {
+                                        let eased = ease_out(age_secs / 0.5);
+                                        final_x
+                                            + (1.0 - eased) * (args_block.width as f32 - final_x)
+                                    } else {
+                                        final_x
+                                    };
+
+                                    let mask_modes = if is_luma {
+                                        vec![false, true]
+                                    } else {
+                                        vec![false]
+                                    };
+
+                                    for is_mask in mask_modes {
+                                        let x_ofs = if is_mask {
+                                            x_translate + args_block.width as f32
+                                        } else {
+                                            x_translate
+                                        };
+                                        canvas.save();
+                                        canvas.translate((x_ofs, top));
+
+                                        // Mutate the cached Paint instances directly to avoid clones and inner allocations
+                                        let active_bg =
+                                            if is_mask { &mut mask_bg } else { &mut paint_bg };
+                                        active_bg.set_color(if is_mask {
+                                            Color::WHITE
+                                        } else {
+                                            bubble.bg_color
+                                        });
+                                        active_bg.set_alpha(byte_alpha);
+
+                                        canvas.draw_round_rect(
+                                            skia_safe::Rect::new(
+                                                0.0,
+                                                0.0,
+                                                bubble.bubble_w as f32,
+                                                bubble.bubble_h as f32,
+                                            ),
+                                            args_block.bubble_radius,
+                                            args_block.bubble_radius,
+                                            &*active_bg,
+                                        );
+
+                                        for (li, line) in bubble.lines.iter().enumerate() {
+                                            for (ti, token) in line.tokens.iter().enumerate() {
+                                                match token {
+                                                    LayoutToken::Glyph { blob, x, y, .. } => {
+                                                        let is_username = !bubble.is_grouped
+                                                            && li == 0
+                                                            && ti == 0;
+
+                                                        if is_mask {
+                                                            text_paint.set_color(Color::from_argb(
+                                                                byte_alpha, 255, 255, 255,
+                                                            ));
+                                                            canvas.draw_text_blob(
+                                                                blob,
+                                                                (*x, *y),
+                                                                &text_paint,
+                                                            );
+                                                        } else {
+                                                            let mut base_color = if is_username {
+                                                                bubble.user_color
+                                                            } else {
+                                                                Color::from(
+                                                                    &args_block.message_color,
+                                                                )
+                                                            };
+                                                            let base_color = base_color.with_a(
+                                                                ((base_color.a() as f32 * alpha).min(255.0)) as u8
+                                                            );
+
+                                                            if is_username
+                                                                && args_block.username_shadow
+                                                            {
+                                                                text_paint.set_color(
+                                                                    Color::from_argb(
+                                                                        (180.0 * alpha) as u8,
+                                                                        0,
+                                                                        0,
+                                                                        0,
+                                                                    ),
+                                                                );
+                                                                canvas.draw_text_blob(
+                                                                    blob,
+                                                                    (*x + 2.0, *y + 2.0),
+                                                                    &text_paint,
+                                                                );
+                                                            }
+                                                            if is_username
+                                                                && args_block.outline_usernames
+                                                            {
+                                                                text_paint.set_style(
+                                                                    skia_safe::paint::Style::Stroke,
+                                                                );
+                                                                text_paint.set_stroke_width(
+                                                                    args_block
+                                                                        .username_outline_width
+                                                                        .unwrap_or(1.5),
+                                                                );
+                                                                text_paint.set_color(
+                                                                    Color::from_argb(
+                                                                        (200.0 * alpha) as u8,
+                                                                        0,
+                                                                        0,
+                                                                        0,
+                                                                    ),
+                                                                );
+                                                                canvas.draw_text_blob(
+                                                                    blob,
+                                                                    (*x, *y),
+                                                                    &text_paint,
+                                                                );
+                                                                text_paint.set_style(
+                                                                    skia_safe::paint::Style::Fill,
+                                                                );
+                                                            }
+
+                                                            text_paint.set_color(base_color);
+                                                            canvas.draw_text_blob(
+                                                                blob,
+                                                                (*x, *y),
+                                                                &text_paint,
+                                                            );
+                                                        }
+                                                    }
+                                                    LayoutToken::Emote { data, x, y } => {
+                                                        let ed: &EmoteData = &**data;
+                                                        let t_ms = (frame_id as u64 * 1000)
+                                                            / args_block.fps as u64;
+                                                        if let Some(img) = ed.frame_at(t_ms) {
+                                                            canvas.save();
+                                                            canvas.translate((*x, *y));
+                                                            canvas
+                                                                .scale((EMOTE_SCALE, EMOTE_SCALE));
+                                                            // Borrow active paint instance immutably to carry the alpha down
+                                                            canvas.draw_image(
+                                                                img,
+                                                                (0, 0),
+                                                                Some(&*active_bg),
+                                                            );
+                                                            canvas.restore();
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
+                                        canvas.restore();
                                     }
-                                    canvas.restore();
+
+                                    y_cursor -=
+                                        bubble.bubble_h as f32 + args_block.message_spacing as f32;
+                                    if y_cursor < 0.0 {
+                                        break;
+                                    }
                                 }
 
-                                y_cursor -= img_h as f32 + args_block.message_spacing as f32;
-                                if y_cursor < 0.0 {
-                                    break;
-                                }
-                            }
-                            surface.read_pixels(
-                                &info_clone,
-                                pixels.as_mut_slice(),
-                                (actual_width * 4) as usize,
-                                (0, 0),
-                            );
-                        });
-                        pixels
+                                surface.read_pixels(
+                                    &info_clone,
+                                    pixels.as_mut_slice(),
+                                    (actual_width * 4) as usize,
+                                    (0, 0),
+                                );
+                            });
+
+                            prev_pixels = Some(pixels.clone());
+                            out.push(pixels);
+                        }
+                        out
                     })
                     .collect()
             });

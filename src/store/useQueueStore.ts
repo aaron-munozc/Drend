@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { create } from "zustand";
+import { persist, createJSONStorage } from "zustand/middleware";
+import { idbStorage } from "./storage.ts";
 
 export type TaskStatus =
 	| "pending"
@@ -18,160 +20,197 @@ export interface AppTask {
 	progress: number;
 	status: TaskStatus;
 	statusText?: string;
-	payload?: any; // Temporarily holds the form args before sending to Rust
+	payload?: any;
 }
 
 interface QueueStore {
 	tasks: AppTask[];
 	isInitialized: boolean;
-	maxConcurrent: number; // Controls how many tasks run at once
+	maxConcurrent: number;
 	initQueue: () => Promise<void>;
 	enqueueTask: (taskType: TaskType, title: string, payload: any) => void;
 	processQueue: () => void;
 	updateTask: (task: AppTask) => void;
 	removeTask: (taskId: string) => void;
 	clearCompleted: () => void;
+	retryTask: (taskId: string) => void;
 }
 
-export const useQueueStore = create<QueueStore>((set, get) => ({
-	tasks: [],
-	isInitialized: false,
-	maxConcurrent: 1, // Will wait for current task to finish before starting the next
+export const useQueueStore = create<QueueStore>()(
+	persist(
+		(set, get) => ({
+			tasks: [],
+			isInitialized: false,
+			maxConcurrent: 1,
 
-	initQueue: async () => {
-		if (get().isInitialized) return;
-		try {
-			// 1. Fetch anything already running in Rust
-			const rustTasks = await invoke<AppTask[]>("get_download_queue");
+			initQueue: async () => {
+				if (get().isInitialized) return;
+				try {
+					// Fetch currently running tasks from Rust
+					const rustTasks = await invoke<AppTask[]>("get_download_queue");
 
-			set((state) => {
-				// Keep frontend "pending" tasks, merge with real Rust tasks
-				const pending = state.tasks.filter((t) => t.status === "pending");
-				return { tasks: [...rustTasks, ...pending], isInitialized: true };
-			});
+					set((state) => {
+						const rustTaskIds = new Set(rustTasks.map((t) => t.taskId));
 
-			// 2. Set up the GLOBAL listener so it never unmounts
-			await listen<AppTask>("task-progress", (event) => {
-				get().updateTask(event.payload);
-			});
+						// 1. Reconcile frontend tasks: If a task was running but Rust doesn't know about it, the app closed unexpectedly.
+						const resolvedPersisted = state.tasks.map((t) => {
+							const wasActive =
+								t.status === "processing" ||
+								t.status === "merging" ||
+								t.status === "queued";
+							if (wasActive && !rustTaskIds.has(t.taskId)) {
+								return {
+									...t,
+									status: { failed: "Process interrupted (App closed abruptly)" } as TaskStatus,
+								};
+							}
+							return t;
+						});
 
-			// 3. Kickstart the queue in case we have pending items
-			get().processQueue();
-		} catch (error) {
-			console.error("Failed to fetch initial queue:", error);
+						// 2. Inject payloads back into the Rust tasks (since Rust doesn't store our frontend UI payloads)
+						const enrichedRustTasks = rustTasks.map((rt) => {
+							const existing = state.tasks.find((t) => t.taskId === rt.taskId);
+							return existing ? { ...rt, payload: existing.payload } : rt;
+						});
+
+						// 3. Merge avoiding duplicates
+						const inactiveFrontendTasks = resolvedPersisted.filter(
+							(t) => !rustTaskIds.has(t.taskId)
+						);
+
+						return {
+							tasks: [...inactiveFrontendTasks, ...enrichedRustTasks],
+							isInitialized: true,
+						};
+					});
+
+					await listen<AppTask>("task-progress", (event) => {
+						get().updateTask(event.payload);
+					});
+
+					get().processQueue();
+				} catch (error) {
+					console.error("Failed to fetch initial queue:", error);
+				}
+			},
+
+			enqueueTask: (taskType, title, payload) => {
+				const tempId = crypto.randomUUID();
+				const newTask: AppTask = {
+					taskId: tempId,
+					taskType,
+					title,
+					progress: 0,
+					status: "pending",
+					statusText: "Waiting in queue...",
+					payload,
+				};
+
+				set((state) => ({ tasks: [...state.tasks, newTask] }));
+				get().processQueue();
+			},
+
+			processQueue: async () => {
+				const { tasks, maxConcurrent } = get();
+				const activeCount = tasks.filter(
+					(t) =>
+						t.status === "processing" ||
+						t.status === "merging" ||
+						t.status === "queued"
+				).length;
+
+				if (activeCount >= maxConcurrent) return;
+
+				const nextTask = tasks.find((t) => t.status === "pending");
+				if (!nextTask) return;
+
+				set((state) => ({
+					tasks: state.tasks.map((t) =>
+						t.taskId === nextTask.taskId
+							? { ...t, status: "queued", statusText: "Sending to engine..." }
+							: t
+					),
+				}));
+
+				try {
+					let endpoint = "";
+					if (nextTask.taskType === "vodDownload") endpoint = "queue_vod_download";
+					else if (nextTask.taskType === "chatDownload") endpoint = "queue_chat_download";
+					else if (nextTask.taskType === "chatRender") endpoint = "queue_chat_render";
+
+					const realTaskId = await invoke<string>(endpoint, nextTask.payload);
+
+					// We no longer drop the payload here so we can re-edit later
+					set((state) => ({
+						tasks: state.tasks.map((t) =>
+							t.taskId === nextTask.taskId
+								? { ...t, taskId: realTaskId }
+								: t
+						),
+					}));
+
+					get().processQueue();
+				} catch (err: any) {
+					set((state) => ({
+						tasks: state.tasks.map((t) =>
+							t.taskId === nextTask.taskId
+								? { ...t, status: { failed: err.toString() } }
+								: t
+						),
+					}));
+					get().processQueue();
+				}
+			},
+
+			updateTask: (incomingTask) => {
+				set((state) => {
+					const existingIndex = state.tasks.findIndex(
+						(t) => t.taskId === incomingTask.taskId
+					);
+					if (existingIndex >= 0) {
+						const newTasks = [...state.tasks];
+						// Preserve the payload from the frontend state
+						newTasks[existingIndex] = {
+							...incomingTask,
+							payload: state.tasks[existingIndex].payload,
+						};
+						return { tasks: newTasks };
+					}
+					return { tasks: [...state.tasks, incomingTask] };
+				});
+
+				const isDone =
+					incomingTask.status === "completed" ||
+					(typeof incomingTask.status === "object" && "failed" in incomingTask.status);
+				if (isDone) {
+					get().processQueue();
+				}
+			},
+
+			removeTask: (taskId) =>
+				set((state) => ({
+					tasks: state.tasks.filter((t) => t.taskId !== taskId),
+				})),
+
+			clearCompleted: () =>
+				set((state) => ({
+					tasks: state.tasks.filter(
+						(t) => t.status !== "completed" && typeof t.status !== "object"
+					),
+				})),
+
+			retryTask: (taskId) => {
+				const task = get().tasks.find((t) => t.taskId === taskId);
+				if (!task || !task.payload) return;
+
+				// Remove the failed iteration and queue a fresh one
+				get().removeTask(taskId);
+				get().enqueueTask(task.taskType, task.title, task.payload);
+			},
+		}),
+		{
+			name: "pipeline-queue-storage",
+			storage: createJSONStorage(() => idbStorage),
 		}
-	},
-
-	enqueueTask: (taskType, title, payload) => {
-		const tempId = crypto.randomUUID(); // Temporary frontend ID
-		const newTask: AppTask = {
-			taskId: tempId,
-			taskType,
-			title,
-			progress: 0,
-			status: "pending",
-			statusText: "Waiting in queue...",
-			payload,
-		};
-
-		set((state) => ({ tasks: [...state.tasks, newTask] }));
-		get().processQueue();
-	},
-
-	processQueue: async () => {
-		const { tasks, maxConcurrent } = get();
-
-		// Count how many tasks are actively touching the Rust engine
-		const activeCount = tasks.filter(
-			(t) =>
-				t.status === "processing" ||
-				t.status === "merging" ||
-				t.status === "queued",
-		).length;
-
-		if (activeCount >= maxConcurrent) return; // Queue is busy, wait.
-
-		// Find the first task waiting to be processed
-		const nextTask = tasks.find((t) => t.status === "pending");
-		if (!nextTask) return; // Nothing left to do
-
-		// Optimistically mark it so the loop doesn't grab it twice
-		set((state) => ({
-			tasks: state.tasks.map((t) =>
-				t.taskId === nextTask.taskId
-					? { ...t, status: "queued", statusText: "Sending to engine..." }
-					: t,
-			),
-		}));
-
-		try {
-			// Map the type to the exact Tauri command
-			let endpoint = "";
-			if (nextTask.taskType === "vodDownload") endpoint = "queue_vod_download";
-			else if (nextTask.taskType === "chatDownload")
-				endpoint = "queue_chat_download";
-			else if (nextTask.taskType === "chatRender")
-				endpoint = "queue_chat_render";
-
-			// Dispatch to Rust and get the REAL task ID
-			const realTaskId = await invoke<string>(endpoint, nextTask.payload);
-
-			// Swap the temp ID for the real ID and drop the payload
-			set((state) => ({
-				tasks: state.tasks.map((t) =>
-					t.taskId === nextTask.taskId
-						? { ...t, taskId: realTaskId, payload: undefined }
-						: t,
-				),
-			}));
-
-			// Fire again in case maxConcurrent was increased
-			get().processQueue();
-		} catch (err: any) {
-			// If it fails immediately, mark it and trigger the next one
-			set((state) => ({
-				tasks: state.tasks.map((t) =>
-					t.taskId === nextTask.taskId
-						? { ...t, status: { failed: err.toString() } }
-						: t,
-				),
-			}));
-			get().processQueue();
-		}
-	},
-
-	updateTask: (incomingTask) => {
-		set((state) => {
-			const existingIndex = state.tasks.findIndex(
-				(t) => t.taskId === incomingTask.taskId,
-			);
-			if (existingIndex >= 0) {
-				const newTasks = [...state.tasks];
-				newTasks[existingIndex] = incomingTask;
-				return { tasks: newTasks };
-			}
-			return { tasks: [...state.tasks, incomingTask] };
-		});
-
-		// CRITICAL: If a task just finished, process the next one!
-		const isDone =
-			incomingTask.status === "completed" ||
-			(typeof incomingTask.status === "object" &&
-				"failed" in incomingTask.status);
-		if (isDone) {
-			get().processQueue();
-		}
-	},
-
-	removeTask: (taskId) =>
-		set((state) => ({
-			tasks: state.tasks.filter((t) => t.taskId !== taskId),
-		})),
-
-	clearCompleted: () =>
-		set((state) => ({
-			tasks: state.tasks.filter(
-				(t) => t.status !== "completed" && typeof t.status !== "object",
-			),
-		})),
-}));
+	)
+);
