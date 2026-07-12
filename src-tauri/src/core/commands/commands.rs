@@ -1,48 +1,60 @@
 use crate::core::chat_renderer::RenderVideoArgs;
-use crate::core::download::manager::{FrontendChatOptions, FrontendVodOptions};
-use crate::core::{AppTask, TaskManager};
+use crate::core::manager::manager::{FrontendChatOptions, FrontendVodOptions};
+use crate::core::{TaskManager};
 use crate::error::AppError;
 use crate::types::{AppResult, Metadata};
 use crate::AppCache;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
+use crate::core::manager::AppTask;
 
 #[tauri::command]
 pub async fn queue_chat_download(
     manager: State<'_, TaskManager>,
     cache: State<'_, AppCache>,
+    id: String,
     url: String,
     options: Option<FrontendChatOptions>,
-) -> AppResult<String> {
+) -> AppResult<()> {
     let opts = options.unwrap_or_default();
-    let metadata = fetch_cached_metadata(&cache, &url)?.stream_metadata;
+    let cached = fetch_cached_metadata(&cache, &url)?;
 
-    let task_id = manager.enqueue_chat_download(metadata, opts);
-    Ok(task_id)
+    let metadata = cached.stream_metadata.ok_or_else(|| {
+        AppError::Generic("Chat manager is not supported for this platform.".into())
+    })?;
+
+    manager.enqueue_chat_download(Some(id), metadata, opts);
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn queue_vod_download(
     manager: State<'_, TaskManager>,
     cache: State<'_, AppCache>,
+    id: String,
     url: String,
     options: Option<FrontendVodOptions>,
-) -> AppResult<String> {
+) -> AppResult<()> {
     let opts = options.unwrap_or_default();
-    let metadata = fetch_cached_metadata(&cache, &url)?.stream_metadata;
+    let cached = fetch_cached_metadata(&cache, &url)?;
 
-    // Title is derived natively in the manager now
-    let task_id = manager.enqueue_vod_download(metadata, opts);
-    Ok(task_id)
+    manager.enqueue_vod_download(
+        Some(id),
+        cached.normalized.original_url,
+        cached.normalized.title,
+        opts,
+    );
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn queue_chat_render(
     app_handle: AppHandle,
     manager: State<'_, TaskManager>,
+    id: String,
     json_file_path: String,
     options: Option<RenderVideoArgs>,
-) -> AppResult<String> {
+) -> AppResult<()> {
     let args = options.unwrap_or_default();
     let input_path = PathBuf::from(json_file_path);
 
@@ -50,8 +62,8 @@ pub async fn queue_chat_render(
         AppError::Generic(format!("Failed to parse application cache layout: {}", e))
     })?;
 
-    let task_id = manager.enqueue_chat_render(input_path, args, cache_dir_base);
-    Ok(task_id)
+    manager.enqueue_chat_render(Some(id), input_path, args, cache_dir_base);
+    Ok(())
 }
 
 #[tauri::command]

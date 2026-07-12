@@ -1,25 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useDownloadTabStore } from "@/store/useDownloadTabStore.ts";
 import {
 	FrontendChatOptions,
 	FrontendVodOptions,
 	Metadata,
 } from "@/features/downloads/types/types.ts";
+import { useWorkspaceStore } from "@/store/useWorkspaceStore.ts"; // <-- Added unified store import
 
 export function useDownloader() {
-	const { updateTab } = useDownloadTabStore();
+	// Replaced useDownloadTabStore with the unified useWorkspaceStore[cite: 12]
+	const { updateTab } = useWorkspaceStore();
 
 	const analyzeUrl = async (tabId: string, url: string) => {
 		updateTab(tabId, { url, status: "loading", error: undefined });
 		try {
-			// 1. Fetch raw payload (Rust might send snake_case)
-			const metadata = await invoke<Metadata>("analyze_stream_url", { url });
+			const metadata = await invoke<Metadata>("analyze_url", { url });
 
-			// 3. Extract the nested title safely
 			updateTab(tabId, {
 				status: "analyzed",
 				metadata,
-				title: metadata.streamMetadata?.title || "Stream Details",
+				title: metadata.normalized.title || "Stream Details",
 			});
 		} catch (err: any) {
 			updateTab(tabId, { status: "error", error: err.toString() });

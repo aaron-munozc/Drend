@@ -16,7 +16,7 @@ pub enum AppError {
     #[error("Playlist parsing failed: {0}")]
     PlaylistParse(String),
 
-    #[error("Segment download failed: {0}")]
+    #[error("Segment manager failed: {0}")]
     SegmentDownload(String),
 
     #[error("Segment write failed: {0}")]

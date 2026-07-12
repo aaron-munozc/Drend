@@ -1,8 +1,9 @@
+import { motion } from "framer-motion";
 import { Search } from "lucide-react";
 import { useState } from "react";
 import { useDownloader } from "@/features/downloads/hooks/useDownlaoder.ts";
 
-export function StreamInput({ tabId }: { tabId: string }) {
+export function UrlInput({ tabId }: { tabId: string }) {
 	const [url, setUrl] = useState("");
 	const { analyzeUrl } = useDownloader();
 
@@ -12,7 +13,12 @@ export function StreamInput({ tabId }: { tabId: string }) {
 	};
 
 	return (
-		<div className="flex h-full w-full items-center justify-center p-6">
+		<motion.div
+			initial={{ opacity: 0, y: 10 }}
+			animate={{ opacity: 1, y: 0 }}
+			transition={{ duration: 0.3 }}
+			className="flex h-full w-full items-center justify-center p-6"
+		>
 			<div className="w-full max-w-xl space-y-6 text-center">
 				<div className="space-y-2">
 					<h1 className="text-3xl font-semibold tracking-tight text-foreground">
@@ -44,6 +50,6 @@ export function StreamInput({ tabId }: { tabId: string }) {
 					</button>
 				</form>
 			</div>
-		</div>
+		</motion.div>
 	);
 }

@@ -16,6 +16,7 @@ pub struct ResolvedEmote {
     pub id: String,
     pub name: String,
     pub url: String,
+    pub zero_width: bool,
 }
 
 #[derive(Default)]
@@ -41,13 +42,14 @@ impl EmoteNameMap {
                     id: id.clone(),
                     name: name.clone(),
                     url,
+                    zero_width: false,
                 },
             );
         }
     }
 
-    pub fn add_bttv(&mut self, entries: &[(String, String)]) {
-        for (name, hash) in entries {
+    pub fn add_bttv(&mut self, entries: &[(String, String, bool)]) {
+        for (name, hash, zero_width) in entries {
             let url = format!("https://cdn.betterttv.net/emote/{}/2x", hash);
             self.map.insert(
                 name.clone(),
@@ -56,6 +58,7 @@ impl EmoteNameMap {
                     id: hash.clone(),
                     name: name.clone(),
                     url,
+                    zero_width: *zero_width,
                 },
             );
         }
@@ -71,13 +74,14 @@ impl EmoteNameMap {
                     id: id.clone(),
                     name: name.clone(),
                     url,
+                    zero_width: false,
                 },
             );
         }
     }
 
-    pub fn add_7tv(&mut self, entries: &[(String, String)]) {
-        for (name, id) in entries {
+    pub fn add_7tv(&mut self, entries: &[(String, String, bool)]) {
+        for (name, id, zero_width) in entries {
             let url = format!("https://cdn.7tv.app/emote/{}/2x.webp", id);
             self.map.insert(
                 name.clone(),
@@ -86,6 +90,7 @@ impl EmoteNameMap {
                     id: id.clone(),
                     name: name.clone(),
                     url,
+                    zero_width: *zero_width,
                 },
             );
         }

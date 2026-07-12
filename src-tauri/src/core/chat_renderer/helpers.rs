@@ -4,21 +4,47 @@ use crate::error::AppError;
 use crate::types::AppResult;
 use image::imageops::FilterType;
 use image::{self, AnimationDecoder, DynamicImage, GenericImageView};
+use rustc_hash::FxHasher;
 use skia_safe::{images, Color, Data, Image};
+use std::hash::Hasher;
 use std::io::Cursor;
 use std::sync::Arc;
 
-pub fn skia_color_from_hex(hex: &str) -> Option<Color> {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() != 6 {
-        return None;
+pub const DEFAULT_USERNAME_COLORS: &[&str] = &[
+    "#FF0000", "#0000FF", "#00FF00", "#B22222", "#FF7F50", "#9ACD32", "#FF4500", "#2E8B57",
+    "#DAA520", "#D2691E", "#5F9EA0", "#1E90FF", "#FF69B4", "#8A2BE2", "#00FF7F",
+];
+
+pub fn get_user_color(username: &str, hex_color: &str) -> Color {
+    // Attempt to parse provided hex
+    if !hex_color.is_empty() {
+        let clean = hex_color.trim_start_matches('#');
+        if let Ok(val) = u32::from_str_radix(clean, 16) {
+            let color = if clean.len() == 6 {
+                Color::from_rgb((val >> 16) as u8, (val >> 8) as u8, val as u8)
+            } else if clean.len() == 8 {
+                Color::from_argb(
+                    (val >> 24) as u8,
+                    (val >> 16) as u8,
+                    (val >> 8) as u8,
+                    val as u8,
+                )
+            } else {
+                Color::WHITE
+            };
+            return color;
+        }
     }
-    let value = u32::from_str_radix(hex, 16).ok()?;
-    Some(Color::from_rgb(
-        ((value >> 16) & 0xFF) as u8,
-        ((value >> 8) & 0xFF) as u8,
-        (value & 0xFF) as u8,
-    ))
+
+    // Fallback to deterministic C# Palette hash
+    let mut hasher = FxHasher::default();
+    hasher.write(username.as_bytes());
+    let hash = hasher.finish();
+    let hex = DEFAULT_USERNAME_COLORS[(hash as usize) % DEFAULT_USERNAME_COLORS.len()];
+
+    let clean = hex.trim_start_matches('#');
+    let val = u32::from_str_radix(clean, 16).unwrap_or(0xFFFFFF);
+    Color::from_rgb((val >> 16) as u8, (val >> 8) as u8, val as u8)
 }
 
 pub fn quality_to_filter(q: &QualityPreset) -> FilterType {
@@ -34,15 +60,14 @@ pub fn ease_out(t: f32) -> f32 {
 }
 
 pub fn guess_ext(bytes: &[u8]) -> String {
-    let bytes_len = bytes.len();
-
-    if bytes_len >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" {
+    let len = bytes.len();
+    if len >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" {
         "png".to_string()
-    } else if bytes_len >= 3 && &bytes[0..3] == b"\xff\xd8\xff" {
+    } else if len >= 3 && &bytes[0..3] == b"\xff\xd8\xff" {
         "jpg".to_string()
-    } else if bytes_len >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+    } else if len >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
         "gif".to_string()
-    } else if bytes_len >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+    } else if len >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         "webp".to_string()
     } else {
         "bin".to_string()
@@ -61,16 +86,6 @@ pub fn resize_dynamic_image_preserve_aspect(
     let scale = target_h as f32 / h as f32;
     let target_w = (w as f32 * scale).round() as u32;
     DynamicImage::ImageRgba8(image::imageops::resize(&img, target_w, target_h, filter))
-}
-
-/// Helper function to perform binary search on GIF frames based on timeline position
-pub fn frame_at_ms(cum: &[u32], total_ms: u32, t_ms: u64) -> usize {
-    if cum.is_empty() || total_ms == 0 {
-        return 0;
-    }
-    let looped = (t_ms % total_ms as u64) as u32;
-    cum.partition_point(|&c| c <= looped)
-        .min(cum.len().saturating_sub(1))
 }
 
 pub fn decode_emote_bytes_to_emote_data(
@@ -92,8 +107,8 @@ pub fn decode_emote_bytes_to_emote_data(
 
             for frame in frames_collected {
                 let delay_ms = match frame.delay().numer_denom_ms() {
-                    (numer, denom) if denom != 0 => numer / denom,
-                    (numer, _) => numer,
+                    (n, d) if d != 0 => n / d,
+                    (n, _) => n,
                 };
 
                 let dyn_img = DynamicImage::ImageRgba8(frame.into_buffer());
@@ -102,13 +117,10 @@ pub fn decode_emote_bytes_to_emote_data(
                 let (w, h) = rgba.dimensions();
 
                 if w == 0 || h == 0 {
-                    eprintln!("Warning: Skipping zero-size GIF frame");
                     continue;
                 }
 
-                let row_bytes = (w * 4) as usize;
                 let data = Data::new_copy(rgba.as_raw());
-
                 if let Some(img) = images::raster_from_data(
                     &skia_safe::ImageInfo::new(
                         (w as i32, h as i32),
@@ -117,13 +129,10 @@ pub fn decode_emote_bytes_to_emote_data(
                         None,
                     ),
                     &data,
-                    row_bytes,
+                    (w * 4) as usize,
                 ) {
                     durations_ms.push(delay_ms);
                     skia_frames.push(img);
-                } else {
-                    eprintln!("Warning: Skia rejected valid RGBA buffer for GIF frame");
-                    continue;
                 }
             }
 
@@ -153,7 +162,6 @@ pub fn decode_emote_bytes_to_emote_data(
             let dyn_img = image::ImageReader::new(Cursor::new(bytes))
                 .with_guessed_format()?
                 .decode()?;
-
             let resized = resize_dynamic_image_preserve_aspect(dyn_img, target_h, filter);
             let rgba = resized.to_rgba8();
             let (w, h) = rgba.dimensions();
@@ -164,9 +172,7 @@ pub fn decode_emote_bytes_to_emote_data(
                 ));
             }
 
-            let row_bytes = (w * 4) as usize;
             let data = Data::new_copy(rgba.as_raw());
-
             let img = images::raster_from_data(
                 &skia_safe::ImageInfo::new(
                     (w as i32, h as i32),
@@ -175,7 +181,7 @@ pub fn decode_emote_bytes_to_emote_data(
                     None,
                 ),
                 &data,
-                row_bytes,
+                (w * 4) as usize,
             )
             .ok_or_else(|| AppError::EmoteCache("Skia rejected valid RGBA buffer".into()))?;
 

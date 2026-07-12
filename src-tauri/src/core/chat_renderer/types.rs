@@ -287,7 +287,7 @@ impl EmoteCache {
                 let _permit = download_sem
                     .acquire_owned()
                     .await
-                    .map_err(|_| AppError::InternalError("download semaphore closed".into()))?;
+                    .map_err(|_| AppError::InternalError("manager semaphore closed".into()))?;
 
                 let url = format!("https://files.kick.com/emotes/{}/fullsize", id);
                 let resp = ec
@@ -298,7 +298,7 @@ impl EmoteCache {
                     .map_err(|e| AppError::Http(format!("request failed: {}", e)))?;
 
                 if !resp.status().is_success() {
-                    let msg = format!("download failed {}: {}", id, resp.status());
+                    let msg = format!("manager failed {}: {}", id, resp.status());
                     ec.remember_missing_disk(id);
                     let mut infl = ec.inflight.lock();
                     if let Some(waiters) = infl.remove(&id) {
@@ -590,7 +590,7 @@ impl ImageCache {
                 let _permit = download_sem
                     .acquire_owned()
                     .await
-                    .map_err(|_| AppError::InternalError("download semaphore closed".into()))?;
+                    .map_err(|_| AppError::InternalError("manager semaphore closed".into()))?;
 
                 let resp = ec
                     .client
@@ -600,7 +600,7 @@ impl ImageCache {
                     .map_err(|e| AppError::Http(format!("request failed: {}", e)))?;
 
                 if !resp.status().is_success() {
-                    let msg = format!("download failed {}: {}", url, resp.status());
+                    let msg = format!("manager failed {}: {}", url, resp.status());
                     ec.remember_missing_disk(key);
                     let mut infl = ec.inflight.lock();
                     if let Some(waiters) = infl.remove(&key) {

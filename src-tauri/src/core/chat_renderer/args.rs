@@ -34,6 +34,14 @@ impl ObjectColor {
             blue: 0,
         }
     }
+    pub fn highlight_gold() -> Self {
+        Self {
+            alpha: 255,
+            red: 255,
+            green: 215,
+            blue: 0,
+        }
+    }
 }
 
 fn to_unit(v: i32) -> f32 {
@@ -42,7 +50,6 @@ fn to_unit(v: i32) -> f32 {
 
 impl From<&ObjectColor> for Color4f {
     fn from(obj: &ObjectColor) -> Self {
-        // Skia requires parameters in 0.0 -> 1.0 range, ordered r,g,b,a
         Color4f::new(
             to_unit(obj.red),
             to_unit(obj.green),
@@ -81,23 +88,19 @@ pub enum EvictionStrategy {
     PushOnly,
 }
 
-/// Controls the quality/performance trade-off for the renderer.
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum QualityPreset {
-    /// Fast – nearest-neighbour emote scaling, no MSAA.
     Draft,
     #[default]
-    /// Balanced – Lanczos emote scaling, light anti-alias.
     Standard,
-    /// Slow – highest-quality filter, full MSAA, sub-pixel text.
     High,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RenderVideoArgs {
-    pub output_path: String,
+    pub output_path: String, // Required
     pub width: i32,
     pub height: i32,
     pub fps: u32,
@@ -120,11 +123,11 @@ pub struct RenderVideoArgs {
     pub anim_fade_in: bool,
     pub eviction_strategy: EvictionStrategy,
     pub quality_preset: QualityPreset,
-    /// Maximum number of decoded emotes to keep in memory. 0 = unbounded.
     pub max_cached_emotes: usize,
     pub message_hold_seconds: u32,
     pub message_fade_out_seconds: u32,
     pub pinned_users: Vec<String>,
+    pub highlight_color: ObjectColor,
     pub pin_duration_secs: u32,
     pub skip_users: Vec<String>,
     pub start_ms: Option<u64>,
@@ -143,7 +146,7 @@ impl Default for RenderVideoArgs {
             width: 400,
             height: 800,
             fps: 30,
-            background_mode: BackgroundMode::ChromaKeyGreen,
+            background_mode: BackgroundMode::Transparent,
             background_color: ObjectColor::black(),
             font_name: "Inter".into(),
             font_size: 20.0,
@@ -166,6 +169,7 @@ impl Default for RenderVideoArgs {
             message_hold_seconds: 5,
             message_fade_out_seconds: 2,
             pinned_users: vec![],
+            highlight_color: ObjectColor::highlight_gold(),
             pin_duration_secs: 10,
             skip_users: vec!["BotRix".into(), "KickBot".into()],
             start_ms: None,

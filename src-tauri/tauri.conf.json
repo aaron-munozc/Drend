@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "stream-downloader",
+  "productName": "drend",
   "version": "0.1.0",
-  "identifier": "com.stream-downloader.desktop",
+  "identifier": "com.drend.desktop",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Stream Downloader",
+        "title": "Drend",
         "width": 1000,
         "height": 700,
         "minHeight": 800,
@@ -33,5 +33,24 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "cli": {
+      "description": "Video Downloader & Extractor CLI",
+      "args": [
+        {
+          "name": "server",
+          "short": "s",
+          "description": "Start the application alongside the Axum server",
+          "takesValue": false
+        },
+        {
+          "name": "background",
+          "short": "b",
+          "description": "Run in headless mode",
+          "takesValue": false
+        }
+      ]
+    }
   }
 }

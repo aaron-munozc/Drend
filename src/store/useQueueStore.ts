@@ -46,13 +46,11 @@ export const useQueueStore = create<QueueStore>()(
 			initQueue: async () => {
 				if (get().isInitialized) return;
 				try {
-					// Fetch currently running tasks from Rust
 					const rustTasks = await invoke<AppTask[]>("get_download_queue");
 
 					set((state) => {
 						const rustTaskIds = new Set(rustTasks.map((t) => t.taskId));
 
-						// 1. Reconcile frontend tasks: If a task was running but Rust doesn't know about it, the app closed unexpectedly.
 						const resolvedPersisted = state.tasks.map((t) => {
 							const wasActive =
 								t.status === "processing" ||
@@ -61,21 +59,21 @@ export const useQueueStore = create<QueueStore>()(
 							if (wasActive && !rustTaskIds.has(t.taskId)) {
 								return {
 									...t,
-									status: { failed: "Process interrupted (App closed abruptly)" } as TaskStatus,
+									status: {
+										failed: "Process interrupted (App closed abruptly)",
+									} as TaskStatus,
 								};
 							}
 							return t;
 						});
 
-						// 2. Inject payloads back into the Rust tasks (since Rust doesn't store our frontend UI payloads)
 						const enrichedRustTasks = rustTasks.map((rt) => {
 							const existing = state.tasks.find((t) => t.taskId === rt.taskId);
 							return existing ? { ...rt, payload: existing.payload } : rt;
 						});
 
-						// 3. Merge avoiding duplicates
 						const inactiveFrontendTasks = resolvedPersisted.filter(
-							(t) => !rustTaskIds.has(t.taskId)
+							(t) => !rustTaskIds.has(t.taskId),
 						);
 
 						return {
@@ -95,9 +93,9 @@ export const useQueueStore = create<QueueStore>()(
 			},
 
 			enqueueTask: (taskType, title, payload) => {
-				const tempId = crypto.randomUUID();
+				const taskId = crypto.randomUUID();
 				const newTask: AppTask = {
-					taskId: tempId,
+					taskId,
 					taskType,
 					title,
 					progress: 0,
@@ -116,7 +114,7 @@ export const useQueueStore = create<QueueStore>()(
 					(t) =>
 						t.status === "processing" ||
 						t.status === "merging" ||
-						t.status === "queued"
+						t.status === "queued",
 				).length;
 
 				if (activeCount >= maxConcurrent) return;
@@ -128,26 +126,23 @@ export const useQueueStore = create<QueueStore>()(
 					tasks: state.tasks.map((t) =>
 						t.taskId === nextTask.taskId
 							? { ...t, status: "queued", statusText: "Sending to engine..." }
-							: t
+							: t,
 					),
 				}));
 
 				try {
 					let endpoint = "";
-					if (nextTask.taskType === "vodDownload") endpoint = "queue_vod_download";
-					else if (nextTask.taskType === "chatDownload") endpoint = "queue_chat_download";
-					else if (nextTask.taskType === "chatRender") endpoint = "queue_chat_render";
+					if (nextTask.taskType === "vodDownload")
+						endpoint = "queue_vod_download";
+					else if (nextTask.taskType === "chatDownload")
+						endpoint = "queue_chat_download";
+					else if (nextTask.taskType === "chatRender")
+						endpoint = "queue_chat_render";
 
-					const realTaskId = await invoke<string>(endpoint, nextTask.payload);
-
-					// We no longer drop the payload here so we can re-edit later
-					set((state) => ({
-						tasks: state.tasks.map((t) =>
-							t.taskId === nextTask.taskId
-								? { ...t, taskId: realTaskId }
-								: t
-						),
-					}));
+					await invoke(endpoint, {
+						id: nextTask.taskId,
+						...nextTask.payload,
+					});
 
 					get().processQueue();
 				} catch (err: any) {
@@ -155,7 +150,7 @@ export const useQueueStore = create<QueueStore>()(
 						tasks: state.tasks.map((t) =>
 							t.taskId === nextTask.taskId
 								? { ...t, status: { failed: err.toString() } }
-								: t
+								: t,
 						),
 					}));
 					get().processQueue();
@@ -165,11 +160,10 @@ export const useQueueStore = create<QueueStore>()(
 			updateTask: (incomingTask) => {
 				set((state) => {
 					const existingIndex = state.tasks.findIndex(
-						(t) => t.taskId === incomingTask.taskId
+						(t) => t.taskId === incomingTask.taskId,
 					);
 					if (existingIndex >= 0) {
 						const newTasks = [...state.tasks];
-						// Preserve the payload from the frontend state
 						newTasks[existingIndex] = {
 							...incomingTask,
 							payload: state.tasks[existingIndex].payload,
@@ -181,7 +175,8 @@ export const useQueueStore = create<QueueStore>()(
 
 				const isDone =
 					incomingTask.status === "completed" ||
-					(typeof incomingTask.status === "object" && "failed" in incomingTask.status);
+					(typeof incomingTask.status === "object" &&
+						"failed" in incomingTask.status);
 				if (isDone) {
 					get().processQueue();
 				}
@@ -195,7 +190,7 @@ export const useQueueStore = create<QueueStore>()(
 			clearCompleted: () =>
 				set((state) => ({
 					tasks: state.tasks.filter(
-						(t) => t.status !== "completed" && typeof t.status !== "object"
+						(t) => t.status !== "completed" && typeof t.status !== "object",
 					),
 				})),
 
@@ -203,7 +198,6 @@ export const useQueueStore = create<QueueStore>()(
 				const task = get().tasks.find((t) => t.taskId === taskId);
 				if (!task || !task.payload) return;
 
-				// Remove the failed iteration and queue a fresh one
 				get().removeTask(taskId);
 				get().enqueueTask(task.taskType, task.title, task.payload);
 			},
@@ -211,6 +205,6 @@ export const useQueueStore = create<QueueStore>()(
 		{
 			name: "pipeline-queue-storage",
 			storage: createJSONStorage(() => idbStorage),
-		}
-	)
+		},
+	),
 );

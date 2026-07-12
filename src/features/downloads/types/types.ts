@@ -1,24 +1,19 @@
 export type Platform = "twitch" | "kick";
 export type StreamStatus = "live" | "clip" | "vod" | "offline";
-export type VideoFormat = "mp4" | "mkv" | "ts";
 
-// Matches the library QualityPreference enum serialized across Tauri
-export type QualityPreference =
-	| "best"
-	| "worst"
-	| { index: number }
-	| { height: number };
+export type VideoFormat = "any" | "mp4" | "mkv" | "webm";
+export type AudioFormat = "best" | "mp3" | "m4a" | "flac" | "wav";
 
-export interface StreamResolution {
-	width: number;
-	height: number;
-}
-
-export interface StreamQuality {
-	index: number;
-	uri: string;
-	resolution?: StreamResolution;
-	bandwidth?: number;
+export interface NormalizedFormat {
+	formatId: string;
+	resolutionLabel: string;
+	fps?: number;
+	extension: string;
+	hasVideo: boolean;
+	hasAudio: boolean;
+	sizeBytes?: number;
+	bitrate?: number;
+	uiLabel: string;
 }
 
 export interface StreamMetadata {
@@ -38,27 +33,73 @@ export interface StreamMetadata {
 	platform: Platform;
 }
 
-// The new wrapper struct returned by analyze_stream_url
+export interface Chapter {
+	title: string;
+	startTime: number;
+	endTime: number;
+}
+
+export interface NormalizedMetadata {
+	id: string;
+	title: string;
+	description?: string;
+	duration?: number;
+	uploader?: string;
+	uploaderId?: string;
+	uploaderUrl?: string;
+	thumbnail?: string;
+	viewCount?: number;
+	likeCount?: number;
+	commentCount?: number;
+	timestamp?: number;
+	uploadDate?: string;
+	isLive: boolean;
+	wasLive: boolean;
+	isUpcoming: boolean;
+	ageLimit: number;
+	tags: string[];
+	categories: string[];
+	chapters: Chapter[];
+	availableSubs: string[];
+	formats: NormalizedFormat[];
+	extractor?: string;
+	isChatSupported: boolean;
+	originalUrl: string;
+}
+
 export interface Metadata {
-	streamMetadata: StreamMetadata;
-	qualities: StreamQuality[];
+	normalized: NormalizedMetadata;
+	streamMetadata?: StreamMetadata;
 }
 
 export interface FrontendVodOptions {
-	quality?: QualityPreference;
-	format?: VideoFormat;
-	threads?: number;
-	startMs?: number;
-	endMs?: number;
-	bufferMs?: number;
 	saveFolder?: string;
 	fileName?: string;
+	videoFormatId?: string;
+	audioFormatId?: string;
+	resolution?: number;
+	videoFormat?: VideoFormat;
+	audioOnly?: boolean;
+	audioFormat?: AudioFormat;
+	startMs?: number;
+	endMs?: number;
+	forceKeyframes?: boolean;
+	threads?: number;
+	limitRate?: string;
+	cookiesBrowser?: string;
+	liveFromStart?: boolean;
+	embedMetadata?: boolean;
+	embedThumbnail?: boolean;
+	embedChapters?: boolean;
+	embedSubs?: boolean;
+	writeAutoSubs?: boolean;
+	subLangs?: string[];
+	sponsorblock?: boolean;
 }
 
 export interface FrontendChatOptions {
 	startMs?: number;
 	endMs?: number;
-	bufferMs?: number;
 	maxRetries?: number;
 	kickConcurrency?: number;
 	emptyCycleThreshold?: number;

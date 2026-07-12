@@ -5,17 +5,18 @@ import {
 	Loader2,
 	AlertCircle,
 	LayoutDashboard,
-	Film,
 	ListOrdered,
 	ChevronLeft,
 	ChevronRight,
+	MonitorPlay,
+	MessageSquare,
 } from "lucide-react";
-import { useDownloadTabStore } from "@/store/useDownloadTabStore.ts";
-import { useAppStore } from "@/store/useAppStore.ts";
-import { StreamInput } from "@/features/downloads/components/StreamInput.tsx";
-import { StreamDetails } from "@/features/downloads/components/StreamDetails.tsx";
+import { UrlDetails } from "@/features/downloads/components/UrlDetails.tsx";
+import { UrlInput } from "@/features/downloads/components/UrlInput.tsx";
 import { QueueView } from "@/features/queue/components/QueueView.tsx";
 import { RenderView } from "@/features/render/components/RenderView.tsx";
+import { useAppStore } from "@/store/useAppStore.ts";
+import { useWorkspaceStore } from "@/store/useWorkspaceStore.ts";
 
 export const Route = createFileRoute("/")({
 	component: IndexPage,
@@ -50,17 +51,10 @@ function IndexPage() {
 					<nav className="space-y-2">
 						<SidebarButton
 							icon={<LayoutDashboard />}
-							label="Downloads"
-							isActive={activeView === "downloads"}
+							label="Workspace"
+							isActive={activeView === "workspace"}
 							isCollapsed={isSidebarCollapsed}
-							onClick={() => setActiveView("downloads")}
-						/>
-						<SidebarButton
-							icon={<Film />}
-							label="Chat Render"
-							isActive={activeView === "render"}
-							isCollapsed={isSidebarCollapsed}
-							onClick={() => setActiveView("render")}
+							onClick={() => setActiveView("workspace")}
 						/>
 						<SidebarButton
 							icon={<ListOrdered />}
@@ -88,8 +82,7 @@ function IndexPage() {
 
 			{/* MAIN CONTENT AREA */}
 			<main className="flex-1 flex flex-col min-w-0 bg-background relative z-10">
-				{activeView === "downloads" && <DownloadsView />}
-				{activeView === "render" && <RenderView />}
+				{activeView === "workspace" && <WorkspaceView />}
 				{activeView === "queue" && <QueueView />}
 			</main>
 		</div>
@@ -121,10 +114,10 @@ function SidebarButton({ icon, label, isActive, isCollapsed, onClick }: any) {
 	);
 }
 
-// Your existing downloads view component (encapsulated)
-function DownloadsView() {
-	const { tabs, activeTabId, addTab, closeTab, setActiveTab } =
-		useDownloadTabStore();
+function WorkspaceView() {
+	const { tabs, activeTabId, addTab, closeTab, setActiveTab, updateTab } =
+		useWorkspaceStore();
+
 	if (!activeTabId && tabs.length > 0) setActiveTab(tabs[0].id);
 	const activeTab = tabs.find((t) => t.id === activeTabId);
 
@@ -165,34 +158,67 @@ function DownloadsView() {
 			</div>
 
 			{/* TAB CONTENT */}
-			<div className="flex-1 bg-card min-h-0 overflow-y-auto">
-				{activeTab?.status === "idle" && <StreamInput tabId={activeTab.id} />}
-				{activeTab?.status === "loading" && (
-					<div className="flex h-full items-center justify-center flex-col gap-3">
-						<Loader2 className="h-8 w-8 animate-spin text-primary" />
-						<p className="text-sm text-muted-foreground">
-							Extracting metadata...
-						</p>
-					</div>
-				)}
-				{activeTab?.status === "error" && (
-					<div className="flex h-full items-center justify-center flex-col gap-3 text-destructive p-6 text-center">
-						<AlertCircle className="h-10 w-10" />
-						<h2 className="text-lg font-semibold">Analysis Failed</h2>
-						<p className="text-sm max-w-md">{activeTab.error}</p>
+			<div className="flex-1 bg-card min-h-0 overflow-y-auto relative">
+				{activeTab?.mode === "select" && (
+					<div className="flex h-full items-center justify-center gap-8 p-6">
 						<button
 							onClick={() =>
-								useDownloadTabStore
-									.getState()
-									.updateTab(activeTab.id, { status: "idle" })
+								updateTab(activeTab.id, {
+									mode: "download",
+									title: "New Download",
+								})
 							}
-							className="mt-4 rounded-md border bg-transparent px-4 py-2 text-sm text-foreground hover:bg-accent"
+							className="flex flex-col items-center gap-4 p-8 w-64 rounded-xl border border-border bg-card hover:bg-accent hover:border-primary transition-all group shadow-sm"
 						>
-							Try Again
+							<MonitorPlay className="w-16 h-16 text-muted-foreground group-hover:text-primary transition-colors" />
+							<span className="text-lg font-semibold">Download Video</span>
+						</button>
+
+						<button
+							onClick={() =>
+								updateTab(activeTab.id, { mode: "render", title: "New Render" })
+							}
+							className="flex flex-col items-center gap-4 p-8 w-64 rounded-xl border border-border bg-card hover:bg-accent hover:border-primary transition-all group shadow-sm"
+						>
+							<MessageSquare className="w-16 h-16 text-muted-foreground group-hover:text-primary transition-colors" />
+							<span className="text-lg font-semibold">Render Chat</span>
 						</button>
 					</div>
 				)}
-				{activeTab?.status === "analyzed" && <StreamDetails tab={activeTab} />}
+
+				{activeTab?.mode === "download" && (
+					<>
+						{activeTab.status === "idle" && (
+							<UrlInput tabId={activeTab.id} />
+						)}
+						{activeTab.status === "loading" && (
+							<div className="flex h-full items-center justify-center flex-col gap-3">
+								<Loader2 className="h-8 w-8 animate-spin text-primary" />
+								<p className="text-sm text-muted-foreground">
+									Extracting metadata...
+								</p>
+							</div>
+						)}
+						{activeTab.status === "error" && (
+							<div className="flex h-full items-center justify-center flex-col gap-3 text-destructive p-6 text-center">
+								<AlertCircle className="h-10 w-10" />
+								<h2 className="text-lg font-semibold">Analysis Failed</h2>
+								<p className="text-sm max-w-md">{activeTab.error}</p>
+								<button
+									onClick={() => updateTab(activeTab.id, { status: "idle" })}
+									className="mt-4 rounded-md border bg-transparent px-4 py-2 text-sm text-foreground hover:bg-accent"
+								>
+									Try Again
+								</button>
+							</div>
+						)}
+						{activeTab.status === "analyzed" && (
+							<UrlDetails tab={activeTab} />
+						)}
+					</>
+				)}
+
+				{activeTab?.mode === "render" && <RenderView tabId={activeTab.id} />}
 			</div>
 		</div>
 	);
