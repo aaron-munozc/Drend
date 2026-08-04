@@ -1,225 +1,190 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { useState, useRef, useEffect } from "react";
 import {
-	Plus,
-	X,
-	Loader2,
-	AlertCircle,
-	LayoutDashboard,
-	ListOrdered,
-	ChevronLeft,
-	ChevronRight,
-	MonitorPlay,
-	MessageSquare,
-} from "lucide-react";
-import { UrlDetails } from "@/features/downloads/components/UrlDetails.tsx";
-import { UrlInput } from "@/features/downloads/components/UrlInput.tsx";
-import { QueueView } from "@/features/queue/components/QueueView.tsx";
-import { RenderView } from "@/features/render/components/RenderView.tsx";
-import { useAppStore } from "@/store/useAppStore.ts";
-import { useWorkspaceStore } from "@/store/useWorkspaceStore.ts";
+	TabState,
+	useTabs,
+	useActiveTab,
+	useActiveTabId,
+	useWorkspaceStore,
+} from "@/stores/useWorkspaceStore.ts";
+import { TabWorkspace } from "../components/TabWorkspace";
 
 export const Route = createFileRoute("/")({
 	component: IndexPage,
 });
 
 function IndexPage() {
-	const { activeView, setActiveView, isSidebarCollapsed, toggleSidebar } =
-		useAppStore();
+	const tabs = useTabs();
+	const activeTabId = useActiveTabId();
+	const activeTab = useActiveTab();
+
+	const setActiveTab = useWorkspaceStore((s) => s.setActiveTab);
+	const addTab = useWorkspaceStore((s) => s.addTab);
+	const closeTab = useWorkspaceStore((s) => s.closeTab);
+	const renameTab = useWorkspaceStore((s) => s.renameTab);
+	const updateTab = useWorkspaceStore((s) => s.updateTab);
+
+	const [editingTabId, setEditingTabId] = useState<string | null>(null);
+	const [editingLabel, setEditingLabel] = useState("");
+	const editInputRef = useRef<HTMLInputElement>(null);
+
+	useEffect(() => {
+		if (editingTabId && editInputRef.current) {
+			editInputRef.current.focus();
+			editInputRef.current.select();
+		}
+	}, [editingTabId]);
+
+	const handleTabDoubleClick = (tab: TabState) => {
+		setEditingTabId(tab.id);
+		setEditingLabel(tab.label);
+	};
+
+	const commitRename = () => {
+		if (editingTabId && editingLabel.trim()) {
+			renameTab(editingTabId, editingLabel.trim());
+		}
+		setEditingTabId(null);
+	};
 
 	return (
-		<div className="flex h-screen w-full bg-background text-foreground overflow-hidden">
-			{/* SIDEBAR */}
-			<aside
-				className={`${
-					isSidebarCollapsed ? "w-16" : "w-64"
-				} flex-shrink-0 border-r border-border bg-card flex flex-col justify-between transition-all duration-300 ease-in-out z-20`}
-			>
-				<div className="p-4 space-y-6 overflow-hidden">
-					<div
-						className={`flex items-center ${isSidebarCollapsed ? "justify-center" : "justify-start"} gap-3 px-2 transition-all`}
-					>
-						<div className="h-8 w-8 min-w-[32px] rounded-lg bg-primary flex items-center justify-center text-primary-foreground font-bold shadow-md">
-							S
-						</div>
-						{!isSidebarCollapsed && (
-							<span className="font-bold tracking-wider whitespace-nowrap">
-								STREAMER
-							</span>
-						)}
-					</div>
+		<div className="flex flex-col h-full">
+			{/* ── Tab Bar ─────────────────────────────────────────────────────── */}
+			<div className="flex items-stretch border-b border-neutral-800 bg-neutral-950 overflow-x-auto flex-shrink-0 h-10">
+				<div className="flex items-stretch min-w-0">
+					{tabs.map((tab) => {
+						const isActive = tab.id === activeTabId;
+						const isEditing = tab.id === editingTabId;
 
-					<nav className="space-y-2">
-						<SidebarButton
-							icon={<LayoutDashboard />}
-							label="Workspace"
-							isActive={activeView === "workspace"}
-							isCollapsed={isSidebarCollapsed}
-							onClick={() => setActiveView("workspace")}
-						/>
-						<SidebarButton
-							icon={<ListOrdered />}
-							label="Task Queue"
-							isActive={activeView === "queue"}
-							isCollapsed={isSidebarCollapsed}
-							onClick={() => setActiveView("queue")}
-						/>
-					</nav>
+						return (
+							<div
+								key={tab.id}
+								onClick={() => !isEditing && setActiveTab(tab.id)}
+								onDoubleClick={() => handleTabDoubleClick(tab)}
+								className={`
+                  group relative flex items-center gap-2 px-3 py-0 border-r border-neutral-800
+                  cursor-pointer select-none min-w-0 max-w-52 flex-shrink-0 transition-colors duration-100
+                  ${
+									isActive
+										? "bg-neutral-900 text-neutral-200"
+										: "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-900/40"
+								}
+                `}
+							>
+								{/* Active indicator */}
+								{isActive && (
+									<span className="absolute bottom-0 left-0 right-0 h-[2px] bg-indigo-500 rounded-t-full" />
+								)}
+
+								{/* Live task dot */}
+								{tab.activeTaskId && (
+									<span className="w-1.5 h-1.5 rounded-full bg-indigo-400 flex-shrink-0 animate-pulse" />
+								)}
+
+								{isEditing ? (
+									<input
+										ref={editInputRef}
+										value={editingLabel}
+										onChange={(e) => setEditingLabel(e.target.value)}
+										onBlur={commitRename}
+										onKeyDown={(e) => {
+											if (e.key === "Enter") commitRename();
+											if (e.key === "Escape") setEditingTabId(null);
+										}}
+										onClick={(e) => e.stopPropagation()}
+										className="bg-neutral-800 text-neutral-200 text-xs rounded px-1.5 py-0.5 outline-none w-28 min-w-0 border border-indigo-500/50"
+									/>
+								) : (
+									<span className="text-xs truncate flex-1 min-w-0">{tab.label}</span>
+								)}
+
+								{/* Close button */}
+								<button
+									onClick={(e) => {
+										e.stopPropagation();
+										closeTab(tab.id);
+									}}
+									className="w-4 h-4 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 hover:bg-neutral-700/80 text-neutral-500 hover:text-neutral-200 transition-all flex-shrink-0 ml-0.5"
+									aria-label={`Close ${tab.label}`}
+								>
+									<svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+										<path
+											d="M1 1l6 6M7 1L1 7"
+											stroke="currentColor"
+											strokeWidth="1.5"
+											strokeLinecap="round"
+										/>
+									</svg>
+								</button>
+							</div>
+						);
+					})}
 				</div>
 
-				<div className="p-4 border-t border-border flex justify-center">
-					<button
-						onClick={toggleSidebar}
-						className="p-2 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+				{/* New Tab button */}
+				<button
+					onClick={() => addTab()}
+					className="w-10 flex items-center justify-center text-neutral-600 hover:text-neutral-300 hover:bg-neutral-800/60 transition-colors flex-shrink-0"
+					aria-label="New workspace tab"
+					title="New workspace  (double-click tab to rename)"
+				>
+					<svg
+						width="13"
+						height="13"
+						viewBox="0 0 14 14"
+						fill="none"
+						stroke="currentColor"
+						strokeWidth="2"
+						strokeLinecap="round"
 					>
-						{isSidebarCollapsed ? (
-							<ChevronRight className="w-5 h-5" />
-						) : (
-							<ChevronLeft className="w-5 h-5" />
-						)}
-					</button>
-				</div>
-			</aside>
+						<path d="M7 2v10M2 7h10" />
+					</svg>
+				</button>
+			</div>
 
-			{/* MAIN CONTENT AREA */}
-			<main className="flex-1 flex flex-col min-w-0 bg-background relative z-10">
-				{activeView === "workspace" && <WorkspaceView />}
-				{activeView === "queue" && <QueueView />}
-			</main>
+			{/* ── Content ─────────────────────────────────────────────────────── */}
+			<div className="flex-1 min-h-0 overflow-hidden">
+				{tabs.length === 0 ? (
+					<EmptyWorkspace onAdd={() => addTab()} />
+				) : activeTab ? (
+					<TabWorkspace
+						tab={activeTab}
+						onUpdate={(patch) => updateTab(activeTab.id, patch)}
+					/>
+				) : null}
+			</div>
 		</div>
 	);
 }
 
-// --- SUB-COMPONENTS ---
-
-function SidebarButton({ icon, label, isActive, isCollapsed, onClick }: any) {
+function EmptyWorkspace({ onAdd }: { onAdd: () => void }) {
 	return (
-		<button
-			onClick={onClick}
-			title={isCollapsed ? label : undefined}
-			className={`w-full flex items-center ${
-				isCollapsed ? "justify-center px-0" : "justify-start px-3"
-			} gap-3 py-3 rounded-xl transition-all duration-200 group ${
-				isActive
-					? "bg-primary/10 text-primary font-semibold"
-					: "text-muted-foreground hover:bg-muted hover:text-foreground"
-			}`}
-		>
-			<span
-				className={`[&>svg]:w-5 [&>svg]:h-5 shrink-0 ${isActive ? "text-primary" : "group-hover:text-foreground"}`}
-			>
-				{icon}
-			</span>
-			{!isCollapsed && <span className="whitespace-nowrap">{label}</span>}
-		</button>
-	);
-}
-
-function WorkspaceView() {
-	const { tabs, activeTabId, addTab, closeTab, setActiveTab, updateTab } =
-		useWorkspaceStore();
-
-	if (!activeTabId && tabs.length > 0) setActiveTab(tabs[0].id);
-	const activeTab = tabs.find((t) => t.id === activeTabId);
-
-	return (
-		<div className="flex h-full w-full flex-col overflow-hidden">
-			{/* TAB BAR */}
-			<div className="flex items-center gap-1 bg-muted px-2 pt-2 border-b border-border shadow-sm overflow-x-auto no-scrollbar">
-				{tabs.map((tab) => (
-					<button
-						key={tab.id}
-						onClick={() => setActiveTab(tab.id)}
-						className={`group flex shrink-0 items-center gap-2 rounded-t-md border-x border-t px-4 py-2 text-sm transition-colors ${
-							activeTabId === tab.id
-								? "border-border bg-card text-card-foreground shadow-sm"
-								: "border-transparent text-muted-foreground hover:bg-accent/50"
-						}`}
-					>
-						<span className="max-w-[150px] truncate">{tab.title}</span>
-						<div
-							role="button"
-							tabIndex={0}
-							onClick={(e) => {
-								e.stopPropagation();
-								closeTab(tab.id);
-							}}
-							className="rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity"
-						>
-							<X className="h-3 w-3" />
-						</div>
-					</button>
-				))}
-				<button
-					onClick={addTab}
-					className="ml-1 shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-accent transition-colors"
+		<div className="flex flex-col items-center justify-center h-full gap-5 text-neutral-600">
+			<div className="p-5 rounded-2xl border border-neutral-800 bg-neutral-900/40">
+				<svg
+					width="40"
+					height="40"
+					viewBox="0 0 48 48"
+					fill="none"
+					stroke="currentColor"
+					strokeWidth="1.5"
 				>
-					<Plus className="h-4 w-4" />
-				</button>
+					<rect x="6" y="6" width="15" height="15" rx="2.5" />
+					<rect x="27" y="6" width="15" height="15" rx="2.5" />
+					<rect x="6" y="27" width="15" height="15" rx="2.5" />
+					<rect x="27" y="27" width="15" height="15" rx="2.5" />
+				</svg>
 			</div>
-
-			{/* TAB CONTENT */}
-			<div className="flex-1 bg-card min-h-0 overflow-y-auto relative">
-				{activeTab?.mode === "select" && (
-					<div className="flex h-full items-center justify-center gap-8 p-6">
-						<button
-							onClick={() =>
-								updateTab(activeTab.id, {
-									mode: "download",
-									title: "New Download",
-								})
-							}
-							className="flex flex-col items-center gap-4 p-8 w-64 rounded-xl border border-border bg-card hover:bg-accent hover:border-primary transition-all group shadow-sm"
-						>
-							<MonitorPlay className="w-16 h-16 text-muted-foreground group-hover:text-primary transition-colors" />
-							<span className="text-lg font-semibold">Download Video</span>
-						</button>
-
-						<button
-							onClick={() =>
-								updateTab(activeTab.id, { mode: "render", title: "New Render" })
-							}
-							className="flex flex-col items-center gap-4 p-8 w-64 rounded-xl border border-border bg-card hover:bg-accent hover:border-primary transition-all group shadow-sm"
-						>
-							<MessageSquare className="w-16 h-16 text-muted-foreground group-hover:text-primary transition-colors" />
-							<span className="text-lg font-semibold">Render Chat</span>
-						</button>
-					</div>
-				)}
-
-				{activeTab?.mode === "download" && (
-					<>
-						{activeTab.status === "idle" && (
-							<UrlInput tabId={activeTab.id} />
-						)}
-						{activeTab.status === "loading" && (
-							<div className="flex h-full items-center justify-center flex-col gap-3">
-								<Loader2 className="h-8 w-8 animate-spin text-primary" />
-								<p className="text-sm text-muted-foreground">
-									Extracting metadata...
-								</p>
-							</div>
-						)}
-						{activeTab.status === "error" && (
-							<div className="flex h-full items-center justify-center flex-col gap-3 text-destructive p-6 text-center">
-								<AlertCircle className="h-10 w-10" />
-								<h2 className="text-lg font-semibold">Analysis Failed</h2>
-								<p className="text-sm max-w-md">{activeTab.error}</p>
-								<button
-									onClick={() => updateTab(activeTab.id, { status: "idle" })}
-									className="mt-4 rounded-md border bg-transparent px-4 py-2 text-sm text-foreground hover:bg-accent"
-								>
-									Try Again
-								</button>
-							</div>
-						)}
-						{activeTab.status === "analyzed" && (
-							<UrlDetails tab={activeTab} />
-						)}
-					</>
-				)}
-
-				{activeTab?.mode === "render" && <RenderView tabId={activeTab.id} />}
+			<div className="text-center">
+				<p className="text-sm text-neutral-400 font-medium">No workspaces open</p>
+				<p className="text-xs text-neutral-600 mt-1">Each workspace is an independent render session</p>
 			</div>
+			<button
+				onClick={onAdd}
+				className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold rounded-lg transition-colors shadow-lg shadow-indigo-900/30"
+			>
+				Open workspace
+			</button>
 		</div>
 	);
 }

@@ -1,5 +1,7 @@
 use crate::error::AppError;
-use crate::types::{AppResult, Chapter, Metadata, NormalizedMetadata, YtDlpMetadata, NormalizedFormat};
+use crate::types::{
+    AppResult, Chapter, Metadata, NormalizedFormat, NormalizedMetadata, YtDlpMetadata,
+};
 use crate::{tools, AppCache};
 use stream_extractor::{fetch_stream, StreamClient};
 use tauri::{AppHandle, State};
@@ -39,8 +41,10 @@ pub async fn analyze_url_core(
 
     let is_chat_supported = url.contains("twitch.tv") || url.contains("kick.com");
 
-    let is_live = yt_meta.live_status.as_deref() == Some("is_live") || yt_meta.is_live.unwrap_or(false);
-    let was_live = yt_meta.live_status.as_deref() == Some("was_live") || yt_meta.was_live.unwrap_or(false);
+    let is_live =
+        yt_meta.live_status.as_deref() == Some("is_live") || yt_meta.is_live.unwrap_or(false);
+    let was_live =
+        yt_meta.live_status.as_deref() == Some("was_live") || yt_meta.was_live.unwrap_or(false);
     let is_upcoming = yt_meta.live_status.as_deref() == Some("is_upcoming");
 
     let chapters = yt_meta
@@ -60,67 +64,75 @@ pub async fn analyze_url_core(
         .unwrap_or_default();
 
     // --- Format Normalization Logic ---
-    let formats = yt_meta.formats.unwrap_or_default().into_iter().filter_map(|f| {
-        let ext = f.ext.clone().unwrap_or_else(|| "unknown".to_string());
+    let formats = yt_meta
+        .formats
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|f| {
+            let ext = f.ext.clone().unwrap_or_else(|| "unknown".to_string());
 
-        // Filter out storyboards/manifests (like Twitch's mhtml files)
-        if ext == "mhtml" || f.format_id.starts_with("sb") {
-            return None;
-        }
-
-        let vcodec = f.vcodec.as_deref().unwrap_or("none");
-        let acodec = f.acodec.as_deref().unwrap_or("none");
-
-        let has_video = vcodec != "none";
-        let has_audio = acodec != "none";
-
-        // Skip completely empty formats
-        if !has_video && !has_audio {
-            return None;
-        }
-
-        let resolution_label = if let Some(h) = f.height {
-            format!("{}p", h)
-        } else if has_video {
-            f.resolution.clone().unwrap_or_else(|| "Video".to_string())
-        } else {
-            "Audio Only".to_string()
-        };
-
-        let mut ui_parts = vec![resolution_label.clone()];
-
-        if let Some(fps) = f.fps {
-            if fps > 0.0 {
-                ui_parts.push(format!("{}fps", fps.round()));
+            // Filter out storyboards/manifests (like Twitch's mhtml files)
+            if ext == "mhtml" || f.format_id.starts_with("sb") {
+                return None;
             }
-        }
 
-        let type_badge = match (has_video, has_audio) {
-            (true, true) => "V+A",
-            (true, false) => "Video Only",
-            (false, true) => "Audio Only",
-            _ => "Unknown",
-        };
+            let vcodec = f.vcodec.as_deref().unwrap_or("none");
+            let acodec = f.acodec.as_deref().unwrap_or("none");
 
-        // Example output: "1080p 60fps (mp4) - [V+A]"
-        let ui_label = format!("{} ({}) - [{}]", ui_parts.join(" "), ext, type_badge);
+            let has_video = vcodec != "none";
+            let has_audio = acodec != "none";
 
-        Some(NormalizedFormat {
-            format_id: f.format_id,
-            resolution_label,
-            fps: f.fps,
-            extension: ext,
-            has_video,
-            has_audio,
-            size_bytes: f.filesize.or(f.filesize_approx),
-            bitrate: f.tbr,
-            ui_label,
+            // Skip completely empty formats
+            if !has_video && !has_audio {
+                return None;
+            }
+
+            let resolution_label = if let Some(h) = f.height {
+                format!("{}p", h)
+            } else if has_video {
+                f.resolution.clone().unwrap_or_else(|| "Video".to_string())
+            } else {
+                "Audio Only".to_string()
+            };
+
+            let mut ui_parts = vec![resolution_label.clone()];
+
+            if let Some(fps) = f.fps {
+                if fps > 0.0 {
+                    ui_parts.push(format!("{}fps", fps.round()));
+                }
+            }
+
+            let type_badge = match (has_video, has_audio) {
+                (true, true) => "V+A",
+                (true, false) => "Video Only",
+                (false, true) => "Audio Only",
+                _ => "Unknown",
+            };
+
+            // Example output: "1080p 60fps (mp4) - [V+A]"
+            let ui_label = format!("{} ({}) - [{}]", ui_parts.join(" "), ext, type_badge);
+
+            Some(NormalizedFormat {
+                format_id: f.format_id,
+                resolution_label,
+                fps: f.fps,
+                extension: ext,
+                has_video,
+                has_audio,
+                size_bytes: f.filesize.or(f.filesize_approx),
+                bitrate: f.tbr,
+                ui_label,
+            })
         })
-    }).collect();
+        .collect();
 
     let normalized = NormalizedMetadata {
         id: yt_meta.id,
-        title: yt_meta.title.or(yt_meta.fulltitle).unwrap_or_else(|| "Unknown Title".to_string()),
+        title: yt_meta
+            .title
+            .or(yt_meta.fulltitle)
+            .unwrap_or_else(|| "Unknown Title".to_string()),
         description: yt_meta.description,
         duration: yt_meta.duration,
         uploader: yt_meta.uploader.or(yt_meta.channel),

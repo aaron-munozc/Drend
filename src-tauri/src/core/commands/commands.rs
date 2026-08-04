@@ -1,12 +1,12 @@
 use crate::core::chat_renderer::RenderVideoArgs;
 use crate::core::manager::manager::{FrontendChatOptions, FrontendVodOptions};
-use crate::core::{TaskManager};
+use crate::core::manager::AppTask;
+use crate::core::TaskManager;
 use crate::error::AppError;
 use crate::types::{AppResult, Metadata};
 use crate::AppCache;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
-use crate::core::manager::AppTask;
 
 #[tauri::command]
 pub async fn queue_chat_download(

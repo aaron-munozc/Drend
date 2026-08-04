@@ -55,9 +55,9 @@ pub enum EmoteData {
         h: i32,
     },
     Animated {
-        frames: Arc<Vec<Image>>,
-        durations_ms: Arc<Vec<u32>>,
-        cum_durations: Arc<Vec<u32>>,
+        frames: Arc<[Image]>,
+        durations_ms: Arc<[u32]>,
+        cum_durations: Arc<[u32]>,
         total_ms: u32,
         w: i32,
         h: i32,
@@ -77,8 +77,10 @@ impl EmoteData {
         }
     }
 
+    #[inline(always)]
     pub fn frame_at(&self, t_ms: u64) -> Option<&Image> {
         match self {
+            // Static: unconditional return — no branch on length/total_ms.
             Self::Static { img, .. } => Some(img),
             Self::Animated {
                 frames,
@@ -86,14 +88,17 @@ impl EmoteData {
                 total_ms,
                 ..
             } => {
-                if frames.is_empty() || *total_ms == 0 {
-                    return None;
+                // Safety check compiled to a single cmov on most targets.
+                if *total_ms == 0 {
+                    return frames.first();
                 }
                 let looped = (t_ms % *total_ms as u64) as u32;
+                // partition_point is a branchless binary search.
                 let idx = cum_durations
                     .partition_point(|&c| c <= looped)
-                    .min(cum_durations.len().saturating_sub(1));
-                frames.get(idx)
+                    .min(frames.len().saturating_sub(1));
+                // SAFETY: idx is clamped to [0, frames.len()-1].
+                Some(unsafe { frames.get_unchecked(idx) })
             }
         }
     }
@@ -170,13 +175,15 @@ impl EmoteCache {
         false
     }
 
-    fn disk_any_path_for_blocking(&self, id: i32) -> Option<PathBuf> {
+    async fn disk_any_path_async(&self, id: i32) -> Option<PathBuf> {
         if self.is_missing_disk_cached(id) {
             return None;
         }
 
+        // Sync stat is cheap (5 extensions, warm dentry cache) — spawn_blocking
+        // overhead (~10–30 µs task scheduling) exceeds the stat cost itself.
         for ext in ["png", "gif", "webp", "jpg", "bin"] {
-            let p = self.disk_path_for(id, ext);
+            let p = self.base.join(format!("{}.{}", id, ext));
             if p.exists() {
                 return Some(p);
             }
@@ -207,10 +214,11 @@ impl EmoteCache {
         bytes: Vec<u8>,
         target_h: u32,
         quality: QualityPreset,
+        premultiply: bool,
     ) -> AppResult<Arc<EmoteData>> {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
-            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, &quality)
+            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, premultiply, &quality)
                 .map_err(|e| AppError::EmoteCache(e.to_string()))
                 .map(Arc::new);
             let _ = tx.send(decoded);
@@ -264,10 +272,13 @@ impl EmoteCache {
                     }
                 }
 
-                if let Some(path) = ec.disk_any_path_for_blocking(id) {
+                if let Some(path) = ec.disk_any_path_async(id).await {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
-                    let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
+                    let arc =
+                        Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
+                    // Persist dimensions so future runs skip re-decoding for sizing.
+                    ec.write_sidecar_blocking(id, arc.width(), arc.height());
 
                     {
                         let mut m = ec.mem.lock();
@@ -323,7 +334,8 @@ impl EmoteCache {
                 tokio::fs::rename(&tmp, &disk_path).await?;
 
                 let target_h = ec.target_height();
-                let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
+                let arc =
+                    Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
                 let (w, h) = (arc.width(), arc.height());
 
                 ec.write_sidecar_blocking(id, w, h);
@@ -506,10 +518,11 @@ impl ImageCache {
         bytes: Vec<u8>,
         target_h: u32,
         quality: QualityPreset,
+        premultiply: bool,
     ) -> AppResult<Arc<EmoteData>> {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
-            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, &quality)
+            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, premultiply, &quality)
                 .map_err(|e| AppError::EmoteCache(e.to_string()))
                 .map(Arc::new);
             let _ = tx.send(decoded);
@@ -568,7 +581,8 @@ impl ImageCache {
                 if let Some(path) = ec.disk_any_path_async_by_hash(key) {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
-                    let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
+                    let arc =
+                        Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
                     let (w, h) = (arc.width(), arc.height());
                     ec.store_sidecar_blocking(key, w, h);
 
@@ -625,7 +639,8 @@ impl ImageCache {
                 tokio::fs::rename(&tmp, &disk_path).await?;
 
                 let target_h = ec.target_height();
-                let arc = Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone()).await?;
+                let arc =
+                    Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
                 let (w, h) = (arc.width(), arc.height());
                 ec.store_sidecar_blocking(key, w, h);
 

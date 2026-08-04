@@ -98,19 +98,30 @@ pub struct YtDlpMetadata {
 pub struct NormalizedMetadata {
     pub id: String,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uploader: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uploader_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uploader_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub view_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub like_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment_count: Option<u64>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_date: Option<String>,
 
     pub is_live: bool,
@@ -124,6 +135,7 @@ pub struct NormalizedMetadata {
     pub available_subs: Vec<String>,
     pub formats: Vec<NormalizedFormat>, // Passed down cleanly to frontend
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extractor: Option<String>,
     pub is_chat_supported: bool,
     pub original_url: String,
@@ -132,6 +144,7 @@ pub struct NormalizedMetadata {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
+    #[serde(flatten)]
     pub normalized: NormalizedMetadata,
 
     #[serde(skip_serializing)]

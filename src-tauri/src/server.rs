@@ -1,10 +1,12 @@
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     response::sse::{Event, Sse},
     routing::{get, post},
-    Json, Router, http::StatusCode,
+    Json, Router,
 };
 use futures_util::stream::Stream as FuturesStream;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -12,12 +14,11 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_stream::wrappers::ReceiverStream;
-use futures_util::StreamExt;
 
-use stream_extractor::StreamClient;
-use crate::core::manager::manager::{FrontendChatOptions, FrontendVodOptions, AppTask};
-use crate::core::{RenderVideoArgs, TaskManager};
 use crate::core::fetcher::analyze_url_core;
+use crate::core::manager::manager::{AppTask, FrontendChatOptions, FrontendVodOptions};
+use crate::core::{RenderVideoArgs, TaskManager};
+use stream_extractor::StreamClient;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -62,10 +63,9 @@ impl ServerController {
             let app = Router::new()
                 .route("/api/health", get(health_check))
                 .route("/api/tasks", get(get_tasks))
-                .route("/api/tasks/:id", get(get_single_task))
-                .route("/api/tasks/:id/cancel", post(cancel_task))
+                .route("/api/tasks/{id}", get(get_single_task))
+                .route("/api/tasks/{id}/cancel", post(cancel_task))
                 .route("/api/tasks/events", get(stream_task_events))
-
                 .route("/api/analyze", post(analyze_url_handler))
                 .route("/api/vod/download", post(trigger_video_download))
                 .route("/api/chat/download", post(trigger_chat_download))
@@ -106,7 +106,10 @@ impl ServerController {
 }
 
 async fn health_check() -> impl axum::response::IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "status": "healthy" })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "healthy" })),
+    )
 }
 
 // ==========================================
@@ -176,7 +179,6 @@ async fn stream_task_events(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
-
 // ==========================================
 // NEW ANALYZE & DOWNLOAD HANDLERS
 // ==========================================
@@ -190,7 +192,6 @@ async fn analyze_url_handler(
     State(state): State<ServerState>,
     Json(payload): Json<AnalyzeReq>,
 ) -> Result<Json<crate::types::Metadata>, (StatusCode, String)> {
-    // Extract the unified cache instance directly from the AppHandle
     let cache = state.app_handle.state::<crate::AppCache>();
 
     match analyze_url_core(payload.url, &state.app_handle, &state.stream_client, &cache).await {
@@ -211,20 +212,26 @@ async fn trigger_video_download(
 ) -> Result<Json<String>, (StatusCode, String)> {
     let cache = state.app_handle.state::<crate::AppCache>();
 
-    // 1. Try to get metadata from the LRU cache first
     let cached_meta = {
-        let mut lock = cache.streams.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned".to_string()))?;
+        let mut lock = cache.streams.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Lock poisoned".to_string(),
+            )
+        })?;
         lock.get(&payload.url).cloned()
     };
 
-    // 2. Fallback to an on-the-fly fetch if cache is empty
     let meta = match cached_meta {
         Some(m) => m,
-        None => {
-            analyze_url_core(payload.url.clone(), &state.app_handle, &state.stream_client, &cache)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        }
+        None => analyze_url_core(
+            payload.url.clone(),
+            &state.app_handle,
+            &state.stream_client,
+            &cache,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     let task_id = state.manager.enqueue_vod_download(
@@ -249,29 +256,40 @@ async fn trigger_chat_download(
 ) -> Result<Json<String>, (StatusCode, String)> {
     let cache = state.app_handle.state::<crate::AppCache>();
 
-    // 1. Try to get metadata from the LRU cache first
     let cached_meta = {
-        let mut lock = cache.streams.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned".to_string()))?;
+        let mut lock = cache.streams.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Lock poisoned".to_string(),
+            )
+        })?;
         lock.get(&payload.url).cloned()
     };
 
-    // 2. Fallback to an on-the-fly fetch if cache is empty
     let meta = match cached_meta {
         Some(m) => m,
-        None => {
-            analyze_url_core(payload.url.clone(), &state.app_handle, &state.stream_client, &cache)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        }
+        None => analyze_url_core(
+            payload.url.clone(),
+            &state.app_handle,
+            &state.stream_client,
+            &cache,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     let stream_metadata = meta.stream_metadata.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Chat download is not supported for this platform/URL.".to_string())
+        (
+            StatusCode::BAD_REQUEST,
+            "Chat download is not supported for this platform/URL.".to_string(),
+        )
     })?;
 
-    let task_id = state
-        .manager
-        .enqueue_chat_download(None, stream_metadata, payload.options.unwrap_or_default());
+    let task_id = state.manager.enqueue_chat_download(
+        None,
+        stream_metadata,
+        payload.options.unwrap_or_default(),
+    );
 
     Ok(Json(task_id))
 }

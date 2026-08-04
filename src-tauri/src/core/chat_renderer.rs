@@ -6,4 +6,5 @@ mod regex;
 mod types;
 
 pub use args::RenderVideoArgs;
+pub use emote_providers::EmoteNameMap;
 pub use engine::process_chat_render;

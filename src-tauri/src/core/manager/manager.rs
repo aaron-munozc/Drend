@@ -9,10 +9,10 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
-use crate::core::chat_renderer::{process_chat_render, RenderVideoArgs};
+use crate::core::chat_renderer::{process_chat_render, EmoteNameMap, RenderVideoArgs};
 use crate::error::AppError;
-use crate::types::AppResult;
 use crate::tools;
+use crate::types::AppResult;
 use stream_extractor::{
     ChatDownloadOptions, KickOptions, ProgressPayload, Stream, StreamClient, StreamMetadata,
 };
@@ -48,8 +48,7 @@ pub struct FrontendVodOptions {
     pub video_format_id: Option<String>,
     pub audio_format_id: Option<String>,
     // ---------------------------------
-
-    pub resolution: Option<u32>, // Kept as fallback
+    pub resolution: Option<u32>,
     pub video_format: Option<VideoFormat>,
     pub audio_only: Option<bool>,
     pub audio_format: Option<AudioFormat>,
@@ -143,7 +142,8 @@ pub struct TaskManager {
 impl TaskManager {
     pub fn new(app_handle: AppHandle) -> Self {
         let tasks: Arc<Mutex<HashMap<String, AppTask>>> = Arc::new(Mutex::new(HashMap::new()));
-        let cancellations: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let cancellations: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::unbounded_channel::<QueueItem>();
         let (event_tx, _) = mpsc::channel::<AppTask>(100);
 
@@ -152,12 +152,16 @@ impl TaskManager {
         let event_tx_clone = event_tx.clone();
 
         tauri::async_runtime::spawn(async move {
+            // --- NEW: Initialize a shared HTTP client for network requests ---
+            let http_client = reqwest::Client::new();
+
             while let Some(item) = rx.recv().await {
                 let task_id = item.task_id.clone();
                 let app = app_handle.clone();
                 let state_map = Arc::clone(&tasks_clone);
                 let cancels = Arc::clone(&cancellations_clone);
                 let progress_broadcast = event_tx_clone.clone();
+                let http_client_clone = http_client.clone(); // Clone for the inner thread
 
                 let mut cancel_rx = {
                     let locked_cancels = cancels.lock().unwrap();
@@ -202,7 +206,7 @@ impl TaskManager {
                                 options,
                                 cancel_rx,
                             )
-                                .await
+                            .await
                         }
                         JobPayload::VodDownload { url, options } => {
                             Self::process_vod_inner(
@@ -214,7 +218,7 @@ impl TaskManager {
                                 options,
                                 cancel_rx,
                             )
-                                .await
+                            .await
                         }
                         JobPayload::ChatRender {
                             input_path,
@@ -227,11 +231,35 @@ impl TaskManager {
                             tauri::async_runtime::spawn(async move {
                                 if cancel_rx.changed().await.is_ok() {
                                     if *cancel_rx.borrow() {
-                                        flag_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        flag_setter
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
                                 }
                             });
 
+                            {
+                                let mut locked = state_map.lock().unwrap();
+                                if let Some(task) = locked.get_mut(&task_id) {
+                                    task.status_text = Some("Fetching emote metadata...".into());
+                                    let _ = app.emit("task-progress", task.clone());
+                                    let _ = progress_broadcast.try_send(task.clone());
+                                }
+                            }
+
+                            let channel_id = "12345678"; // Replace with real extraction logic
+
+                            // --- FIXED: Uses EmoteNameMap::build_emote_map and passes the client/flags ---
+                            let emote_map = EmoteNameMap::build_emote_map(
+                                &http_client_clone,
+                                &args.emote_providers,
+                                channel_id,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                // Fallback to empty map or return the error to fail the task
+                                eprintln!("Failed to fetch emotes: {}", e);
+                                EmoteNameMap::new()
+                            });
                             process_chat_render(
                                 &app,
                                 state_map.clone(),
@@ -239,9 +267,10 @@ impl TaskManager {
                                 input_path,
                                 args,
                                 cache_dir_base,
+                                emote_map,
                                 cancel_flag,
                             )
-                                .await
+                            .await
                         }
                     };
 
@@ -318,7 +347,10 @@ impl TaskManager {
             .or_else(|| app.path().download_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let file_name = opts.file_name.clone().unwrap_or_else(|| "%(title)s.%(ext)s".to_string());
+        let file_name = opts
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "%(title)s.%(ext)s".to_string());
         let out_path = out_dir.join(file_name);
         args.push("-o".to_string());
         args.push(out_path.to_string_lossy().to_string());
@@ -355,7 +387,10 @@ impl TaskManager {
             args.push("-f".into());
 
             // Format ID Builder Logic
-            match (opts.video_format_id.as_deref(), opts.audio_format_id.as_deref()) {
+            match (
+                opts.video_format_id.as_deref(),
+                opts.audio_format_id.as_deref(),
+            ) {
                 (Some(vid), Some(aid)) => {
                     // Specific Video + Specific Audio (e.g., YouTube/Facebook)
                     args.push(format!("{}+{}", vid, aid));
@@ -396,7 +431,10 @@ impl TaskManager {
         // Apply remaining options seamlessly
         if opts.start_ms.is_some() || opts.end_ms.is_some() {
             let start = opts.start_ms.map(|ms| ms / 1000).unwrap_or(0);
-            let end_str = opts.end_ms.map(|ms| (ms / 1000).to_string()).unwrap_or_else(|| "inf".into());
+            let end_str = opts
+                .end_ms
+                .map(|ms| (ms / 1000).to_string())
+                .unwrap_or_else(|| "inf".into());
             args.push("--download-sections".into());
             args.push(format!("*{}-{}", start, end_str));
 
@@ -495,8 +533,17 @@ impl TaskManager {
             }
         }
 
-        let status = child.wait().await.map_err(|e| AppError::Generic(e.to_string()))?;
-        if status.success() { Ok(()) } else { Err(AppError::Generic("Process terminated with error codes".into())) }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| AppError::Generic(e.to_string()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(AppError::Generic(
+                "Process terminated with error codes".into(),
+            ))
+        }
     }
 
     async fn process_chat_inner(
@@ -529,7 +576,10 @@ impl TaskManager {
             }
         });
 
-        let out_dir = opts.save_folder.map(PathBuf::from).or_else(|| app.path().download_dir().ok());
+        let out_dir = opts
+            .save_folder
+            .map(PathBuf::from)
+            .or_else(|| app.path().download_dir().ok());
         let kick_opts = KickOptions::default()
             .with_concurrency(opts.kick_concurrency.unwrap_or(10))
             .with_empty_cycle_threshold(opts.empty_cycle_threshold.unwrap_or(6));
@@ -540,15 +590,26 @@ impl TaskManager {
             .with_progress_hook(progress_hook)
             .with_cancel_rx(cancel_rx);
 
-        if let Some(dir) = out_dir { engine_opts = engine_opts.with_output_dir(dir); }
-        if let Some(name) = opts.file_name { engine_opts = engine_opts.with_output_name(name); }
-        if let Some(start) = opts.start_ms { engine_opts = engine_opts.with_start_ms(start); }
-        if let Some(end) = opts.end_ms { engine_opts = engine_opts.with_end_ms(end); }
+        if let Some(dir) = out_dir {
+            engine_opts = engine_opts.with_output_dir(dir);
+        }
+        if let Some(name) = opts.file_name {
+            engine_opts = engine_opts.with_output_name(name);
+        }
+        if let Some(start) = opts.start_ms {
+            engine_opts = engine_opts.with_start_ms(start);
+        }
+        if let Some(end) = opts.end_ms {
+            engine_opts = engine_opts.with_end_ms(end);
+        }
 
         let client = StreamClient::new().map_err(|e| AppError::Generic(e.to_string()))?;
         let stream = Stream::new(meta, &client);
 
-        stream.download_chat(engine_opts).await.map_err(|e| AppError::Generic(e.to_string()))?;
+        stream
+            .download_chat(engine_opts)
+            .await
+            .map_err(|e| AppError::Generic(e.to_string()))?;
         Ok(())
     }
 
@@ -582,7 +643,11 @@ impl TaskManager {
             .lock()
             .unwrap()
             .insert(task_id.clone(), cancel_tx);
-        self.create_task(&task_id, TaskType::ChatRender, format!("Rendering: {}", title));
+        self.create_task(
+            &task_id,
+            TaskType::ChatRender,
+            format!("Rendering: {}", title),
+        );
 
         let _ = self.tx.send(QueueItem {
             task_id: task_id.clone(),
@@ -601,7 +666,10 @@ impl TaskManager {
         meta: StreamMetadata,
         options: FrontendChatOptions,
     ) -> String {
-        let title = meta.title.clone().unwrap_or_else(|| "Unknown Stream".to_string());
+        let title = meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "Unknown Stream".to_string());
 
         let task_id = task_id
             .filter(|id| !id.trim().is_empty())
@@ -672,7 +740,10 @@ impl TaskManager {
             status: TaskStatus::Queued,
             status_text: Some("Queuing...".into()),
         };
-        self.tasks.lock().unwrap().insert(task_id.to_string(), task.clone());
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(task_id.to_string(), task.clone());
         let _ = self.event_tx.try_send(task);
     }
 
@@ -690,7 +761,9 @@ impl TaskManager {
 
         tauri::async_runtime::spawn(async move {
             for task in current_tasks {
-                if tx.send(task).await.is_err() { return; }
+                if tx.send(task).await.is_err() {
+                    return;
+                }
             }
         });
         rx

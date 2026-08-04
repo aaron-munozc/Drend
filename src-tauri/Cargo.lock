@@ -1454,6 +1454,7 @@ dependencies = [
 name = "drend"
 version = "1.0.0"
 dependencies = [
+ "arrayvec",
  "axum",
  "crossbeam-channel",
  "futures",
@@ -1470,7 +1471,6 @@ dependencies = [
  "serde",
  "serde_json",
  "skia-safe",
- "smallvec",
  "stream_extractor",
  "tar",
  "tauri",

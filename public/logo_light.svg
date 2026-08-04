@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <style>
+      .cls-1, .cls-2 {
+        fill: #fff;
+      }
+
+      .cls-3 {
+        fill: #20262a;
+      }
+
+      .cls-2 {
+        stroke: #20262a;
+        stroke-miterlimit: 10;
+        stroke-width: 12px;
+      }
+    </style>
+  </defs>
+  <g id="Video_Feature" data-name="Video Feature">
+    <rect class="cls-2" x="100.27" y="263.62" width="259.81" height="181.26" rx="40.71" ry="40.71" transform="translate(215.81 -67.97) rotate(31.06)"/>
+    <rect class="cls-3" x="125.21" y="306.81" width="259.81" height="12.08" transform="translate(198.02 -86.77) rotate(31.06)"/>
+    <rect class="cls-3" x="163.7" y="246.47" width="54.1" height="9.23" transform="translate(-97.67 123.63) rotate(-28.94)"/>
+    <rect class="cls-3" x="214.42" y="277.03" width="54.1" height="9.23" transform="translate(-106.12 151.99) rotate(-28.94)"/>
+    <rect class="cls-3" x="317.93" y="339.38" width="54.1" height="9.23" transform="translate(-123.37 209.85) rotate(-28.94)"/>
+    <rect class="cls-3" x="274.7" y="308.11" width="54.1" height="9.23" transform="translate(-113.64 185.03) rotate(-28.94)"/>
+    <path class="cls-3" d="M259.52,376.04l-30.47-50.8c-2.99-4.98-10.25-4.86-13.08.22l-28.76,51.79c-2.82,5.08.92,11.31,6.73,11.21l59.23-.99c5.81-.1,9.34-6.45,6.35-11.43Z"/>
+  </g>
+  <g id="Download_Feature" data-name="Download Feature">
+    <path class="cls-3" d="M508.29,68.44h42.61c4.66,0,8.44,3.78,8.44,8.44v119.04h-59.49v-119.04c0-4.66,3.78-8.44,8.44-8.44Z"/>
+    <path class="cls-3" d="M534.6,259.6l50.37-54.61c3.2-3.46.74-9.07-3.97-9.07h-100.74c-4.71,0-7.17,5.61-3.97,9.07l50.37,54.61c2.14,2.32,5.81,2.32,7.95,0Z"/>
+    <rect class="cls-3" x="448.86" y="272.41" width="161.48" height="17" rx="2.74" ry="2.74"/>
+  </g>
+  <g>
+    <polyline class="cls-3" points="719.78 480.87 749.84 394.96 817.02 412.25"/>
+    <rect class="cls-3" x="721.35" y="290.43" width="236.35" height="151.16" rx="20.95" ry="20.95" transform="translate(117.69 -197.65) rotate(14.43)"/>
+    <rect class="cls-1" x="760.29" y="320.39" width="164.42" height="26.87" rx="8.07" ry="8.07" transform="translate(109.76 -199.41) rotate(14.43)"/>
+    <rect class="cls-1" x="752.15" y="351.11" width="123.31" height="23.51" rx="8.07" ry="8.07" transform="translate(116.09 -191.34) rotate(14.43)"/>
+  </g>
+  <path id="Mask" class="cls-1" d="M974.96,500.21v378.09c0,31.49-25.53,57.01-57.01,57.01H146.45c-31.49,0-57.01-25.53-57.01-57.01v-378.09c0-31.49,25.53-57.01,57.01-57.01h201.67v-109.88c0-24.25,19.08-43.91,42.62-43.91h282.91c23.53,0,42.61,19.66,42.61,43.91v109.88h201.68c31.49,0,57.01,25.53,57.01,57.01Z"/>
+  <g id="ToolBox">
+    <path class="cls-3" d="M110.28,570.69h843.85v318.19c0,14.13-11.47,25.6-25.6,25.6H135.88c-14.13,0-25.6-11.47-25.6-25.6v-318.19h0Z"/>
+    <path class="cls-3" d="M135.35,466.51h793.7c13.84,0,25.07,11.23,25.07,25.07v58.27H110.28v-58.27c0-13.84,11.23-25.07,25.07-25.07Z"/>
+    <rect class="cls-1" x="204.04" y="508.18" width="62.51" height="135.43" rx="12.49" ry="12.49"/>
+    <rect class="cls-1" x="797.85" y="513.39" width="62.51" height="135.43" rx="12.49" ry="12.49"/>
+    <rect class="cls-1" x="506.15" y="518.6" width="62.51" height="104.18" rx="12.49" ry="12.49"/>
+    <rect class="cls-3" x="523.15" y="548.12" width="28.51" height="45.14" rx="4.94" ry="4.94"/>
+    <path id="ToolBoxHandle" class="cls-3" d="M704.09,346.2v91.89c0,4.19-3.39,7.58-7.58,7.58h-36.92c-4.19,0-7.58-3.39-7.58-7.58v-58.12c0-6.87-5.57-12.43-12.43-12.43h-214.75c-6.87,0-12.43,5.57-12.43,12.43v58.12c0,4.19-3.39,7.58-7.58,7.58h-36.92c-4.19,0-7.58-3.39-7.58-7.58v-91.89c0-19.86,16.1-35.96,35.96-35.96h271.86c19.86,0,35.96,16.1,35.96,35.96Z"/>
+  </g>
+</svg>

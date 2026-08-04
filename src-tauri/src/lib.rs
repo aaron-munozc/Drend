@@ -5,17 +5,17 @@ use crate::types::Metadata;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
+use tauri::Manager;
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_log::fern::colors::{Color, ColoredLevelConfig};
 
 mod core;
 mod error;
 mod server;
-mod types;
 mod tools;
+mod types;
 
 pub struct AppCache {
     pub streams: Mutex<LruCache<String, Metadata>>,
@@ -79,7 +79,10 @@ pub fn run() {
                             run_server = true;
                             let app_handle = app.handle().clone();
                             let manager_clone = manager.clone();
-                            let client_clone = app.state::<stream_extractor::StreamClient>().inner().clone();
+                            let client_clone = app
+                                .state::<stream_extractor::StreamClient>()
+                                .inner()
+                                .clone();
                             let controller_clone = server_controller.clone();
 
                             tauri::async_runtime::spawn(async move {
@@ -116,26 +119,27 @@ pub fn run() {
             // Grab the default icon compiled into the Tauri app
             let icon = app.default_window_icon().cloned();
 
-            let tray_builder = TrayIconBuilder::new()
-                .menu(&menu)
-                .on_menu_event(|app_handle, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+            let tray_builder =
+                TrayIconBuilder::new()
+                    .menu(&menu)
+                    .on_menu_event(|app_handle, event| match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
                         }
-                    }
-                    "quit" => {
-                        // Gracefully shut down the Axum server before killing the Tauri process
-                        let app_clone = app_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let controller = app_clone.state::<server::ServerController>();
-                            let _ = controller.stop().await; // Unbinds the port safely
-                            app_clone.exit(0); // Safely drops the Tokio runtime and exits
-                        });
-                    }
-                    _ => {}
-                });
+                        "quit" => {
+                            // Gracefully shut down the Axum server before killing the Tauri process
+                            let app_clone = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let controller = app_clone.state::<server::ServerController>();
+                                let _ = controller.stop().await; // Unbinds the port safely
+                                app_clone.exit(0); // Safely drops the Tokio runtime and exits
+                            });
+                        }
+                        _ => {}
+                    });
 
             // Conditionally attach the icon if one was successfully loaded
             let tray_builder = if let Some(i) = icon {
@@ -180,10 +184,10 @@ pub fn run() {
             queue_vod_download,
             queue_chat_render,
             get_download_queue,
-
             tools::check_ytdlp,
             tools::install_ytdlp,
-
+            tools::check_ffmpeg,
+            tools::install_ffmpeg,
             server::start_api_server,
             server::stop_api_server
         ])

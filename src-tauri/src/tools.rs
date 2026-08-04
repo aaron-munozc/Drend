@@ -9,8 +9,8 @@ use which::which;
 /// Helper to consistently get the app's local data directory
 fn get_app_dir(app: &AppHandle) -> PathBuf {
     app.path()
-       .app_local_data_dir()
-       .unwrap_or_else(|_| PathBuf::from("."))
+        .app_local_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 // ==========================================
@@ -126,7 +126,11 @@ pub fn get_ffmpeg_path(app: &AppHandle) -> PathBuf {
         return local_path;
     }
 
-    let global_name = if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" };
+    let global_name = if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
     if let Ok(global_path) = which(global_name) {
         return global_path;
     }
@@ -187,8 +191,9 @@ pub async fn install_ffmpeg(app: AppHandle) -> AppResult<()> {
 
             let mut found = false;
             for i in 0..archive.len() {
-                let mut file = archive.by_index(i)
-                                      .map_err(|e| AppError::Generic(format!("Failed to read archive entry: {}", e)))?;
+                let mut file = archive.by_index(i).map_err(|e| {
+                    AppError::Generic(format!("Failed to read archive entry: {}", e))
+                })?;
 
                 let name = file.name();
                 let is_target = if cfg!(target_os = "windows") {
@@ -198,8 +203,9 @@ pub async fn install_ffmpeg(app: AppHandle) -> AppResult<()> {
                 };
 
                 if is_target && !file.is_dir() {
-                    let mut out = std::fs::File::create(&path_clone)
-                        .map_err(|e| AppError::Generic(format!("Failed to create destination file: {}", e)))?;
+                    let mut out = std::fs::File::create(&path_clone).map_err(|e| {
+                        AppError::Generic(format!("Failed to create destination file: {}", e))
+                    })?;
                     std::io::copy(&mut file, &mut out)
                         .map_err(|e| AppError::Generic(format!("Failed to extract file: {}", e)))?;
                     found = true;
@@ -207,7 +213,9 @@ pub async fn install_ffmpeg(app: AppHandle) -> AppResult<()> {
                 }
             }
             if !found {
-                return Err(AppError::Generic("ffmpeg binary not found inside zip archive".to_string()));
+                return Err(AppError::Generic(
+                    "ffmpeg binary not found inside zip archive".to_string(),
+                ));
             }
         }
 
@@ -216,21 +224,24 @@ pub async fn install_ffmpeg(app: AppHandle) -> AppResult<()> {
         {
             let decompressor = xz2::read::XzDecoder::new(cursor);
             let mut archive = tar::Archive::new(decompressor);
-            let entries = archive.entries()
-                                 .map_err(|e| AppError::Generic(format!("Failed to read tar entries: {}", e)))?;
+            let entries = archive
+                .entries()
+                .map_err(|e| AppError::Generic(format!("Failed to read tar entries: {}", e)))?;
 
             let mut found = false;
             for entry_result in entries {
                 let mut entry = entry_result
                     .map_err(|e| AppError::Generic(format!("Failed to parse tar entry: {}", e)))?;
 
-                let entry_path = entry.path()
-                                      .map_err(|e| AppError::Generic(format!("Failed to read tar entry path: {}", e)))?;
+                let entry_path = entry.path().map_err(|e| {
+                    AppError::Generic(format!("Failed to read tar entry path: {}", e))
+                })?;
 
                 // BtbN Linux builds place the binary at `ffmpeg-xxx/bin/ffmpeg`
                 if entry_path.ends_with("ffmpeg") && entry.header().entry_type().is_file() {
-                    let mut out = std::fs::File::create(&path_clone)
-                        .map_err(|e| AppError::Generic(format!("Failed to create destination file: {}", e)))?;
+                    let mut out = std::fs::File::create(&path_clone).map_err(|e| {
+                        AppError::Generic(format!("Failed to create destination file: {}", e))
+                    })?;
                     std::io::copy(&mut entry, &mut out)
                         .map_err(|e| AppError::Generic(format!("Failed to extract file: {}", e)))?;
                     found = true;
@@ -238,14 +249,16 @@ pub async fn install_ffmpeg(app: AppHandle) -> AppResult<()> {
                 }
             }
             if !found {
-                return Err(AppError::Generic("ffmpeg binary not found inside tar.xz archive".to_string()));
+                return Err(AppError::Generic(
+                    "ffmpeg binary not found inside tar.xz archive".to_string(),
+                ));
             }
         }
 
         Ok(())
     })
-        .await
-        .map_err(|e| AppError::Generic(format!("Extraction thread panicked: {}", e)))??;
+    .await
+    .map_err(|e| AppError::Generic(format!("Extraction thread panicked: {}", e)))??;
 
     // Set executable permissions for Linux / macOS
     #[cfg(unix)]
