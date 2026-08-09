@@ -15,36 +15,16 @@ pub struct ObjectColor {
 
 impl ObjectColor {
     pub fn black() -> Self {
-        Self {
-            alpha: 255,
-            red: 20,
-            green: 20,
-            blue: 20,
-        }
+        Self { alpha: 255, red: 20, green: 20, blue: 20 }
     }
     pub fn white() -> Self {
-        Self {
-            alpha: 255,
-            red: 240,
-            green: 240,
-            blue: 240,
-        }
+        Self { alpha: 255, red: 240, green: 240, blue: 240 }
     }
     pub fn solid_black() -> Self {
-        Self {
-            alpha: 255,
-            red: 0,
-            green: 0,
-            blue: 0,
-        }
+        Self { alpha: 255, red: 0, green: 0, blue: 0 }
     }
     pub fn highlight_gold() -> Self {
-        Self {
-            alpha: 255,
-            red: 255,
-            green: 215,
-            blue: 0,
-        }
+        Self { alpha: 255, red: 255, green: 215, blue: 0 }
     }
 }
 
@@ -86,7 +66,8 @@ impl From<&ObjectColor> for Color {
 /// text, saving cache space, network bandwidth, and decode CPU for streams that
 /// only use a subset of providers.
 ///
-/// All providers are enabled by default for maximum compatibility.
+/// All providers are disabled by default — callers must opt in explicitly so
+/// unused CDN fetches never happen.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct EmoteProviderFlags {
@@ -108,7 +89,12 @@ pub struct EmoteProviderFlags {
 impl Default for EmoteProviderFlags {
     fn default() -> Self {
         Self {
-            kick: false,
+            // Kick native emote tags ([emote:ID:NAME]) are the platform's own
+            // format — every Kick VOD log contains them. Defaulting to `false`
+            // silently discards all emote-only messages, leaving phantom
+            // zero-content bubbles that push other messages without rendering
+            // anything. Must be `true` by default for a Kick chat renderer.
+            kick: true,
             seven_tv: false,
             bttv: false,
             ffz: false,
@@ -133,18 +119,65 @@ impl EmoteProviderFlags {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Controls what the canvas background looks like behind the chat.
+///
+/// # Choosing the right mode
+///
+/// | Mode            | Output container | Alpha support | Recommended for                    |
+/// |-----------------|------------------|---------------|------------------------------------|
+/// | `Transparent`   | `.mov` (ProRes 4444) | True RGBA  | Final compositing in DaVinci / AE  |
+/// | `LumaMatte`     | `.mp4`           | Side-car mask | Editors without ProRes; web export |
+/// | `ChromaKeyGreen`| `.mp4`           | Keyed in NLE  | Legacy green-screen workflows      |
+/// | `CustomColor`   | `.mp4`           | None          | Burned-in captions or preview      |
+///
+/// **`Transparent`** — emits ProRes 4444 (`yuva444p10le`). True RGBA in a
+/// single file. Highest quality, largest file. No GPU required; encoding is
+/// done by FFmpeg's software `prores_ks` encoder. Use this when you have an
+/// NLE that supports ProRes 4444 (DaVinci Resolve, Final Cut Pro, Premiere).
+///
+/// **`LumaMatte`** — the canvas is doubled in width: the left half carries the
+/// RGB colour pass and the right half carries the luminance alpha mask (white =
+/// opaque, black = transparent). A single `filter_complex` in FFmpeg then
+/// crops + merges the two halves and overlays them onto the base video. This
+/// avoids a separate `.matte` file while remaining fully lossless at the
+/// overlay stage. Use this when you need H.264 output but still want clean
+/// edges, or when the editing tool can't handle ProRes.
+///
+/// **`ChromaKeyGreen`** — solid `rgb(0,255,0)` background. Simple to set up
+/// in any NLE with a colour-keyer, but suffers from green fringing on
+/// anti-aliased text edges. Prefer `LumaMatte` or `Transparent` when possible.
+///
+/// **`CustomColor`** — opaque fill with `background_color`. Use for
+/// burned-in previews where transparency is not needed, or for direct
+/// recording-over output where no compositing step follows.
+///
+/// # Direct overlay (`overlay_video_path`)
+///
+/// When a base video is provided, `LumaMatte` is the default and recommended
+/// mode. The pipeline becomes:
+///
+/// ```text
+/// [base video] ──┐
+///                ├─ overlay filter_complex ─► encoded output
+/// [chat frames] ─┘   (alpha reconstructed from luma matte)
+/// ```
+///
+/// `Transparent` also works in direct-overlay mode; FFmpeg receives raw BGRA
+/// frames and handles the alpha compositing via `alpha=premultiplied`.
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum BackgroundMode {
-    /// Fully transparent — output is RGBA with alpha channel (e.g. ProRes 4444).
-    #[default]
+    /// Fully transparent — output is RGBA with alpha channel (ProRes 4444 `.mov`).
+    /// Best quality; largest file. Requires an NLE that supports ProRes 4444.
     Transparent,
     /// Side-by-side luma matte: left half = colour, right half = alpha mask.
     /// The canvas width is automatically doubled; FFmpeg reconstructs the alpha.
+    /// Good balance of quality and compatibility with H.264 output.
+    #[default]
     LumaMatte,
     /// Solid chroma-key green (0, 255, 0) — for legacy keying workflows.
+    /// Produces green fringing on anti-aliased edges; prefer `LumaMatte`.
     ChromaKeyGreen,
-    /// Solid fill using `background_color`.
+    /// Solid fill using `background_color`. No transparency; smallest file.
     CustomColor,
 }
 
@@ -160,15 +193,20 @@ pub enum EvictionStrategy {
 }
 
 /// Scaling filter used when resizing emote images.
+///
+/// Applied once at decode time; stored decoded images are never re-filtered.
+/// Choosing `Draft` costs nothing at render time — it only affects decode
+/// quality. For typical stream emote sizes (32–56 px tall) `Standard` is
+/// perceptually indistinguishable from `High`.
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum QualityPreset {
-    /// Nearest-neighbor — fastest, no filtering.
+    /// Nearest-neighbor — fastest decode, no filtering. Fine for pixel-art emotes.
     Draft,
-    /// Bilinear (triangle) — good balance of speed and quality.
+    /// Bilinear (triangle) — good balance of speed and quality. **Default.**
     #[default]
     Standard,
-    /// Lanczos3 — best quality, slowest.
+    /// Lanczos3 — best quality for photo-style emotes, ~3× slower than `Standard`.
     High,
 }
 
@@ -315,6 +353,17 @@ pub struct RenderVideoArgs {
     /// Decode emotes with premultiplied alpha for faster Skia compositing.
     pub create_premultiplied_alpha_emotes: bool,
 
+    /// When `true` (default), GIF emotes are fully decoded to Skia Images at
+    /// cache warm-up time. Fastest at render time; uses ~250 KB RAM per unique
+    /// animated emote.
+    ///
+    /// Set to `false` for streams with many unique animated emotes (>20) to
+    /// defer pixel decode to first render access. Saves 200–500 MB RAM at the
+    /// cost of a one-time decode stall on first frame that references each emote.
+    /// The stall is amortised across the render via `OnceLock` — subsequent
+    /// frames for the same emote pay only an atomic load.
+    pub eager_gif_decode: bool,
+
     // ── Time window ───────────────────────────────────────────────────────────
     /// Only process messages after this epoch-ms offset (optional).
     pub start_ms: Option<u64>,
@@ -325,6 +374,11 @@ pub struct RenderVideoArgs {
 
     // ── Base video overlay ────────────────────────────────────────────────────
     /// Path to a video file that the chat render is composited onto.
+    ///
+    /// When set, chat frames are piped directly into FFmpeg's `overlay`
+    /// filter without writing a temporary file. The base video audio track
+    /// is copied as-is. Set `use_immediate_pipe_overlay = true` to also
+    /// skip any intermediate chat video file and composite on-the-fly.
     pub overlay_video_path: Option<String>,
     pub overlay_x: Option<i32>,
     pub overlay_y: Option<i32>,
@@ -335,13 +389,48 @@ pub struct RenderVideoArgs {
 
     // ── Pipeline extensions ───────────────────────────────────────────────────
     /// Pipe raw frames directly into FFmpeg stdin, skipping temp files.
+    ///
+    /// When `true` the background mode is forced to `Transparent` so the
+    /// BGRA pixel stream carries full alpha. FFmpeg composites this stream
+    /// directly onto `overlay_video_path` without any intermediate file on
+    /// disk. This is the lowest-latency and lowest-disk-usage pipeline.
+    ///
+    /// Requires `overlay_video_path` to be set; ignored otherwise.
     pub use_immediate_pipe_overlay: bool,
     /// Solid-color shapes drawn above the background, below chat.
+    /// Pre-fill the chat overlay with messages that would already be on-screen
+    /// at frame 0.
+    ///
+    /// Without this, if the first message in the log arrives at t=7 s the
+    /// overlay is blank for the first 7 seconds.  With this enabled, any
+    /// message whose timestamp falls within `[time_zero - message_hold_seconds,
+    /// time_zero]` is injected at frame 0 as if it had already been on screen
+    /// for the appropriate amount of time — hold/eviction/fade-out timers are
+    /// adjusted so the message expires at exactly the right moment.  Slide and
+    /// fade-in animations are suppressed for pre-filled messages since they
+    /// are already "settled" when the video begins.
+    ///
+    /// Requires `time_zero_ms` (or `start_ms`) to be set so the engine knows
+    /// where "frame 0" is in stream time.  Has no effect when `time_zero_ms`
+    /// is not set (the default behaviour makes the first message define t=0).
+    #[serde(default)]
+    pub prefill_from_start: bool,
     pub shape_overlays: Vec<CustomShapeOverlay>,
     /// Image assets drawn above the background, below chat.
     pub image_overlays: Vec<CustomImageOverlay>,
     /// How to fill frames when the base video outlasts the chat log.
     pub timeline_mismatch_strategy: TimelineMismatchStrategy,
+
+    // ── CPU tuning ────────────────────────────────────────────────────────────
+    /// Cap on the number of rayon worker threads used for frame rendering.
+    /// `None` → auto-detect (uses all logical CPUs, capped per quality preset).
+    /// Reduce to leave headroom for other processes or to limit RAM use
+    /// (each worker allocates its own Skia raster surface).
+    pub max_render_threads: Option<usize>,
+
+    /// Cap on simultaneous emote/image downloads during cache warm-up.
+    /// Defaults to 8; reduce on metered connections.
+    pub max_download_concurrency: Option<usize>,
 }
 
 impl Default for RenderVideoArgs {
@@ -397,7 +486,7 @@ impl Default for RenderVideoArgs {
             group_messages: false,
             group_messages_window_secs: 0,
 
-            // Emote providers — all on by default
+            // Emote providers — all off by default; callers opt in
             emote_providers: EmoteProviderFlags::default(),
 
             // Emotes & images
@@ -405,6 +494,7 @@ impl Default for RenderVideoArgs {
             max_cached_emotes: 180,
             center_emotes_vertically: true,
             create_premultiplied_alpha_emotes: true,
+            eager_gif_decode: true,
 
             // Time window
             start_ms: None,
@@ -420,9 +510,14 @@ impl Default for RenderVideoArgs {
 
             // Pipeline extensions
             use_immediate_pipe_overlay: false,
+            prefill_from_start: false,
             shape_overlays: vec![],
             image_overlays: vec![],
             timeline_mismatch_strategy: TimelineMismatchStrategy::FreezeLastFrame,
+
+            // CPU tuning
+            max_render_threads: None,
+            max_download_concurrency: None,
         }
     }
 }

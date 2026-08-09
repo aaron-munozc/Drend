@@ -133,7 +133,7 @@ pub struct NormalizedMetadata {
     pub categories: Vec<String>,
     pub chapters: Vec<Chapter>,
     pub available_subs: Vec<String>,
-    pub formats: Vec<NormalizedFormat>, // Passed down cleanly to frontend
+    pub formats: Vec<NormalizedFormat>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extractor: Option<String>,

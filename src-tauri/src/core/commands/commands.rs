@@ -71,6 +71,18 @@ pub async fn get_download_queue(manager: State<'_, TaskManager>) -> AppResult<Ve
     Ok(manager.get_tasks())
 }
 
+#[tauri::command]
+pub async fn cancel_task(
+    manager: State<'_, TaskManager>,
+    task_id: String,
+) -> AppResult<()> {
+    manager
+        .cancel_task(&task_id)
+        .map_err(AppError::Generic)?;
+
+    Ok(())
+}
+
 // ==========================================
 // HELPERS
 // ==========================================

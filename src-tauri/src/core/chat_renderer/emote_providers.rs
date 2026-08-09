@@ -2,7 +2,7 @@ use crate::core::chat_renderer::args::EmoteProviderFlags;
 use crate::core::chat_renderer::regex::{EMOTE_REGEX, IMAGE_URL_REGEX};
 use crate::types::AppResult;
 use serde::Deserialize;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ struct BttvEmote {
 // --- FFZ ---
 #[derive(Deserialize)]
 struct FfzResponse {
-    sets: HashMap<String, FfzSet>,
+    sets: FxHashMap<String, FfzSet>,
 }
 #[derive(Deserialize)]
 struct FfzSet {
@@ -110,7 +110,9 @@ struct EmoteEntry {
 #[derive(Default, Clone)]
 pub struct EmoteNameMap {
     /// Flat map: emote name → (resolved emote, provider tag).
-    map: HashMap<String, EmoteEntry>,
+    /// FxHashMap: non-cryptographic hasher ~2× faster than std HashMap for
+    /// short string keys, which is the dominant case for emote names.
+    map: FxHashMap<String, EmoteEntry>,
 }
 
 impl EmoteNameMap {
@@ -372,7 +374,7 @@ impl EmoteNameMap {
                                 "https://static-cdn.jtvnaw.net/emoticons/v2/{}/default/dark/2.0",
                                 id
                             )
-                            .as_str(),
+                                .as_str(),
                         ),
                         zero_width: false,
                     },
@@ -598,12 +600,16 @@ fn push_text_segment<'a>(
         if !word.is_empty() {
             push_word(word, map_flags, out);
         }
-        // Preserve whitespace tokens so the layout pass can measure spaces
-        // without re-splitting. Only single spaces matter for layout; other
-        // whitespace is collapsed to avoid bloating token vectors.
-        if part == " " || !part.trim().is_empty() {
+        // Preserve single spaces as tokens so the layout pass can measure them
+        // without re-splitting. Other whitespace (tabs, double-spaces, etc.) is
+        // collapsed to a single space to avoid bloating token vectors.
+        if part == " " {
+            out.push(MessageToken::Text(part));
+        } else if !part.trim().is_empty() {
+            // Non-space, non-whitespace: treat as a regular word token.
             out.push(MessageToken::Text(part));
         }
+        // Pure-whitespace sequences wider than one space are intentionally dropped.
         last_end = start + part.len();
     }
 

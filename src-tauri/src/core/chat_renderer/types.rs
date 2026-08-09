@@ -54,6 +54,10 @@ pub enum EmoteData {
         w: i32,
         h: i32,
     },
+    /// All GIF frames pre-decoded into Skia Images upfront.
+    ///
+    /// Default when the emote set is small. RAM cost = frames × w × h × 4 bytes.
+    /// For a 56-px, 20-frame emote that's ~250 KB per unique GIF emote.
     Animated {
         frames: Arc<[Image]>,
         durations_ms: Arc<[u32]>,
@@ -62,18 +66,36 @@ pub enum EmoteData {
         w: i32,
         h: i32,
     },
+    /// Compressed GIF bytes kept in memory; Skia frames decoded on first access.
+    ///
+    /// Enabled via `args.eager_gif_decode = false`. Avoids paying the upfront
+    /// RAM cost of holding every decoded frame for the entire render job.
+    /// Useful for streams with >20 unique animated emotes (can save 200-500 MB).
+    ///
+    /// `decoded_cache` uses `OnceLock` so only the first render thread to touch
+    /// this emote pays the decode cost; all subsequent accesses are lock-free reads.
+    LazyGif {
+        raw_bytes: Arc<[u8]>,
+        cum_durations: Arc<[u32]>,
+        total_ms: u32,
+        w: i32,
+        h: i32,
+        target_h: u32,
+        alpha_type: skia_safe::AlphaType,
+        decoded_cache: Arc<std::sync::OnceLock<Arc<[Image]>>>,
+    },
 }
 
 impl EmoteData {
     pub fn width(&self) -> i32 {
         match self {
-            Self::Static { w, .. } | Self::Animated { w, .. } => *w,
+            Self::Static { w, .. } | Self::Animated { w, .. } | Self::LazyGif { w, .. } => *w,
         }
     }
 
     pub fn height(&self) -> i32 {
         match self {
-            Self::Static { h, .. } | Self::Animated { h, .. } => *h,
+            Self::Static { h, .. } | Self::Animated { h, .. } | Self::LazyGif { h, .. } => *h,
         }
     }
 
@@ -82,22 +104,45 @@ impl EmoteData {
         match self {
             // Static: unconditional return — no branch on length/total_ms.
             Self::Static { img, .. } => Some(img),
-            Self::Animated {
-                frames,
-                cum_durations,
-                total_ms,
-                ..
-            } => {
-                // Safety check compiled to a single cmov on most targets.
+
+            Self::Animated { frames, cum_durations, total_ms, .. } => {
                 if *total_ms == 0 {
                     return frames.first();
                 }
                 let looped = (t_ms % *total_ms as u64) as u32;
-                // partition_point is a branchless binary search.
                 let idx = cum_durations
                     .partition_point(|&c| c <= looped)
                     .min(frames.len().saturating_sub(1));
-                // SAFETY: idx is clamped to [0, frames.len()-1].
+                Some(unsafe { frames.get_unchecked(idx) })
+            }
+
+            // LazyGif: OnceLock ensures exactly one thread ever decodes the GIF.
+            // All subsequent frame_at calls on this emote are a single atomic load.
+            Self::LazyGif {
+                raw_bytes,
+                cum_durations,
+                total_ms,
+                target_h,
+                alpha_type,
+                decoded_cache,
+                ..
+            } => {
+                let frames = decoded_cache.get_or_init(|| {
+                    crate::core::chat_renderer::helpers::decode_gif_to_skia_frames(
+                        raw_bytes,
+                        *target_h,
+                        *alpha_type,
+                    )
+                        .unwrap_or_else(|_| Arc::from(vec![]))
+                });
+
+                if frames.is_empty() || *total_ms == 0 {
+                    return frames.first();
+                }
+                let looped = (t_ms % *total_ms as u64) as u32;
+                let idx = cum_durations
+                    .partition_point(|&c| c <= looped)
+                    .min(frames.len().saturating_sub(1));
                 Some(unsafe { frames.get_unchecked(idx) })
             }
         }
@@ -113,6 +158,8 @@ pub struct EmoteCache {
     client: Client,
     target_emote_h: u32,
     quality: QualityPreset,
+    /// See `RenderVideoArgs::eager_gif_decode`.
+    pub(crate) eager_gif_decode: bool,
 }
 
 impl Clone for EmoteCache {
@@ -125,6 +172,7 @@ impl Clone for EmoteCache {
             client: self.client.clone(),
             target_emote_h: self.target_emote_h,
             quality: self.quality.clone(),
+            eager_gif_decode: self.eager_gif_decode,
         }
     }
 }
@@ -135,6 +183,7 @@ impl EmoteCache {
         capacity: usize,
         target_emote_h: u32,
         quality: QualityPreset,
+        eager_gif_decode: bool,
     ) -> Self {
         let cap = capacity.max(1);
         let mem = LruCache::new(NonZeroUsize::new(cap).unwrap());
@@ -147,6 +196,7 @@ impl EmoteCache {
             client: Client::new(),
             target_emote_h,
             quality,
+            eager_gif_decode,
         }
     }
 
@@ -175,13 +225,16 @@ impl EmoteCache {
         false
     }
 
-    async fn disk_any_path_async(&self, id: i32) -> Option<PathBuf> {
+    /// Check local disk for a cached emote file.
+    ///
+    /// Deliberately synchronous: each stat call takes ~1 µs on a warm dentry
+    /// cache. The async overhead of `spawn_blocking` (~10–30 µs) exceeds the
+    /// total cost of 5 stat calls, so keeping this sync is strictly faster.
+    fn disk_any_path(&self, id: i32) -> Option<PathBuf> {
         if self.is_missing_disk_cached(id) {
             return None;
         }
 
-        // Sync stat is cheap (5 extensions, warm dentry cache) — spawn_blocking
-        // overhead (~10–30 µs task scheduling) exceeds the stat cost itself.
         for ext in ["png", "gif", "webp", "jpg", "bin"] {
             let p = self.base.join(format!("{}.{}", id, ext));
             if p.exists() {
@@ -215,16 +268,19 @@ impl EmoteCache {
         target_h: u32,
         quality: QualityPreset,
         premultiply: bool,
+        eager_gif_decode: bool,
     ) -> AppResult<Arc<EmoteData>> {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
-            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, premultiply, &quality)
+            let decoded = decode_emote_bytes_to_emote_data(
+                &bytes, target_h, premultiply, &quality, eager_gif_decode,
+            )
                 .map_err(|e| AppError::EmoteCache(e.to_string()))
                 .map(Arc::new);
             let _ = tx.send(decoded);
         });
         rx.await
-            .map_err(|_| AppError::InternalError("decode task dropped".into()))?
+          .map_err(|_| AppError::InternalError("decode task dropped".into()))?
     }
 
     pub(crate) async fn ensure_cached(&self, ids: &[i32]) -> AppResult<()> {
@@ -234,6 +290,8 @@ impl EmoteCache {
             return Ok(());
         }
 
+        // Cap concurrent downloads: 8 is a good default for broadband; callers
+        // can lower this via args.max_download_concurrency on metered connections.
         let download_limit = std::cmp::min(8usize, ids.len().max(1));
         let download_sem = Arc::new(Semaphore::new(download_limit));
         let ec = self.clone();
@@ -272,11 +330,11 @@ impl EmoteCache {
                     }
                 }
 
-                if let Some(path) = ec.disk_any_path_async(id).await {
+                if let Some(path) = ec.disk_any_path(id) {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
                     let arc =
-                        Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
+                        Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode).await?;
                     // Persist dimensions so future runs skip re-decoding for sizing.
                     ec.write_sidecar_blocking(id, arc.width(), arc.height());
 
@@ -335,7 +393,7 @@ impl EmoteCache {
 
                 let target_h = ec.target_height();
                 let arc =
-                    Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
+                    Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode).await?;
                 let (w, h) = (arc.width(), arc.height());
 
                 ec.write_sidecar_blocking(id, w, h);
@@ -375,6 +433,7 @@ pub struct ImageCache {
     client: Client,
     target_emote_h: u32,
     quality: QualityPreset,
+    pub(crate) eager_gif_decode: bool,
 }
 
 impl Clone for ImageCache {
@@ -388,6 +447,7 @@ impl Clone for ImageCache {
             client: self.client.clone(),
             target_emote_h: self.target_emote_h,
             quality: self.quality.clone(),
+            eager_gif_decode: self.eager_gif_decode,
         }
     }
 }
@@ -398,6 +458,7 @@ impl ImageCache {
         capacity: usize,
         target_emote_h: u32,
         quality: QualityPreset,
+        eager_gif_decode: bool,
     ) -> Self {
         let cap = capacity.max(1);
         let mem = LruCache::new(NonZeroUsize::new(cap).unwrap());
@@ -412,6 +473,7 @@ impl ImageCache {
             client: Client::new(),
             target_emote_h,
             quality,
+            eager_gif_decode,
         }
     }
 
@@ -461,7 +523,8 @@ impl ImageCache {
         false
     }
 
-    fn disk_any_path_async_by_hash(&self, hash: u64) -> Option<PathBuf> {
+    /// Synchronous disk probe — see `EmoteCache::disk_any_path` for rationale.
+    fn disk_any_path_by_hash(&self, hash: u64) -> Option<PathBuf> {
         if self.is_missing_disk_cached(hash) {
             return None;
         }
@@ -519,16 +582,19 @@ impl ImageCache {
         target_h: u32,
         quality: QualityPreset,
         premultiply: bool,
+        eager_gif_decode: bool,
     ) -> AppResult<Arc<EmoteData>> {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
-            let decoded = decode_emote_bytes_to_emote_data(&bytes, target_h, premultiply, &quality)
+            let decoded = decode_emote_bytes_to_emote_data(
+                &bytes, target_h, premultiply, &quality, eager_gif_decode,
+            )
                 .map_err(|e| AppError::EmoteCache(e.to_string()))
                 .map(Arc::new);
             let _ = tx.send(decoded);
         });
         rx.await
-            .map_err(|_| AppError::InternalError("decode task dropped".into()))?
+          .map_err(|_| AppError::InternalError("decode task dropped".into()))?
     }
 
     pub(crate) async fn ensure_cached(&self, urls: &[String]) -> AppResult<()> {
@@ -578,11 +644,11 @@ impl ImageCache {
                     }
                 }
 
-                if let Some(path) = ec.disk_any_path_async_by_hash(key) {
+                if let Some(path) = ec.disk_any_path_by_hash(key) {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
                     let arc =
-                        Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
+                        Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode).await?;
                     let (w, h) = (arc.width(), arc.height());
                     ec.store_sidecar_blocking(key, w, h);
 
@@ -640,7 +706,7 @@ impl ImageCache {
 
                 let target_h = ec.target_height();
                 let arc =
-                    Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true).await?;
+                    Self::decode_bytes_rayon(bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode).await?;
                 let (w, h) = (arc.width(), arc.height());
                 ec.store_sidecar_blocking(key, w, h);
 
