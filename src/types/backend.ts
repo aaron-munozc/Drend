@@ -202,6 +202,13 @@ export interface NormalizedFormat {
 	sizeBytes: number | null;
 	bitrate: number | null;
 	uiLabel: string;
+	url: string;
+}
+
+export interface Chapter {
+	startTime: number;
+	endTime: number;
+	title: string;
 }
 
 export interface Metadata {
@@ -209,13 +216,35 @@ export interface Metadata {
 	title: string;
 	description?: string;
 	duration?: number;
+
+	uploader?: string;
+	uploaderId?: string;
+	uploaderUrl?: string;
 	thumbnail?: string;
+	viewCount?: number;
+	likeCount?: number;
+	commentCount?: number;
+
+	timestamp?: number;
+	uploadDate?: string;
+
 	isLive: boolean;
 	wasLive: boolean;
 	isUpcoming: boolean;
+	ageLimit: number;
+
+	availability?: string;
+	tags: string[];
+	categories: string[];
+	chapters: Chapter[];
+	availableSubs: string[];
+
+	formats: NormalizedFormat[];
+
+	extractor?: string;
 	isChatSupported: boolean;
 	originalUrl: string;
-	formats: NormalizedFormat[];
+	webpageUrl?: string;
 }
 
 export interface FrontendVodOptions {

@@ -413,7 +413,6 @@ pub struct RenderVideoArgs {
     /// Requires `time_zero_ms` (or `start_ms`) to be set so the engine knows
     /// where "frame 0" is in stream time.  Has no effect when `time_zero_ms`
     /// is not set (the default behaviour makes the first message define t=0).
-    #[serde(default)]
     pub prefill_from_start: bool,
     pub shape_overlays: Vec<CustomShapeOverlay>,
     /// Image assets drawn above the background, below chat.

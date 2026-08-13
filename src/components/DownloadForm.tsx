@@ -137,27 +137,65 @@ export function DownloadForm({ tab, onUpdate }: DownloadFormProps) {
 								className="w-32 h-20 object-cover rounded-lg flex-shrink-0 bg-neutral-800"
 							/>
 						)}
-						<div className="flex-1 min-w-0 space-y-1">
+						<div className="flex-1 min-w-0 space-y-1.5">
 							<h3 className="text-sm font-semibold text-neutral-100 line-clamp-2">
 								{metadata.title}
 							</h3>
-							<div className="flex flex-wrap gap-x-3 gap-y-0.5">
-								<span className="text-xs text-neutral-500">
+
+							{/* 🚀 NEW: Uploader and Views display */}
+							<div className="flex items-center gap-2 text-xs text-neutral-400">
+								{metadata.uploader && (
+									<span className="font-medium text-neutral-300">{metadata.uploader}</span>
+								)}
+								{metadata.viewCount !== undefined && (
+									<>
+										<span>•</span>
+										<span>{new Intl.NumberFormat().format(metadata.viewCount)} views</span>
+									</>
+								)}
+							</div>
+
+							<div className="flex flex-wrap gap-x-2 gap-y-1 pt-1">
+								<span className="text-xs font-medium text-neutral-500 bg-neutral-800/50 px-2 py-0.5 rounded">
 									{formatDuration(metadata.duration)}
 								</span>
+
 								{metadata.isLive && (
-									<span className="text-xs text-red-400 font-medium flex items-center gap-1">
+									<span className="text-xs text-red-400 font-medium flex items-center gap-1 bg-red-400/10 px-2 py-0.5 rounded">
 										<span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
 										LIVE
 									</span>
 								)}
+
 								{metadata.wasLive && (
-									<span className="text-xs text-amber-500">VOD</span>
+									<span className="text-xs text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded">VOD</span>
+								)}
+
+								{/* 🚀 NEW: Availability Badge (e.g. Unlisted, Premium, Subscriber Only) */}
+								{metadata.availability && metadata.availability !== "public" && (
+									<span className="text-xs text-purple-400 bg-purple-400/10 px-2 py-0.5 rounded capitalize">
+										{metadata.availability.replace("_", " ")}
+									</span>
+								)}
+
+								{/* 🚀 NEW: Extractor/Platform Badge */}
+								{metadata.extractor && (
+									<span className="text-xs text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded capitalize">
+										{metadata.extractor.split(':')[0]}
+									</span>
 								)}
 							</div>
-							<p className="text-xs text-neutral-600 truncate">
-								{metadata.originalUrl}
-							</p>
+
+							{/* 🚀 NEW: Canonical URL Link replacing plain text */}
+							<a
+								href={metadata.webpageUrl ?? metadata.originalUrl}
+								target="_blank"
+								rel="noreferrer"
+								className="text-[11px] text-indigo-400 hover:text-indigo-300 truncate block mt-1 transition-colors"
+								title={metadata.webpageUrl ?? metadata.originalUrl}
+							>
+								{metadata.webpageUrl ?? metadata.originalUrl}
+							</a>
 						</div>
 					</div>
 

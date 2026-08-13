@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use crate::error::AppError;
 use crate::types::{
     AppResult, Chapter, Metadata, NormalizedFormat, NormalizedMetadata, YtDlpMetadata,
@@ -24,6 +25,7 @@ pub async fn analyze_url_core(
     let output = Command::new(&ytdlp_path)
         .arg("-J")
         .arg("--no-warnings")
+        .arg("--no-playlist")
         .arg(&url)
         .output()
         .await
@@ -35,16 +37,15 @@ pub async fn analyze_url_core(
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
-
     let yt_meta: YtDlpMetadata = serde_json::from_str(&json_str)
         .map_err(|e| AppError::Generic(format!("Failed to parse yt-dlp output: {}", e)))?;
 
-    let is_chat_supported = url.contains("twitch.tv") || url.contains("kick.com");
+    // 🚀 UPGRADE: Smarter chat support check based on the resolved extractor
+    let extractor = yt_meta.extractor.as_deref().unwrap_or("").to_lowercase();
+    let is_chat_supported = extractor.contains("twitch") || extractor.contains("kick");
 
-    let is_live =
-        yt_meta.live_status.as_deref() == Some("is_live") || yt_meta.is_live.unwrap_or(false);
-    let was_live =
-        yt_meta.live_status.as_deref() == Some("was_live") || yt_meta.was_live.unwrap_or(false);
+    let is_live = yt_meta.live_status.as_deref() == Some("is_live") || yt_meta.is_live.unwrap_or(false);
+    let was_live = yt_meta.live_status.as_deref() == Some("was_live") || yt_meta.was_live.unwrap_or(false);
     let is_upcoming = yt_meta.live_status.as_deref() == Some("is_upcoming");
 
     let chapters = yt_meta
@@ -58,31 +59,37 @@ pub async fn analyze_url_core(
         })
         .collect();
 
-    let available_subs = yt_meta
-        .subtitles
-        .map(|subs| subs.keys().cloned().collect())
-        .unwrap_or_default();
+    // 🚀 UPGRADE: Merge manual and automatic captions cleanly
+    let mut subs_set = HashSet::new();
+    if let Some(subs) = &yt_meta.subtitles {
+        subs_set.extend(subs.keys().cloned());
+    }
+    if let Some(auto_subs) = &yt_meta.automatic_captions {
+        subs_set.extend(auto_subs.keys().cloned());
+    }
+    let mut available_subs: Vec<String> = subs_set.into_iter().collect();
+    available_subs.sort();
 
     // --- Format Normalization Logic ---
-    let formats = yt_meta
+    let mut formats: Vec<NormalizedFormat> = yt_meta
         .formats
         .unwrap_or_default()
         .into_iter()
         .filter_map(|f| {
-            let ext = f.ext.clone().unwrap_or_else(|| "unknown".to_string());
+            // Skip if there's no actual download/stream URL
+            let format_url = f.url?;
+            if format_url.is_empty() { return None; }
 
-            // Filter out storyboards/manifests (like Twitch's mhtml files)
+            let ext = f.ext.clone().unwrap_or_else(|| "unknown".to_string());
             if ext == "mhtml" || f.format_id.starts_with("sb") {
                 return None;
             }
 
             let vcodec = f.vcodec.as_deref().unwrap_or("none");
             let acodec = f.acodec.as_deref().unwrap_or("none");
-
             let has_video = vcodec != "none";
             let has_audio = acodec != "none";
 
-            // Skip completely empty formats
             if !has_video && !has_audio {
                 return None;
             }
@@ -96,7 +103,6 @@ pub async fn analyze_url_core(
             };
 
             let mut ui_parts = vec![resolution_label.clone()];
-
             if let Some(fps) = f.fps {
                 if fps > 0.0 {
                     ui_parts.push(format!("{}fps", fps.round()));
@@ -110,7 +116,6 @@ pub async fn analyze_url_core(
                 _ => "Unknown",
             };
 
-            // Example output: "1080p 60fps (mp4) - [V+A]"
             let ui_label = format!("{} ({}) - [{}]", ui_parts.join(" "), ext, type_badge);
 
             Some(NormalizedFormat {
@@ -123,16 +128,23 @@ pub async fn analyze_url_core(
                 size_bytes: f.filesize.or(f.filesize_approx),
                 bitrate: f.tbr,
                 ui_label,
+                url: format_url,
             })
         })
         .collect();
 
+    // 🚀 UPGRADE: Sort formats for the frontend (Highest Quality Video+Audio First)
+    formats.sort_by(|a, b| {
+        let score_a = (a.has_video as u8 * 2) + (a.has_audio as u8);
+        let score_b = (b.has_video as u8 * 2) + (b.has_audio as u8);
+        score_b.cmp(&score_a) // V+A first, then Video, then Audio
+               .then_with(|| b.resolution_label.cmp(&a.resolution_label))
+               .then_with(|| b.fps.unwrap_or(0.0).partial_cmp(&a.fps.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
     let normalized = NormalizedMetadata {
         id: yt_meta.id,
-        title: yt_meta
-            .title
-            .or(yt_meta.fulltitle)
-            .unwrap_or_else(|| "Unknown Title".to_string()),
+        title: yt_meta.title.or(yt_meta.fulltitle).unwrap_or_else(|| "Unknown Title".to_string()),
         description: yt_meta.description,
         duration: yt_meta.duration,
         uploader: yt_meta.uploader.or(yt_meta.channel),
@@ -148,22 +160,20 @@ pub async fn analyze_url_core(
         was_live,
         is_upcoming,
         age_limit: yt_meta.age_limit.unwrap_or(0),
+        availability: yt_meta.availability,
         tags: yt_meta.tags.unwrap_or_default(),
         categories: yt_meta.categories.unwrap_or_default(),
         chapters,
         available_subs,
-        formats, // Added to struct
+        formats,
         extractor: yt_meta.extractor,
         is_chat_supported,
         original_url: url.clone(),
+        webpage_url: yt_meta.webpage_url,
     };
 
     let stream_metadata = if is_chat_supported {
-        if let Ok(stream) = fetch_stream(client, &url).await {
-            Some(stream.into_inner())
-        } else {
-            None
-        }
+        fetch_stream(client, &url).await.ok()
     } else {
         None
     };
@@ -178,10 +188,8 @@ pub async fn analyze_url_core(
     };
 
     lock.put(url, final_metadata.clone());
-
     Ok(final_metadata)
 }
-
 #[tauri::command]
 pub async fn analyze_url(
     url: String,

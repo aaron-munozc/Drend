@@ -12,7 +12,7 @@ function RootLayout() {
 			<Sidebar />
 			<div className="flex flex-col flex-1 min-w-0">
 				{/* Top bar */}
-				<header className="h-10 flex items-center justify-end px-4 border-b border-neutral-800/60 flex-shrink-0 bg-neutral-950/80 backdrop-blur-sm">
+				<header className="h-10 flex items-center justify-end px-4 border-b border-neutral-800/60 shrink-0 bg-neutral-950/80 backdrop-blur-sm">
 					<DiagnosticTray />
 				</header>
 				{/* Main content */}

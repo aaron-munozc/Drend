@@ -13,8 +13,11 @@ use crate::core::chat_renderer::{process_chat_render, EmoteNameMap, RenderVideoA
 use crate::error::AppError;
 use crate::tools;
 use crate::types::AppResult;
+
+// --- FIXED: Imported the free functions to handle chat downloads ---
 use stream_extractor::{
-    ChatDownloadOptions, KickOptions, ProgressPayload, Stream, StreamClient, StreamMetadata,
+    download_clip_chat, download_vod_chat, ChatDownloadOptions, KickOptions, ProgressPayload,
+    Stream, StreamClient,
 };
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
@@ -100,7 +103,7 @@ pub struct AppTask {
 
 pub enum JobPayload {
     ChatDownload {
-        meta: StreamMetadata,
+        meta: Stream,
         options: FrontendChatOptions,
     },
     VodDownload {
@@ -152,7 +155,6 @@ impl TaskManager {
         let event_tx_clone = event_tx.clone();
 
         tauri::async_runtime::spawn(async move {
-            // --- NEW: Initialize a shared HTTP client for network requests ---
             let http_client = reqwest::Client::new();
 
             while let Some(item) = rx.recv().await {
@@ -161,9 +163,10 @@ impl TaskManager {
                 let state_map = Arc::clone(&tasks_clone);
                 let cancels = Arc::clone(&cancellations_clone);
                 let progress_broadcast = event_tx_clone.clone();
-                let http_client_clone = http_client.clone(); // Clone for the inner thread
+                let http_client_clone = http_client.clone();
 
-                let mut cancel_rx = {
+                // --- FIXED: Removed unnecessary 'mut' here ---
+                let cancel_rx = {
                     let locked_cancels = cancels.lock().unwrap();
                     if let Some(tx) = locked_cancels.get(&task_id) {
                         if *tx.borrow() {
@@ -206,7 +209,7 @@ impl TaskManager {
                                 options,
                                 cancel_rx,
                             )
-                            .await
+                                .await
                         }
                         JobPayload::VodDownload { url, options } => {
                             Self::process_vod_inner(
@@ -218,7 +221,7 @@ impl TaskManager {
                                 options,
                                 cancel_rx,
                             )
-                            .await
+                                .await
                         }
                         JobPayload::ChatRender {
                             input_path,
@@ -246,20 +249,18 @@ impl TaskManager {
                                 }
                             }
 
-                            let channel_id = "12345678"; // Replace with real extraction logic
+                            let channel_id = "12345678";
 
-                            // --- FIXED: Uses EmoteNameMap::build_emote_map and passes the client/flags ---
                             let emote_map = EmoteNameMap::build_emote_map(
                                 &http_client_clone,
                                 &args.emote_providers,
                                 channel_id,
                             )
-                            .await
-                            .unwrap_or_else(|e| {
-                                // Fallback to empty map or return the error to fail the task
-                                eprintln!("Failed to fetch emotes: {}", e);
-                                EmoteNameMap::new()
-                            });
+                                .await
+                                .unwrap_or_else(|e| {
+                                    eprintln!("Failed to fetch emotes: {}", e);
+                                    EmoteNameMap::new()
+                                });
                             process_chat_render(
                                 &app,
                                 state_map.clone(),
@@ -270,7 +271,7 @@ impl TaskManager {
                                 emote_map,
                                 cancel_flag,
                             )
-                            .await
+                                .await
                         }
                     };
 
@@ -358,7 +359,6 @@ impl TaskManager {
         let is_audio_only = opts.audio_only.unwrap_or(false);
         if is_audio_only {
             args.push("-f".into());
-            // Use explicit Audio ID if provided
             if let Some(audio_id) = opts.audio_format_id.as_deref() {
                 args.push(audio_id.to_string());
             } else {
@@ -386,25 +386,20 @@ impl TaskManager {
         } else {
             args.push("-f".into());
 
-            // Format ID Builder Logic
             match (
                 opts.video_format_id.as_deref(),
                 opts.audio_format_id.as_deref(),
             ) {
                 (Some(vid), Some(aid)) => {
-                    // Specific Video + Specific Audio (e.g., YouTube/Facebook)
                     args.push(format!("{}+{}", vid, aid));
                 }
                 (Some(vid), None) => {
-                    // Pre-merged format with Video+Audio built-in (e.g., Twitch)
                     args.push(vid.to_string());
                 }
                 (None, Some(aid)) => {
-                    // Failsafe: Best Video + Specific Audio
                     args.push(format!("bv*+{}", aid));
                 }
                 (None, None) => {
-                    // Legacy Fallback using resolution
                     if let Some(res) = opts.resolution {
                         args.push(format!("bv*[height<={}]+ba/b[height<={}]/b", res, res));
                     } else {
@@ -428,7 +423,6 @@ impl TaskManager {
             }
         }
 
-        // Apply remaining options seamlessly
         if opts.start_ms.is_some() || opts.end_ms.is_some() {
             let start = opts.start_ms.map(|ms| ms / 1000).unwrap_or(0);
             let end_str = opts
@@ -551,7 +545,7 @@ impl TaskManager {
         tasks: Arc<Mutex<HashMap<String, AppTask>>>,
         event_tx: mpsc::Sender<AppTask>,
         task_id: &str,
-        meta: StreamMetadata,
+        meta: Stream,
         opts: FrontendChatOptions,
         cancel_rx: watch::Receiver<bool>,
     ) -> AppResult<()> {
@@ -580,6 +574,7 @@ impl TaskManager {
             .save_folder
             .map(PathBuf::from)
             .or_else(|| app.path().download_dir().ok());
+
         let kick_opts = KickOptions::default()
             .with_concurrency(opts.kick_concurrency.unwrap_or(10))
             .with_empty_cycle_threshold(opts.empty_cycle_threshold.unwrap_or(6));
@@ -603,13 +598,33 @@ impl TaskManager {
             engine_opts = engine_opts.with_end_ms(end);
         }
 
-        let client = StreamClient::new().map_err(|e| AppError::Generic(e.to_string()))?;
-        let stream = Stream::new(meta, &client);
+        // --- FIXED: Create client and use the free functions rather than non-existent methods ---
+        let client = StreamClient::new()
+            .map_err(|e| AppError::Generic(format!("Failed to initialize client: {:?}", e)))?;
 
-        stream
-            .download_chat(engine_opts)
-            .await
-            .map_err(|e| AppError::Generic(e.to_string()))?;
+        match meta {
+            Stream::Vod(vod) => {
+                download_vod_chat(&client, &vod, engine_opts)
+                    .await
+                    .map_err(|e| AppError::Generic(format!("{:?}", e)))?;
+            }
+            Stream::Clip(clip) => {
+                download_clip_chat(&client, &clip, engine_opts)
+                    .await
+                    .map_err(|e| AppError::Generic(format!("{:?}", e)))?;
+            }
+            Stream::Live(_) => {
+                return Err(AppError::Generic(
+                    "Live streams do not support chat downloading".into(),
+                ));
+            }
+            _ => {
+                return Err(AppError::Generic(
+                    "Unsupported stream type for chat downloading".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -625,7 +640,6 @@ impl TaskManager {
             .map(|os_str| os_str.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Chat Render Job".to_string());
 
-        // Use frontend ID if provided and non-empty, otherwise generate standard ID
         let task_id = task_id
             .filter(|id| !id.trim().is_empty())
             .unwrap_or_else(|| {
@@ -663,18 +677,23 @@ impl TaskManager {
     pub fn enqueue_chat_download(
         &self,
         task_id: Option<String>,
-        meta: StreamMetadata,
+        meta: Stream,
         options: FrontendChatOptions,
     ) -> String {
-        let title = meta
-            .title
-            .clone()
-            .unwrap_or_else(|| "Unknown Stream".to_string());
+        // --- FIXED: Added the wildcard to handle the non-exhaustive pattern ---
+        let (title_opt, chat_id_opt) = match &meta {
+            Stream::Vod(v) => (v.title.clone(), v.chat_id),
+            Stream::Clip(c) => (c.title.clone(), c.chat_id),
+            Stream::Live(l) => (l.title.clone(), l.chat_id),
+            _ => (None, None),
+        };
+
+        let title = title_opt.unwrap_or_else(|| "Unknown Stream".to_string());
 
         let task_id = task_id
             .filter(|id| !id.trim().is_empty())
             .unwrap_or_else(|| {
-                let id_str = meta.chat_id.map(|id| id.to_string()).unwrap_or_else(|| {
+                let id_str = chat_id_opt.map(|id| id.to_string()).unwrap_or_else(|| {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()

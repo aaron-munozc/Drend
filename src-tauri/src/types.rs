@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use stream_extractor::StreamMetadata;
+use stream_extractor::Stream;
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -12,7 +12,6 @@ pub struct YtDlpChapter {
     pub title: Option<String>,
 }
 
-// 1. Raw yt-dlp Format Struct
 #[derive(Debug, Deserialize)]
 pub struct YtDlpFormat {
     pub format_id: String,
@@ -23,25 +22,27 @@ pub struct YtDlpFormat {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<f64>,
-    pub tbr: Option<f64>, // Bitrate
+    pub tbr: Option<f64>,
     pub filesize: Option<u64>,
     pub filesize_approx: Option<u64>,
     pub resolution: Option<String>,
+    pub url: Option<String>,
+    pub http_headers: Option<HashMap<String, String>>,
 }
 
-// 2. Frontend-Facing Format Struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedFormat {
     pub format_id: String,
-    pub resolution_label: String, // e.g., "1080p", "Audio Only"
+    pub resolution_label: String,
     pub fps: Option<f64>,
     pub extension: String,
     pub has_video: bool,
     pub has_audio: bool,
     pub size_bytes: Option<u64>,
     pub bitrate: Option<f64>,
-    pub ui_label: String, // Clean label for frontend drop-downs
+    pub ui_label: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +53,6 @@ pub struct Chapter {
     pub title: String,
 }
 
-// 3. Raw yt-dlp Output Struct
 #[derive(Debug, Deserialize)]
 pub struct YtDlpMetadata {
     pub id: String,
@@ -85,14 +85,16 @@ pub struct YtDlpMetadata {
     pub age_limit: Option<u8>,
     pub chapters: Option<Vec<YtDlpChapter>>,
     pub subtitles: Option<HashMap<String, serde_json::Value>>,
+    pub automatic_captions: Option<HashMap<String, serde_json::Value>>,
 
-    pub formats: Option<Vec<YtDlpFormat>>, // Added formats extraction
+    pub availability: Option<String>,
+
+    pub formats: Option<Vec<YtDlpFormat>>,
 
     pub webpage_url: Option<String>,
     pub extractor: Option<String>,
 }
 
-// 4. Frontend-Facing Metadata Struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedMetadata {
@@ -129,6 +131,10 @@ pub struct NormalizedMetadata {
     pub is_upcoming: bool,
     pub age_limit: u8,
 
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<String>,
+
     pub tags: Vec<String>,
     pub categories: Vec<String>,
     pub chapters: Vec<Chapter>,
@@ -139,6 +145,9 @@ pub struct NormalizedMetadata {
     pub extractor: Option<String>,
     pub is_chat_supported: bool,
     pub original_url: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webpage_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,5 +157,5 @@ pub struct Metadata {
     pub normalized: NormalizedMetadata,
 
     #[serde(skip_serializing)]
-    pub stream_metadata: Option<StreamMetadata>,
+    pub stream_metadata: Option<Stream>,
 }

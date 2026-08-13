@@ -16,7 +16,7 @@ use stream_extractor::MessageSaved;
 use tauri::{AppHandle, Emitter};
 
 use crate::core::chat_renderer::args::{
-    BackgroundMode, CustomImageOverlay, EvictionStrategy, QualityPreset, RenderVideoArgs,
+    BackgroundMode, EvictionStrategy, QualityPreset, RenderVideoArgs,
     TimelineMismatchStrategy,
 };
 use crate::core::chat_renderer::emote_providers::{
@@ -1339,7 +1339,7 @@ fn build_overlay_ffmpeg_args(
         let r = shape.color.red.clamp(0, 255) as u8;
         let g = shape.color.green.clamp(0, 255) as u8;
         let b = shape.color.blue.clamp(0, 255) as u8;
-        let alpha_f = (shape.color.alpha.clamp(0, 255) as f32 / 255.0);
+        let alpha_f = shape.color.alpha.clamp(0, 255) as f32 / 255.0;
 
         // color=c=0xRRGGBB:s=WxH generates a constant-color source.
         // scale2ref sizes it to shape.width × shape.height before overlay.
@@ -1578,14 +1578,12 @@ fn build_standalone_ffmpeg_args(
 // ──────────────────────────────────────────────────────────────────────────────
 // Main render entry point
 // ──────────────────────────────────────────────────────────────────────────────
-// todo modify so the timestamp renders happen by the new 2 fields
     /**
     /// Seconds elapsed since the start of the requested download range.
     pub range_offset_secs: i64,
     /// Human-readable offset `HH:MM:SS` from the start of the requested download range.
     pub range_offset_str: String,
 */
-// todo isntead of the old code that used math to calculate from the stream start
 
 pub async fn process_chat_render(
     app: &AppHandle,
@@ -1774,13 +1772,12 @@ pub async fn process_chat_render(
     let scan_emote_map = emote_map.clone();
     let group_window = args.group_messages_window_secs as i64;
     let group_enabled = args.group_messages;
-    let time_zero_ms = args.time_zero_ms;
     let do_prefill = args.prefill_from_start && args.time_zero_ms.is_some();
     let prefill_window_secs = args.message_hold_seconds as i64;
 
     // Single-shot channel that carries (max_offset_sec, base_ts, emote_ids, image_urls)
     // from the scan thread back to the async task.
-    let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<(f64, i64, Vec<i32>, Vec<String>)>();
+    let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<(f64, Vec<i32>, Vec<String>)>();
 
     std::thread::spawn(move || {
         let f = match std::fs::File::open(&scan_path) {
@@ -1791,7 +1788,6 @@ pub async fn process_chat_render(
         // without thrashing the OS page cache.
         let reader = std::io::BufReader::with_capacity(2 << 20, f);
 
-        let mut base_time_secs: Option<i64> = None;
         let mut max_offset_sec: f64 = 0.0;
         let mut last_user = String::new();
         let mut last_time = -1i64;
@@ -1827,13 +1823,7 @@ pub async fn process_chat_render(
                 }
             }
 
-            let base = *base_time_secs.get_or_insert_with(|| {
-                time_zero_ms
-                    .map(|t| (t / 1000) as i64)
-                    .unwrap_or(msg.created_at_secs)
-            });
-
-            let offset = (msg.created_at_secs - base) as f64;
+            let offset = msg.range_offset_secs as f64;
             if offset > max_offset_sec {
                 max_offset_sec = offset;
             }
@@ -1843,7 +1833,7 @@ pub async fn process_chat_render(
             // be injected at frame 0 with their age already baked in so timers
             // still expire at the right moment.
             if do_prefill && offset < 0.0 {
-                let age_secs = (-offset) as f64;
+                let age_secs = -offset;
                 if age_secs <= prefill_window_secs as f64 {
                     // Compute how many frames old this message already is at frame 0.
                     let age_offset_frames =
@@ -1878,27 +1868,25 @@ pub async fn process_chat_render(
 
             let is_grouped = group_enabled
                 && msg.sender.username == last_user
-                && (msg.created_at_secs - last_time) <= group_window;
+                && (msg.range_offset_secs - last_time) <= group_window;
             last_user.clear();
             last_user.push_str(&msg.sender.username);
-            last_time = msg.created_at_secs;
+            last_time = msg.range_offset_secs;
 
             if loader_tx.send((msg, is_grouped)).is_err() {
                 break;
             }
         }
 
-        let base = base_time_secs.unwrap_or(0);
         let _ = meta_tx.send((
             max_offset_sec,
-            base,
             emote_ids.into_iter().collect(),
             image_urls.into_iter().collect(),
         ));
     });
 
-    let (max_offset_sec, base_time_secs, emote_ids, image_urls) =
-        meta_rx.await.unwrap_or((0.0, 0, Vec::new(), Vec::new()));
+    let (max_offset_sec, emote_ids, image_urls) =
+        meta_rx.await.unwrap_or((0.0, Vec::new(), Vec::new()));
 
     emit_progress(5.0, "Hydrating emote caches...");
 
@@ -2108,7 +2096,6 @@ pub async fn process_chat_render(
             let mf = message_font.clone();
             let mh = msg_line_h;
             let ma = metrics_ascent;
-            let bts = base_time_secs;
 
             pool.spawn(move || {
                 let results: BatchResult = msgs
@@ -2120,8 +2107,7 @@ pub async fn process_chat_render(
                                 let mut tg = gc.borrow_mut();
                                 *tg = gen;
 
-                                let offset_sec =
-                                    ((msg.created_at_secs - bts) as f64).max(0.0);
+                                let offset_sec = (msg.range_offset_secs as f64).max(0.0);
                                 let base_frame =
                                     (offset_sec * args_c.fps as f64).round() as i64;
                                 let is_highlighted = hl.contains(&msg.sender.username);
@@ -2359,7 +2345,7 @@ pub async fn process_chat_render(
         if matches!(eviction, EvictionStrategy::Timed) {
             let max_age = hold_secs + fade_secs;
             active_bubbles
-                .retain(|b| (f_idx.saturating_sub(b.spawn_frame)) as f32 / fps_f32 <= max_age);
+                .retain(|b| f_idx.saturating_sub(b.spawn_frame) as f32 / fps_f32 <= max_age);
         }
 
         // Trim bubbles that scroll off the top of the canvas.
