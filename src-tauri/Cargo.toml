@@ -43,7 +43,7 @@ which = "8.0.5"
 tauri-plugin-dialog = "2.7.2"
 reqwest = "0.13.4"
 futures-util = "0.3.33"
-tokio-stream = "0.1.19"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 arrayvec = "0.7.8"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

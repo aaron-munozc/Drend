@@ -1,24 +1,27 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::core::chat_renderer::{process_chat_render, EmoteNameMap, RenderVideoArgs};
 use crate::error::AppError;
 use crate::tools;
 use crate::types::AppResult;
 
-// --- FIXED: Imported the free functions to handle chat downloads ---
 use stream_extractor::{
     download_clip_chat, download_vod_chat, ChatDownloadOptions, KickOptions, ProgressPayload,
     Stream, StreamClient,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums / Types
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -46,11 +49,8 @@ pub enum AudioFormat {
 pub struct FrontendVodOptions {
     pub save_folder: Option<String>,
     pub file_name: Option<String>,
-
-    // --- Explicit Format Selection ---
     pub video_format_id: Option<String>,
     pub audio_format_id: Option<String>,
-    // ---------------------------------
     pub resolution: Option<u32>,
     pub video_format: Option<VideoFormat>,
     pub audio_only: Option<bool>,
@@ -101,22 +101,6 @@ pub struct AppTask {
     pub status_text: Option<String>,
 }
 
-pub enum JobPayload {
-    ChatDownload {
-        meta: Stream,
-        options: FrontendChatOptions,
-    },
-    VodDownload {
-        url: String,
-        options: FrontendVodOptions,
-    },
-    ChatRender {
-        input_path: PathBuf,
-        args: RenderVideoArgs,
-        cache_dir_base: PathBuf,
-    },
-}
-
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FrontendChatOptions {
@@ -129,210 +113,505 @@ pub struct FrontendChatOptions {
     pub file_name: Option<String>,
 }
 
-struct QueueItem {
-    task_id: String,
-    payload: JobPayload,
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRenderItem {
+    pub id: String,
+    pub json_file_path: String,
+    pub options: RenderVideoArgs,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QueueSettings — Persisted on disk
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueSettings {
+    /// Max simultaneous VOD + chat downloads (I/O-bound, default 2).
+    pub max_concurrent_downloads: usize,
+    /// Max simultaneous chat renders (CPU/GPU-bound, default 1).
+    pub max_concurrent_renders: usize,
+}
+
+impl Default for QueueSettings {
+    fn default() -> Self {
+        Self {
+            max_concurrent_downloads: 2,
+            max_concurrent_renders: 1,
+        }
+    }
+}
+
+impl QueueSettings {
+    fn path(app: &AppHandle) -> Result<PathBuf, AppError> {
+        let dir = app
+            .path()
+            .app_config_dir()
+            .map_err(|e| AppError::Generic(format!("Config dir resolution failed: {}", e)))?;
+        fs::create_dir_all(&dir)
+            .map_err(|e| AppError::Generic(format!("Failed to create config dir: {}", e)))?;
+        Ok(dir.join("queue_settings.json"))
+    }
+
+    pub fn load(app: &AppHandle) -> Self {
+        Self::path(app)
+            .ok()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, app: &AppHandle) -> Result<(), AppError> {
+        let path = Self::path(app)?;
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| AppError::Generic(format!("Serialization error: {}", e)))?;
+        fs::write(path, data)
+            .map_err(|e| AppError::Generic(format!("Failed to write settings to disk: {}", e)))?;
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concurrency Limits
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct LimitsInner {
+    download_semaphore: Arc<Semaphore>,
+    render_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
+struct Limits(Arc<Mutex<LimitsInner>>);
+
+impl Limits {
+    fn from_settings(s: &QueueSettings) -> Self {
+        Self(Arc::new(Mutex::new(LimitsInner {
+            download_semaphore: Arc::new(Semaphore::new(s.max_concurrent_downloads.max(1))),
+            render_semaphore: Arc::new(Semaphore::new(s.max_concurrent_renders.max(1))),
+        })))
+    }
+
+    async fn acquire_download(&self) -> OwnedSemaphorePermit {
+        let sem = self.0.lock().unwrap().download_semaphore.clone();
+        sem.acquire_owned().await.expect("semaphore closed")
+    }
+
+    async fn acquire_render(&self) -> OwnedSemaphorePermit {
+        let sem = self.0.lock().unwrap().render_semaphore.clone();
+        sem.acquire_owned().await.expect("semaphore closed")
+    }
+
+    fn apply(&self, s: &QueueSettings) {
+        let mut inner = self.0.lock().unwrap();
+        inner.download_semaphore = Arc::new(Semaphore::new(s.max_concurrent_downloads.max(1)));
+        inner.render_semaphore = Arc::new(Semaphore::new(s.max_concurrent_renders.max(1)));
+        log::info!(
+            "[Queue] Limits updated — downloads: {}, renders: {}",
+            s.max_concurrent_downloads,
+            s.max_concurrent_renders
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TaskManager
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
 pub struct TaskManager {
+    app: AppHandle,
     tasks: Arc<Mutex<HashMap<String, AppTask>>>,
     cancellations: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
-    tx: mpsc::UnboundedSender<QueueItem>,
-    event_tx: mpsc::Sender<AppTask>,
+    limits: Limits,
+    settings: Arc<Mutex<QueueSettings>>,
+    event_tx: broadcast::Sender<AppTask>,
 }
 
 impl TaskManager {
     pub fn new(app_handle: AppHandle) -> Self {
-        let tasks: Arc<Mutex<HashMap<String, AppTask>>> = Arc::new(Mutex::new(HashMap::new()));
-        let cancellations: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel::<QueueItem>();
-        let (event_tx, _) = mpsc::channel::<AppTask>(100);
-
-        let tasks_clone = Arc::clone(&tasks);
-        let cancellations_clone = Arc::clone(&cancellations);
-        let event_tx_clone = event_tx.clone();
-
-        tauri::async_runtime::spawn(async move {
-            let http_client = reqwest::Client::new();
-
-            while let Some(item) = rx.recv().await {
-                let task_id = item.task_id.clone();
-                let app = app_handle.clone();
-                let state_map = Arc::clone(&tasks_clone);
-                let cancels = Arc::clone(&cancellations_clone);
-                let progress_broadcast = event_tx_clone.clone();
-                let http_client_clone = http_client.clone();
-
-                // --- FIXED: Removed unnecessary 'mut' here ---
-                let cancel_rx = {
-                    let locked_cancels = cancels.lock().unwrap();
-                    if let Some(tx) = locked_cancels.get(&task_id) {
-                        if *tx.borrow() {
-                            let mut locked_tasks = state_map.lock().unwrap();
-                            if let Some(task) = locked_tasks.get_mut(&task_id) {
-                                task.status = TaskStatus::Cancelled;
-                                task.status_text = Some("Cancelled before starting".into());
-                                let _ = app.emit("task-progress", task.clone());
-                                let _ = progress_broadcast.try_send(task.clone());
-                            }
-                            continue;
-                        }
-                        Some(tx.subscribe())
-                    } else {
-                        None
-                    }
-                };
-
-                if cancel_rx.is_none() {
-                    continue;
-                }
-                let mut cancel_rx = cancel_rx.unwrap();
-
-                if let Some(task) = state_map.lock().unwrap().get_mut(&task_id) {
-                    task.status = TaskStatus::Processing;
-                    task.status_text = Some("Initializing...".into());
-                    let _ = app.emit("task-progress", task.clone());
-                    let _ = progress_broadcast.try_send(task.clone());
-                }
-
-                tauri::async_runtime::spawn(async move {
-                    let result = match item.payload {
-                        JobPayload::ChatDownload { meta, options } => {
-                            Self::process_chat_inner(
-                                &app,
-                                state_map.clone(),
-                                progress_broadcast.clone(),
-                                &task_id,
-                                meta,
-                                options,
-                                cancel_rx,
-                            )
-                                .await
-                        }
-                        JobPayload::VodDownload { url, options } => {
-                            Self::process_vod_inner(
-                                &app,
-                                state_map.clone(),
-                                progress_broadcast.clone(),
-                                &task_id,
-                                url,
-                                options,
-                                cancel_rx,
-                            )
-                                .await
-                        }
-                        JobPayload::ChatRender {
-                            input_path,
-                            args,
-                            cache_dir_base,
-                        } => {
-                            let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                            let flag_setter = Arc::clone(&cancel_flag);
-
-                            tauri::async_runtime::spawn(async move {
-                                if cancel_rx.changed().await.is_ok() {
-                                    if *cancel_rx.borrow() {
-                                        flag_setter
-                                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                }
-                            });
-
-                            {
-                                let mut locked = state_map.lock().unwrap();
-                                if let Some(task) = locked.get_mut(&task_id) {
-                                    task.status_text = Some("Fetching emote metadata...".into());
-                                    let _ = app.emit("task-progress", task.clone());
-                                    let _ = progress_broadcast.try_send(task.clone());
-                                }
-                            }
-
-                            let channel_id = "12345678";
-
-                            let emote_map = EmoteNameMap::build_emote_map(
-                                &http_client_clone,
-                                &args.emote_providers,
-                                channel_id,
-                            )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    eprintln!("Failed to fetch emotes: {}", e);
-                                    EmoteNameMap::new()
-                                });
-                            process_chat_render(
-                                &app,
-                                state_map.clone(),
-                                &task_id,
-                                input_path,
-                                args,
-                                cache_dir_base,
-                                emote_map,
-                                cancel_flag,
-                            )
-                                .await
-                        }
-                    };
-
-                    let mut locked = state_map.lock().unwrap();
-                    if let Some(task) = locked.get_mut(&task_id) {
-                        match result {
-                            Ok(_) => {
-                                task.status = TaskStatus::Completed;
-                                task.progress = 100.0;
-                                task.status_text = Some("Done!".into());
-                            }
-                            Err(e) => {
-                                let err_msg = e.to_string();
-                                if err_msg.to_lowercase().contains("cancelled") {
-                                    task.status = TaskStatus::Cancelled;
-                                    task.status_text = Some("Cancelled by user".into());
-                                } else {
-                                    task.status = TaskStatus::Failed(err_msg.clone());
-                                    task.status_text = Some(err_msg);
-                                }
-                            }
-                        }
-                        let _ = app.emit("task-progress", task.clone());
-                        let _ = progress_broadcast.try_send(task.clone());
-                    }
-                    cancels.lock().unwrap().remove(&task_id);
-                });
-            }
-        });
-
+        let settings = QueueSettings::load(&app_handle);
+        log::info!(
+            "[Queue] Loaded settings — downloads: {}, renders: {}",
+            settings.max_concurrent_downloads,
+            settings.max_concurrent_renders
+        );
+        let (event_tx, _) = broadcast::channel(256);
         Self {
-            tasks,
-            cancellations,
-            tx,
+            app: app_handle,
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            limits: Limits::from_settings(&settings),
+            settings: Arc::new(Mutex::new(settings)),
             event_tx,
         }
     }
+
+    pub fn apply_settings(&self, new_settings: QueueSettings) -> Result<(), AppError> {
+        new_settings.save(&self.app)?;
+        self.limits.apply(&new_settings);
+        *self.settings.lock().unwrap() = new_settings;
+        Ok(())
+    }
+
+    pub fn get_settings(&self) -> QueueSettings {
+        self.settings.lock().unwrap().clone()
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<AppTask> {
+        self.event_tx.subscribe()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Enqueue Methods
+    // ─────────────────────────────────────────────────────────────────────
+
+    pub fn enqueue_chat_render(
+        &self,
+        task_id: Option<String>,
+        input_path: PathBuf,
+        args: RenderVideoArgs,
+        cache_dir_base: PathBuf,
+    ) -> String {
+        let title = input_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Chat Render".to_string());
+
+        let task_id = self.resolve_task_id(task_id, "render");
+        self.setup_task(&task_id, TaskType::ChatRender, format!("Rendering: {}", title));
+
+        let app = self.app.clone();
+        let tasks = Arc::clone(&self.tasks);
+        let cancellations = Arc::clone(&self.cancellations);
+        let limits = self.limits.clone();
+        let event_tx = self.event_tx.clone();
+        let tid = task_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let mut cancel_rx = match cancellations.lock().unwrap().get(&tid) {
+                Some(tx) => tx.subscribe(),
+                None => return,
+            };
+
+            // Acquire permit while respecting early cancellation
+            let _permit = tokio::select! {
+                permit = limits.acquire_render() => permit,
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        Self::mark_cancelled_waiting(&app, &tasks, &event_tx, &tid);
+                        return;
+                    }
+                    limits.acquire_render().await
+                }
+            };
+
+            Self::mark_processing(&app, &tasks, &event_tx, &tid, "Initializing...");
+
+            let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag_setter = Arc::clone(&cancel_flag);
+            let mut cancel_rx_clone = cancel_rx.clone();
+            tauri::async_runtime::spawn(async move {
+                while cancel_rx_clone.changed().await.is_ok() {
+                    if *cancel_rx_clone.borrow() {
+                        flag_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                }
+            });
+
+            let http_client = reqwest::Client::new();
+            let emote_map = EmoteNameMap::build_emote_map(
+                &http_client,
+                &args.emote_providers,
+                "12345678",
+            )
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("[Render {}] Emote fetch failed: {}", tid, e);
+                    EmoteNameMap::new()
+                });
+
+            let result = process_chat_render(
+                &app,
+                tasks.clone(),
+                &tid,
+                input_path,
+                args,
+                cache_dir_base,
+                emote_map,
+                cancel_flag,
+            )
+                .await;
+
+            Self::finalize_task(&app, &tasks, &cancellations, &event_tx, &tid, result);
+        });
+
+        task_id
+    }
+
+    pub fn enqueue_batch_chat_render(
+        &self,
+        items: Vec<(String, PathBuf, RenderVideoArgs, PathBuf)>,
+    ) -> Vec<String> {
+        items
+            .into_iter()
+            .map(|(id, path, args, cache)| {
+                self.enqueue_chat_render(Some(id), path, args, cache)
+            })
+            .collect()
+    }
+
+    pub fn enqueue_chat_download(
+        &self,
+        task_id: Option<String>,
+        meta: Stream,
+        options: FrontendChatOptions,
+    ) -> String {
+        let (title_opt, chat_id_opt) = match &meta {
+            Stream::Vod(v) => (v.title.clone(), v.chat_id),
+            Stream::Clip(c) => (c.title.clone(), c.chat_id),
+            Stream::Live(l) => (l.title.clone(), l.chat_id),
+            _ => (None, None),
+        };
+        let title = title_opt.unwrap_or_else(|| "Unknown Stream".to_string());
+
+        let task_id = task_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| {
+                let id_str = chat_id_opt
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(Self::timestamp_id);
+                format!("chat_{}", id_str)
+            });
+
+        self.setup_task(&task_id, TaskType::ChatDownload, title);
+
+        let app = self.app.clone();
+        let tasks = Arc::clone(&self.tasks);
+        let cancellations = Arc::clone(&self.cancellations);
+        let limits = self.limits.clone();
+        let event_tx = self.event_tx.clone();
+        let tid = task_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let mut cancel_rx = match cancellations.lock().unwrap().get(&tid) {
+                Some(tx) => tx.subscribe(),
+                None => return,
+            };
+
+            let _permit = tokio::select! {
+                permit = limits.acquire_download() => permit,
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        Self::mark_cancelled_waiting(&app, &tasks, &event_tx, &tid);
+                        return;
+                    }
+                    limits.acquire_download().await
+                }
+            };
+
+            Self::mark_processing(&app, &tasks, &event_tx, &tid, "Connecting...");
+
+            let result =
+                Self::process_chat_inner(&app, tasks.clone(), &event_tx, &tid, meta, options, cancel_rx)
+                    .await;
+
+            Self::finalize_task(&app, &tasks, &cancellations, &event_tx, &tid, result);
+        });
+
+        task_id
+    }
+
+    pub fn enqueue_vod_download(
+        &self,
+        task_id: Option<String>,
+        url: String,
+        title: String,
+        options: FrontendVodOptions,
+    ) -> String {
+        let task_id = self.resolve_task_id(task_id, "vod");
+        self.setup_task(&task_id, TaskType::VodDownload, title);
+
+        let app = self.app.clone();
+        let tasks = Arc::clone(&self.tasks);
+        let cancellations = Arc::clone(&self.cancellations);
+        let limits = self.limits.clone();
+        let event_tx = self.event_tx.clone();
+        let tid = task_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let mut cancel_rx = match cancellations.lock().unwrap().get(&tid) {
+                Some(tx) => tx.subscribe(),
+                None => return,
+            };
+
+            let _permit = tokio::select! {
+                permit = limits.acquire_download() => permit,
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        Self::mark_cancelled_waiting(&app, &tasks, &event_tx, &tid);
+                        return;
+                    }
+                    limits.acquire_download().await
+                }
+            };
+
+            Self::mark_processing(&app, &tasks, &event_tx, &tid, "Starting download...");
+
+            let result =
+                Self::process_vod_inner(&app, tasks.clone(), &event_tx, &tid, url, options, cancel_rx)
+                    .await;
+
+            Self::finalize_task(&app, &tasks, &cancellations, &event_tx, &tid, result);
+        });
+
+        task_id
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task Management
+    // ─────────────────────────────────────────────────────────────────────
 
     pub fn cancel_task(&self, task_id: &str) -> Result<(), String> {
         let cancels = self.cancellations.lock().unwrap();
         if let Some(tx) = cancels.get(task_id) {
             let _ = tx.send(true);
-
             let mut tasks = self.tasks.lock().unwrap();
             if let Some(task) = tasks.get_mut(task_id) {
                 if matches!(task.status, TaskStatus::Queued) {
                     task.status = TaskStatus::Cancelled;
-                    task.status_text = Some("Cancelled inside processing queue".into());
-                    let _ = self.event_tx.try_send(task.clone());
+                    task.status_text = Some("Cancelled while waiting".into());
+                    let _ = self.app.emit("task-progress", task.clone());
+                    let _ = self.event_tx.send(task.clone());
                 }
             }
             Ok(())
         } else {
-            Err("Task is not running or already terminated.".into())
+            Err("Task not found or already terminated.".into())
         }
+    }
+
+    pub fn get_tasks(&self) -> Vec<AppTask> {
+        self.tasks.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn get_task(&self, task_id: &str) -> Option<AppTask> {
+        self.tasks.lock().unwrap().get(task_id).cloned()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn resolve_task_id(&self, provided: Option<String>, prefix: &str) -> String {
+        provided
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| format!("{}_{}", prefix, Self::timestamp_id()))
+    }
+
+    fn timestamp_id() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string()
+    }
+
+    fn emit(app: &AppHandle, event_tx: &broadcast::Sender<AppTask>, task: &AppTask) {
+        let _ = app.emit("task-progress", task.clone());
+        let _ = event_tx.send(task.clone());
+    }
+
+    fn setup_task(&self, task_id: &str, task_type: TaskType, title: String) {
+        let (cancel_tx, _) = watch::channel(false);
+        self.cancellations
+            .lock()
+            .unwrap()
+            .insert(task_id.to_string(), cancel_tx);
+
+        let task = AppTask {
+            task_id: task_id.to_string(),
+            task_type,
+            title,
+            progress: 0.0,
+            status: TaskStatus::Queued,
+            status_text: Some("Waiting for available slot...".into()),
+        };
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(task_id.to_string(), task.clone());
+        Self::emit(&self.app, &self.event_tx, &task);
+    }
+
+    fn mark_processing(
+        app: &AppHandle,
+        tasks: &Arc<Mutex<HashMap<String, AppTask>>>,
+        event_tx: &broadcast::Sender<AppTask>,
+        task_id: &str,
+        text: &str,
+    ) {
+        let mut locked = tasks.lock().unwrap();
+        if let Some(task) = locked.get_mut(task_id) {
+            task.status = TaskStatus::Processing;
+            task.status_text = Some(text.into());
+            Self::emit(app, event_tx, task);
+        }
+    }
+
+    fn mark_cancelled_waiting(
+        app: &AppHandle,
+        tasks: &Arc<Mutex<HashMap<String, AppTask>>>,
+        event_tx: &broadcast::Sender<AppTask>,
+        task_id: &str,
+    ) {
+        let mut locked = tasks.lock().unwrap();
+        if let Some(task) = locked.get_mut(task_id) {
+            task.status = TaskStatus::Cancelled;
+            task.status_text = Some("Cancelled before starting".into());
+            Self::emit(app, event_tx, task);
+        }
+    }
+
+    fn finalize_task(
+        app: &AppHandle,
+        tasks: &Arc<Mutex<HashMap<String, AppTask>>>,
+        cancellations: &Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+        event_tx: &broadcast::Sender<AppTask>,
+        task_id: &str,
+        result: AppResult<()>,
+    ) {
+        {
+            let mut locked = tasks.lock().unwrap();
+            if let Some(task) = locked.get_mut(task_id) {
+                match result {
+                    Ok(_) => {
+                        task.status = TaskStatus::Completed;
+                        task.progress = 100.0;
+                        task.status_text = Some("Done!".into());
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.to_lowercase().contains("cancelled") {
+                            task.status = TaskStatus::Cancelled;
+                            task.status_text = Some("Cancelled by user".into());
+                        } else {
+                            task.status = TaskStatus::Failed(msg.clone());
+                            task.status_text = Some(msg);
+                        }
+                    }
+                }
+                Self::emit(app, event_tx, task);
+            }
+        }
+        cancellations.lock().unwrap().remove(task_id);
     }
 
     async fn process_vod_inner(
         app: &AppHandle,
         tasks: Arc<Mutex<HashMap<String, AppTask>>>,
-        event_tx: mpsc::Sender<AppTask>,
+        event_tx: &broadcast::Sender<AppTask>,
         task_id: &str,
         url: String,
         opts: FrontendVodOptions,
@@ -364,11 +643,9 @@ impl TaskManager {
             } else {
                 args.push("ba/best".into());
             }
-
             args.push("--extract-audio".into());
             args.push("--audio-quality".into());
             args.push("0".into());
-
             let target_audio = opts.audio_format.clone().unwrap_or(AudioFormat::Best);
             if target_audio != AudioFormat::Best {
                 let fmt_str = match target_audio {
@@ -385,20 +662,10 @@ impl TaskManager {
             }
         } else {
             args.push("-f".into());
-
-            match (
-                opts.video_format_id.as_deref(),
-                opts.audio_format_id.as_deref(),
-            ) {
-                (Some(vid), Some(aid)) => {
-                    args.push(format!("{}+{}", vid, aid));
-                }
-                (Some(vid), None) => {
-                    args.push(vid.to_string());
-                }
-                (None, Some(aid)) => {
-                    args.push(format!("bv*+{}", aid));
-                }
+            match (opts.video_format_id.as_deref(), opts.audio_format_id.as_deref()) {
+                (Some(vid), Some(aid)) => args.push(format!("{}+{}", vid, aid)),
+                (Some(vid), None) => args.push(vid.to_string()),
+                (None, Some(aid)) => args.push(format!("bv*+{}", aid)),
                 (None, None) => {
                     if let Some(res) = opts.resolution {
                         args.push(format!("bv*[height<={}]+ba/b[height<={}]/b", res, res));
@@ -407,7 +674,6 @@ impl TaskManager {
                     }
                 }
             }
-
             let target_video = opts.video_format.clone().unwrap_or(VideoFormat::Any);
             if target_video != VideoFormat::Any {
                 let fmt_str = match target_video {
@@ -431,7 +697,6 @@ impl TaskManager {
                 .unwrap_or_else(|| "inf".into());
             args.push("--download-sections".into());
             args.push(format!("*{}-{}", start, end_str));
-
             if opts.force_keyframes.unwrap_or(false) {
                 args.push("--force-keyframes-at-cuts".into());
             }
@@ -466,7 +731,6 @@ impl TaskManager {
         if opts.live_from_start.unwrap_or(false) {
             args.push("--live-from-start".into());
         }
-
         args.push(url);
 
         let mut child = Command::new(&ytdlp_path)
@@ -480,6 +744,7 @@ impl TaskManager {
         let mut reader = BufReader::new(stdout).lines();
         let t_id = task_id.to_string();
         let app_clone = app.clone();
+        let event_tx_clone = event_tx.clone();
 
         loop {
             tokio::select! {
@@ -496,16 +761,17 @@ impl TaskManager {
                                 if let Some(start) = line.find(']') {
                                     let rest = &line[start + 1..];
                                     if let Some(end) = rest.find('%') {
-                                        let pct_str = rest[..end].trim();
-                                        let clean_str: String = pct_str.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
-
-                                        if let Ok(percent) = clean_str.parse::<f32>() {
+                                        let clean: String = rest[..end]
+                                            .trim()
+                                            .chars()
+                                            .filter(|c| c.is_ascii_digit() || *c == '.')
+                                            .collect();
+                                        if let Ok(pct) = clean.parse::<f32>() {
                                             let mut locked = tasks.lock().unwrap();
                                             if let Some(task) = locked.get_mut(&t_id) {
-                                                task.progress = percent;
+                                                task.progress = pct;
                                                 task.status_text = Some("Downloading...".into());
-                                                let _ = app_clone.emit("task-progress", task.clone());
-                                                let _ = event_tx.try_send(task.clone());
+                                                Self::emit(&app_clone, &event_tx_clone, task);
                                             }
                                         }
                                     }
@@ -514,9 +780,8 @@ impl TaskManager {
                                 let mut locked = tasks.lock().unwrap();
                                 if let Some(task) = locked.get_mut(&t_id) {
                                     task.status = TaskStatus::Merging;
-                                    task.status_text = Some("Post-processing stream...".into());
-                                    let _ = app_clone.emit("task-progress", task.clone());
-                                    let _ = event_tx.try_send(task.clone());
+                                    task.status_text = Some("Post-processing...".into());
+                                    Self::emit(&app_clone, &event_tx_clone, task);
                                 }
                             }
                         }
@@ -534,16 +799,14 @@ impl TaskManager {
         if status.success() {
             Ok(())
         } else {
-            Err(AppError::Generic(
-                "Process terminated with error codes".into(),
-            ))
+            Err(AppError::Generic("yt-dlp exited with errors".into()))
         }
     }
 
     async fn process_chat_inner(
         app: &AppHandle,
         tasks: Arc<Mutex<HashMap<String, AppTask>>>,
-        event_tx: mpsc::Sender<AppTask>,
+        event_tx: &broadcast::Sender<AppTask>,
         task_id: &str,
         meta: Stream,
         opts: FrontendChatOptions,
@@ -551,10 +814,11 @@ impl TaskManager {
     ) -> AppResult<()> {
         let t_id = task_id.to_string();
         let app_clone = app.clone();
-        let progress_broadcast = event_tx.clone();
+        let event_tx_clone = event_tx.clone();
+        let tasks_clone = tasks.clone();
 
         let progress_hook = Arc::new(move |payload: ProgressPayload| {
-            let mut locked = tasks.lock().unwrap();
+            let mut locked = tasks_clone.lock().unwrap();
             if let Some(task) = locked.get_mut(&t_id) {
                 match payload {
                     ProgressPayload::Downloading { percent, message } => {
@@ -565,8 +829,7 @@ impl TaskManager {
                     ProgressPayload::Error { message } => task.status_text = Some(message),
                     _ => {}
                 }
-                let _ = app_clone.emit("task-progress", task.clone());
-                let _ = progress_broadcast.try_send(task.clone());
+                Self::emit(&app_clone, &event_tx_clone, task);
             }
         });
 
@@ -598,7 +861,6 @@ impl TaskManager {
             engine_opts = engine_opts.with_end_ms(end);
         }
 
-        // --- FIXED: Create client and use the free functions rather than non-existent methods ---
         let client = StreamClient::new()
             .map_err(|e| AppError::Generic(format!("Failed to initialize client: {:?}", e)))?;
 
@@ -626,165 +888,5 @@ impl TaskManager {
         }
 
         Ok(())
-    }
-
-    pub fn enqueue_chat_render(
-        &self,
-        task_id: Option<String>,
-        input_path: PathBuf,
-        args: RenderVideoArgs,
-        cache_dir_base: PathBuf,
-    ) -> String {
-        let title = input_path
-            .file_name()
-            .map(|os_str| os_str.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Chat Render Job".to_string());
-
-        let task_id = task_id
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "render_{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis()
-                )
-            });
-
-        let (cancel_tx, _) = watch::channel(false);
-        self.cancellations
-            .lock()
-            .unwrap()
-            .insert(task_id.clone(), cancel_tx);
-        self.create_task(
-            &task_id,
-            TaskType::ChatRender,
-            format!("Rendering: {}", title),
-        );
-
-        let _ = self.tx.send(QueueItem {
-            task_id: task_id.clone(),
-            payload: JobPayload::ChatRender {
-                input_path,
-                args,
-                cache_dir_base,
-            },
-        });
-        task_id
-    }
-
-    pub fn enqueue_chat_download(
-        &self,
-        task_id: Option<String>,
-        meta: Stream,
-        options: FrontendChatOptions,
-    ) -> String {
-        // --- FIXED: Added the wildcard to handle the non-exhaustive pattern ---
-        let (title_opt, chat_id_opt) = match &meta {
-            Stream::Vod(v) => (v.title.clone(), v.chat_id),
-            Stream::Clip(c) => (c.title.clone(), c.chat_id),
-            Stream::Live(l) => (l.title.clone(), l.chat_id),
-            _ => (None, None),
-        };
-
-        let title = title_opt.unwrap_or_else(|| "Unknown Stream".to_string());
-
-        let task_id = task_id
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| {
-                let id_str = chat_id_opt.map(|id| id.to_string()).unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis()
-                        .to_string()
-                });
-                format!("chat_{}", id_str)
-            });
-
-        let (cancel_tx, _) = watch::channel(false);
-        self.cancellations
-            .lock()
-            .unwrap()
-            .insert(task_id.clone(), cancel_tx);
-        self.create_task(&task_id, TaskType::ChatDownload, title);
-
-        let _ = self.tx.send(QueueItem {
-            task_id: task_id.clone(),
-            payload: JobPayload::ChatDownload { meta, options },
-        });
-        task_id
-    }
-
-    pub fn enqueue_vod_download(
-        &self,
-        task_id: Option<String>,
-        url: String,
-        title: String,
-        options: FrontendVodOptions,
-    ) -> String {
-        let task_id = task_id
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "vod_{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis()
-                )
-            });
-
-        let (cancel_tx, _) = watch::channel(false);
-        self.cancellations
-            .lock()
-            .unwrap()
-            .insert(task_id.clone(), cancel_tx);
-        self.create_task(&task_id, TaskType::VodDownload, title);
-
-        let _ = self.tx.send(QueueItem {
-            task_id: task_id.clone(),
-            payload: JobPayload::VodDownload { url, options },
-        });
-        task_id
-    }
-
-    fn create_task(&self, task_id: &str, task_type: TaskType, title: String) {
-        let task = AppTask {
-            task_id: task_id.to_string(),
-            task_type,
-            title,
-            progress: 0.0,
-            status: TaskStatus::Queued,
-            status_text: Some("Queuing...".into()),
-        };
-        self.tasks
-            .lock()
-            .unwrap()
-            .insert(task_id.to_string(), task.clone());
-        let _ = self.event_tx.try_send(task);
-    }
-
-    pub fn get_tasks(&self) -> Vec<AppTask> {
-        self.tasks.lock().unwrap().values().cloned().collect()
-    }
-
-    pub fn get_task(&self, task_id: &str) -> Option<AppTask> {
-        self.tasks.lock().unwrap().get(task_id).cloned()
-    }
-
-    pub fn subscribe_events(&self) -> mpsc::Receiver<AppTask> {
-        let (tx, rx) = mpsc::channel(100);
-        let current_tasks = self.get_tasks();
-
-        tauri::async_runtime::spawn(async move {
-            for task in current_tasks {
-                if tx.send(task).await.is_err() {
-                    return;
-                }
-            }
-        });
-        rx
     }
 }

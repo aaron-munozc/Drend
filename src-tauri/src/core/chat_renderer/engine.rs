@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use stream_extractor::MessageSaved;
 use tauri::{AppHandle, Emitter};
-
+use crate::core::AppTask;
 use crate::core::chat_renderer::args::{
     BackgroundMode, EvictionStrategy, QualityPreset, RenderVideoArgs,
     TimelineMismatchStrategy,
@@ -26,7 +26,6 @@ use crate::core::chat_renderer::helpers::{ease_out, get_user_color};
 use crate::core::chat_renderer::types::{
     EmoteCache, EmoteData, ImageCache, LayoutLine, LayoutToken,
 };
-use crate::core::manager::AppTask;
 use crate::error::AppError;
 use crate::types::AppResult;
 

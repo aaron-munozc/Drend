@@ -157,6 +157,56 @@ const TIMELINE_STRATEGIES: { value: TimelineMismatchStrategy; label: string; des
 const EDGES = ["n", "s", "e", "w", "ne", "nw", "se", "sw"] as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OverlayHandle — resize handle for canvas overlays.
+// Defined outside CanvasEditor so React sees a stable component type across
+// renders; defining it inside (even via useCallback) causes unmount/remount.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface OverlayHandleProps {
+    edge: DragState["edge"];
+    rect: { x: number; y: number; width: number; height: number };
+    kind: OverlayKind;
+    index?: number;
+    onPointerDown: (
+        e: React.PointerEvent,
+        kind: OverlayKind,
+        index: number | undefined,
+        rect: { x: number; y: number; width: number; height: number },
+        edge: DragState["edge"],
+    ) => void;
+}
+
+const OverlayHandle = memo(function OverlayHandle({ edge, rect, kind, index, onPointerDown }: OverlayHandleProps) {
+    const pos: React.CSSProperties = {
+        position: "absolute", width: 10, height: 10, borderRadius: 3,
+        background: "white", border: "2px solid rgba(99,102,241,0.95)", zIndex: 40,
+        userSelect: "none", WebkitUserSelect: "none", pointerEvents: "auto",
+        touchAction: "none", boxSizing: "border-box",
+        cursor: edge ? EDGE_CURSOR[edge] : undefined,
+    };
+    if (edge === "n") Object.assign(pos, { top: -5, left: "50%", transform: "translateX(-50%)" });
+    if (edge === "s") Object.assign(pos, { bottom: -5, left: "50%", transform: "translateX(-50%)" });
+    if (edge === "e") Object.assign(pos, { right: -5, top: "50%", transform: "translateY(-50%)" });
+    if (edge === "w") Object.assign(pos, { left: -5, top: "50%", transform: "translateY(-50%)" });
+    if (edge === "ne") Object.assign(pos, { top: -5, right: -5 });
+    if (edge === "nw") Object.assign(pos, { top: -5, left: -5 });
+    if (edge === "se") Object.assign(pos, { bottom: -5, right: -5 });
+    if (edge === "sw") Object.assign(pos, { bottom: -5, left: -5 });
+
+    return (
+        <div
+            style={pos}
+            onPointerDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                onPointerDown(e, kind, index, rect, edge);
+            }}
+        />
+    );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Primitive UI helpers — all memo'd so parent re-renders don't cascade
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -189,7 +239,10 @@ const NumberInput = memo(function NumberInput({ value, onChange, min, max, step 
 }) {
     return (
         <input type="number" value={value} min={min} max={max} step={step}
-               onChange={(e) => onChange(Number(e.target.value))}
+               onChange={(e) => {
+                   const v = Number(e.target.value);
+                   if (!Number.isNaN(v)) onChange(v);
+               }}
                className="w-full bg-neutral-900 border border-neutral-700/80 rounded-md px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-indigo-500/70 focus:ring-1 focus:ring-indigo-500/20 transition-all"
         />
     );
@@ -304,15 +357,17 @@ function Section({ title, defaultOpen = true, children }: {
 // useVideoMeta
 // ─────────────────────────────────────────────────────────────────────────────
 
-function useVideoMeta(path: string | undefined): { meta: VideoMeta | null; loading: boolean } {
+function useVideoMeta(path: string | undefined): { meta: VideoMeta | null; loading: boolean; error: string | null } {
     const [meta, setMeta] = useState<VideoMeta | null>(null);
     const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
-        if (!path) { setMeta(null); return; }
+        if (!path) { setMeta(null); setError(null); return; }
         let cancelled = false;
         setLoading(true);
         setMeta(null);
+        setError(null);
 
         const videoSrc = convertFileSrc(path);
 
@@ -324,19 +379,34 @@ function useVideoMeta(path: string | undefined): { meta: VideoMeta | null; loadi
             vid.preload = "metadata";
             vid.onloadedmetadata = () => { vid.currentTime = Math.min(1.5, vid.duration * 0.1); };
             vid.onseeked = () => {
-                const c = document.createElement("canvas");
-                c.width = vid.videoWidth; c.height = vid.videoHeight;
-                c.getContext("2d")?.drawImage(vid, 0, 0);
-                if (!cancelled) {
-                    setMeta({
-                        width: vid.videoWidth, height: vid.videoHeight, duration: vid.duration,
-                        videoSrc,
-                        posterDataUrl: c.toDataURL("image/jpeg", 0.75),
-                    });
+                try {
+                    const c = document.createElement("canvas");
+                    c.width = vid.videoWidth; c.height = vid.videoHeight;
+                    c.getContext("2d")?.drawImage(vid, 0, 0);
+                    if (!cancelled) {
+                        setMeta({
+                            width: vid.videoWidth, height: vid.videoHeight, duration: vid.duration,
+                            videoSrc,
+                            posterDataUrl: c.toDataURL("image/jpeg", 0.75),
+                        });
+                    }
+                } catch {
+                    // Canvas tainted (cross-origin) — still set meta without a poster
+                    if (!cancelled) {
+                        setMeta({
+                            width: vid.videoWidth, height: vid.videoHeight, duration: vid.duration,
+                            videoSrc,
+                            posterDataUrl: "",
+                        });
+                    }
                 }
                 vid.remove(); resolve();
             };
-            vid.onerror = () => { vid.remove(); resolve(); };
+            vid.onerror = () => {
+                vid.remove();
+                if (!cancelled) setError("Could not load video preview.");
+                resolve();
+            };
         });
 
         const tryTauriCommand = async () => {
@@ -360,7 +430,7 @@ function useVideoMeta(path: string | undefined): { meta: VideoMeta | null; loadi
         return () => { cancelled = true; };
     }, [path]);
 
-    return { meta, loading };
+    return { meta, loading, error };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -594,39 +664,8 @@ function CanvasEditor({
 
     const pct = (v: number, dim: number) => `${(v / dim) * 100}%`;
 
-    // Handle function — defined inline but stable shape; memo'd per-instance via useCallback in parent
-    const Handle = useCallback(function Handle({ edge, rect, kind, index }: {
-        edge: DragState["edge"]; rect: { x: number; y: number; width: number; height: number };
-        kind: OverlayKind; index?: number;
-    }) {
-        const pos: React.CSSProperties = {
-            position: "absolute", width: 10, height: 10, borderRadius: 3,
-            background: "white", border: "2px solid rgba(99,102,241,0.95)", zIndex: 40,
-            userSelect: "none", WebkitUserSelect: "none", pointerEvents: "auto",
-            touchAction: "none", boxSizing: "border-box",
-            cursor: edge ? EDGE_CURSOR[edge] : undefined,
-        };
-        if (edge === "n") Object.assign(pos, { top: -5, left: "50%", transform: "translateX(-50%)" });
-        if (edge === "s") Object.assign(pos, { bottom: -5, left: "50%", transform: "translateX(-50%)" });
-        if (edge === "e") Object.assign(pos, { right: -5, top: "50%", transform: "translateY(-50%)" });
-        if (edge === "w") Object.assign(pos, { left: -5, top: "50%", transform: "translateY(-50%)" });
-        if (edge === "ne") Object.assign(pos, { top: -5, right: -5 });
-        if (edge === "nw") Object.assign(pos, { top: -5, left: -5 });
-        if (edge === "se") Object.assign(pos, { bottom: -5, right: -5 });
-        if (edge === "sw") Object.assign(pos, { bottom: -5, left: -5 });
-
-        return (
-            <div
-                style={pos}
-                onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-                    onPointerDown(e, kind, index, rect, edge);
-                }}
-            />
-        );
-    }, [onPointerDown]);
+    // OverlayHandle is defined at module level (above CanvasEditor) so React
+    // always sees the same component type — no unmount/remount on re-render.
 
     const selKind = selected?.kind;
     const selIdx = selected?.index;
@@ -734,7 +773,7 @@ function CanvasEditor({
                             <span style={{ position: "absolute", top: 2, left: 4, fontSize: 8, fontWeight: 700, color: "rgba(165,180,252,0.7)", pointerEvents: "none", userSelect: "none", lineHeight: 1 }}>
                                 S{i + 1}
                             </span>
-                            {isSel && EDGES.map((edge) => <Handle key={edge} edge={edge} rect={rect} kind="shape" index={i} />)}
+                            {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="shape" index={i} onPointerDown={onPointerDown} />)}
                         </div>
                     );
                 })}
@@ -768,7 +807,7 @@ function CanvasEditor({
                                     IMG {i + 1}
                                 </span>
                             )}
-                            {isSel && EDGES.map((edge) => <Handle key={edge} edge={edge} rect={rect} kind="image" index={i} />)}
+                            {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="image" index={i} onPointerDown={onPointerDown} />)}
                         </div>
                     );
                 })}
@@ -815,7 +854,7 @@ function CanvasEditor({
                                 </div>
                                 {isSel && <div style={{ fontSize: 8, color: "rgba(196,181,253,0.6)", fontFamily: "monospace", marginTop: 2 }}>{chatW}×{chatH} · drag to move</div>}
                             </div>
-                            {isSel && EDGES.map((edge) => <Handle key={edge} edge={edge} rect={rect} kind="chat" />)}
+                            {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="chat" onPointerDown={onPointerDown} />)}
                         </div>
                     );
                 })()}
@@ -992,6 +1031,26 @@ function formatTime(s: number) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ResetChip — module-level so React sees a stable component type.
+// Defined here (not inside SettingsPanel) to avoid unmount/remount on every
+// SettingsPanel render when overriddenKeys or onResetKey change.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ResetChip = memo(function ResetChip({ fieldKey, overriddenKeys, onResetKey }: {
+    fieldKey: string;
+    overriddenKeys?: Set<string>;
+    onResetKey?: (key: string) => void;
+}) {
+    if (!overriddenKeys?.has(fieldKey) || !onResetKey) return null;
+    return (
+        <button type="button" onClick={() => onResetKey(fieldKey)}
+                className="ml-1.5 text-[9px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 border border-amber-700/40 hover:bg-amber-900/70 transition-colors leading-none">
+            override · reset
+        </button>
+    );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Shared settings panel
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1006,6 +1065,7 @@ interface SettingsPanelProps {
     onSelectOverlayVideo?: () => void;
     videoMeta?: VideoMeta | null;
     videoLoading?: boolean;
+    videoError?: string | null;
     onSetOverlayVideoPath?: (v: string) => void;
 }
 
@@ -1013,14 +1073,22 @@ function SettingsPanel({
                            opts, setOpt, setOpts,
                            overriddenKeys, onResetKey,
                            isBatchItem = false,
-                           overlayVideoPath, onSelectOverlayVideo, videoMeta, videoLoading, onSetOverlayVideoPath,
+                           overlayVideoPath, onSelectOverlayVideo, videoMeta, videoLoading, videoError, onSetOverlayVideoPath,
                        }: SettingsPanelProps) {
     const [pinnedRaw, setPinnedRaw] = useState(() => opts.pinnedUsers.join(", "));
     const [skipRaw, setSkipRaw] = useState(() => opts.skipUsers.join(", "));
 
-    // Sync raw strings only when the underlying array identity changes
-    useEffect(() => { setPinnedRaw(opts.pinnedUsers.join(", ")); }, [opts.pinnedUsers]);
-    useEffect(() => { setSkipRaw(opts.skipUsers.join(", ")); }, [opts.skipUsers]);
+    // Sync raw strings when the underlying array changes (e.g. batch reset / copy).
+    // Compare the joined value rather than array identity so that semantically
+    // identical arrays (e.g. produced by copySettingsFromItem) don't skip the sync.
+    useEffect(() => {
+        const joined = opts.pinnedUsers.join(", ");
+        setPinnedRaw((prev) => (prev !== joined ? joined : prev));
+    }, [opts.pinnedUsers]);
+    useEffect(() => {
+        const joined = opts.skipUsers.join(", ");
+        setSkipRaw((prev) => (prev !== joined ? joined : prev));
+    }, [opts.skipUsers]);
 
     const onChatChange = useCallback((x: number, y: number, w: number, h: number) => {
         setOpts({ overlayX: x, overlayY: y, overlayWidth: w, overlayHeight: h, width: w, height: h });
@@ -1030,16 +1098,7 @@ function SettingsPanel({
         setOpt(key, raw.split(",").map((s) => s.trim()).filter(Boolean));
     }, [setOpt]);
 
-    // ResetChip is small and only renders when overriddenKeys changes — keep it local but stable
-    const ResetChip = useCallback(({ fieldKey }: { fieldKey: string }) => {
-        if (!overriddenKeys?.has(fieldKey) || !onResetKey) return null;
-        return (
-            <button type="button" onClick={() => onResetKey(fieldKey)}
-                    className="ml-1.5 text-[9px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 border border-amber-700/40 hover:bg-amber-900/70 transition-colors leading-none">
-                override · reset
-            </button>
-        );
-    }, [overriddenKeys, onResetKey]);
+    // ResetChip is defined at module level — pass overriddenKeys and onResetKey as props.
 
     const setShapes = useCallback((v: CustomShapeOverlay[]) => setOpt("shapeOverlays", v), [setOpt]);
     const setImages = useCallback((v: CustomImageOverlay[]) => setOpt("imageOverlays", v), [setOpt]);
@@ -1092,15 +1151,15 @@ function SettingsPanel({
             <Section title="Canvas & Overlays" defaultOpen>
                 <div className="grid grid-cols-3 gap-2">
                     <div>
-                        <div className="flex items-center mb-1"><FieldLabel>Width</FieldLabel><ResetChip fieldKey="width" /></div>
+                        <div className="flex items-center mb-1"><FieldLabel>Width</FieldLabel><ResetChip fieldKey="width" overriddenKeys={overriddenKeys} onResetKey={onResetKey} /></div>
                         <NumberInput value={opts.width} min={1} onChange={(v) => setOpt("width", v)} />
                     </div>
                     <div>
-                        <div className="flex items-center mb-1"><FieldLabel>Height</FieldLabel><ResetChip fieldKey="height" /></div>
+                        <div className="flex items-center mb-1"><FieldLabel>Height</FieldLabel><ResetChip fieldKey="height" overriddenKeys={overriddenKeys} onResetKey={onResetKey} /></div>
                         <NumberInput value={opts.height} min={1} onChange={(v) => setOpt("height", v)} />
                     </div>
                     <div>
-                        <div className="flex items-center mb-1"><FieldLabel>FPS</FieldLabel><ResetChip fieldKey="fps" /></div>
+                        <div className="flex items-center mb-1"><FieldLabel>FPS</FieldLabel><ResetChip fieldKey="fps" overriddenKeys={overriddenKeys} onResetKey={onResetKey} /></div>
                         <NumberInput value={opts.fps} min={1} max={120} onChange={(v) => setOpt("fps", v)} />
                     </div>
                 </div>
@@ -1130,6 +1189,15 @@ function SettingsPanel({
                     <div className="mt-2 w-full h-32 rounded-lg bg-neutral-900/60 border border-neutral-700/50 flex flex-col items-center justify-center gap-2 text-neutral-500">
                         <span className="w-5 h-5 border-2 border-neutral-700 border-t-indigo-500 rounded-full animate-spin" />
                         <span className="text-[11px]">Loading video…</span>
+                    </div>
+                )}
+
+                {!videoLoading && videoError && overlayVideoPath && (
+                    <div className="mt-2 flex items-center gap-2 px-3 py-2 bg-red-950/30 border border-red-800/40 rounded-lg text-[11px] text-red-400">
+                        <svg className="shrink-0" width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4h1.5v5h-1.5V5zm0 6h1.5v1.5h-1.5V11z" />
+                        </svg>
+                        {videoError}
                     </div>
                 )}
 
@@ -1168,7 +1236,7 @@ function SettingsPanel({
             <Section title="Typography" defaultOpen={false}>
                 <div className="grid grid-cols-2 gap-2">
                     <div>
-                        <div className="flex items-center mb-1"><FieldLabel>Font family</FieldLabel><ResetChip fieldKey="fontName" /></div>
+                        <div className="flex items-center mb-1"><FieldLabel>Font family</FieldLabel><ResetChip fieldKey="fontName" overriddenKeys={overriddenKeys} onResetKey={onResetKey} /></div>
                         <TextInput value={opts.fontName} onChange={(v) => setOpt("fontName", v)} placeholder="Inter" />
                     </div>
                     <CustomSlider label="Font Size" value={opts.fontSize} min={8} max={72} unit="px" onChange={(v) => setOpt("fontSize", v)} />
@@ -1268,7 +1336,7 @@ function SettingsPanel({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BatchItemPanel
+// BatchItemPanel — redesigned for intuitive inheritance model
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface BatchItemPanelProps {
@@ -1281,21 +1349,58 @@ interface BatchItemPanelProps {
     onCopyFrom: (sourceIndex: number) => void;
 }
 
+/** A small pill showing inheritance state for a key property */
+const InheritBadge = memo(function InheritBadge({ label, isOverridden, onReset }: {
+    label: string; isOverridden: boolean; onReset: () => void;
+}) {
+    if (!isOverridden) {
+        return (
+            <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] bg-neutral-900 text-neutral-600 border border-neutral-800">
+                <svg width="7" height="7" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                    <path d="M1 4h4M3 2l2 2-2 2" />
+                </svg>
+                {label}
+            </span>
+        );
+    }
+    return (
+        <button type="button" onClick={onReset}
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] bg-amber-950/50 text-amber-400 border border-amber-800/50 hover:bg-red-950/40 hover:text-red-400 hover:border-red-800/50 transition-colors group">
+            <svg width="7" height="7" viewBox="0 0 8 8" fill="currentColor" className="group-hover:hidden">
+                <circle cx="4" cy="4" r="2.5" />
+            </svg>
+            <svg width="7" height="7" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="hidden group-hover:block">
+                <path d="M1.5 1.5l5 5M6.5 1.5l-5 5" />
+            </svg>
+            {label}
+        </button>
+    );
+});
+
 function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, onCopyFrom }: BatchItemPanelProps) {
+    const [expanded, setExpanded] = useState(true);
     const [showOverrides, setShowOverrides] = useState(false);
     const [showCopyMenu, setShowCopyMenu] = useState(false);
     const copyMenuRef = useRef<HTMLDivElement>(null);
 
     const effectiveOpts = useMemo(() => resolveItemOpts(mainOpts, item), [mainOpts, item]);
-    const { meta: videoMeta, loading: videoLoading } = useVideoMeta(effectiveOpts.useImmediatePipeOverlay ? (item.overlayVideoPath || undefined) : undefined);
+    const { meta: videoMeta, loading: videoLoading, error: videoError } = useVideoMeta(effectiveOpts.useImmediatePipeOverlay ? (item.overlayVideoPath || undefined) : undefined);
 
     useEffect(() => {
         if (!showCopyMenu) return;
-        const h = (e: MouseEvent) => {
-            if (copyMenuRef.current && !copyMenuRef.current.contains(e.target as Node)) setShowCopyMenu(false);
+        const onOutsideClick = (e: MouseEvent) => {
+            if (copyMenuRef.current && !copyMenuRef.current.contains(e.target as Node))
+                setShowCopyMenu(false);
         };
-        document.addEventListener("mousedown", h);
-        return () => document.removeEventListener("mousedown", h);
+        const onEscape = (e: KeyboardEvent) => {
+            if (e.key === "Escape") setShowCopyMenu(false);
+        };
+        document.addEventListener("mousedown", onOutsideClick);
+        document.addEventListener("keydown", onEscape);
+        return () => {
+            document.removeEventListener("mousedown", onOutsideClick);
+            document.removeEventListener("keydown", onEscape);
+        };
     }, [showCopyMenu]);
 
     const overriddenKeys = useMemo(() => new Set(Object.keys(item.overrides)), [item.overrides]);
@@ -1341,10 +1446,14 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
 
     const hasOverrides = overriddenKeys.size > 0;
     const canDispatch = Boolean(item.jsonFilePath) && Boolean(item.outputPath);
-    const copyTargets = useMemo(
-        () => allItems.map((_it, i) => ({ index: i, label: `Item ${i + 1}` })).filter((t) => t.index !== index),
-        [allItems, index],
-    );
+
+    // Copy targets: "Main settings" first, then sibling items
+    const copyTargets = useMemo(() => {
+        const siblings = allItems
+            .map((_it, i) => ({ kind: "item" as const, index: i, label: `Item ${i + 1}` }))
+            .filter((t) => t.index !== index);
+        return [{ kind: "main" as const, index: -1, label: "Main settings" }, ...siblings];
+    }, [allItems, index]);
 
     const handleSelectJsonl = useCallback(async () => {
         try {
@@ -1357,7 +1466,7 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
         try {
             const sel = await open({ multiple: false, directory: true });
             if (typeof sel === "string") {
-                const sep = sel.includes("\\") ? "\\" : "/";
+                const sep = sel.includes("\\") && !sel.includes("/") ? "\\" : "/";
                 const path = sel.endsWith(sep) ? `${sel}output_${index + 1}.mp4` : `${sel}${sep}output_${index + 1}.mp4`;
                 onChange({ ...item, outputPath: path });
             }
@@ -1415,178 +1524,327 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
         } catch {}
     }, [effectiveOpts.imageOverlays, setOverride]);
 
-    return (
-        <div className={`border rounded-xl overflow-hidden transition-colors ${canDispatch ? "border-neutral-700/80" : "border-neutral-800"}`}>
-            {/* Header */}
-            <div className="flex items-center gap-2 px-3 py-2.5 bg-neutral-900/60">
-                <button type="button" className="flex-1 flex items-center gap-2 min-w-0 text-left">
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
-                         className="text-neutral-600 shrink-0 transition-transform duration-150 rotate-180">
-                        <path d="M2 3.5l3 3 3-3" />
-                    </svg>
-                    <span className="text-xs font-semibold text-neutral-300">Item {index + 1}</span>
-                    {item.jsonFilePath
-                        ? <span className="text-[10px] text-neutral-600 font-mono truncate min-w-0">{item.jsonFilePath.split(/[/\\]/).pop()}</span>
-                        : <span className="text-[10px] text-red-500/80">No source set</span>}
-                </button>
+    const sourceFileName = item.jsonFilePath ? item.jsonFilePath.split(/[/\\]/).pop() : null;
+    const outputFileName = item.outputPath ? item.outputPath.split(/[/\\]/).pop() : null;
 
-                {copyTargets.length > 0 && (
-                    <div className="relative shrink-0" ref={copyMenuRef}>
-                        <button type="button" onClick={() => setShowCopyMenu((v) => !v)}
-                                className="flex items-center gap-1 px-2 py-1 rounded text-[10px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors">
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                                <rect x="4" y="4" width="9" height="11" rx="1.5" />
-                                <path d="M4 4V3a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-1" />
-                            </svg>
-                            Copy from
-                        </button>
-                        {showCopyMenu && (
-                            <div className="absolute right-0 top-full mt-1 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl z-50 py-1 min-w-35">
-                                <div className="px-2.5 py-1.5 text-[9px] text-neutral-600 uppercase tracking-wide font-semibold border-b border-neutral-800 mb-1">
-                                    Copy settings from
+    return (
+        <div className={`rounded-xl border overflow-hidden transition-all duration-200 ${
+            canDispatch
+                ? "border-neutral-700/70 shadow-sm shadow-black/20"
+                : "border-neutral-800/80"
+        }`}>
+            {/* ── Card Header ───────────────────────────────────────────────── */}
+            <div className={`flex items-center gap-0 transition-colors ${
+                canDispatch ? "bg-neutral-900/80" : "bg-neutral-900/50"
+            }`}>
+                {/* Ready indicator strip */}
+                <div className={`w-1 self-stretch shrink-0 rounded-l-xl transition-colors ${
+                    canDispatch ? "bg-violet-600/60" : "bg-neutral-800"
+                }`} />
+
+                <div className="flex-1 flex items-center gap-2.5 px-3 py-2.5 min-w-0">
+                    {/* Collapse toggle */}
+                    <button type="button" onClick={() => setExpanded((v) => !v)}
+                            className="flex items-center gap-1.5 shrink-0 group">
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                             className={`text-neutral-600 group-hover:text-neutral-400 transition-all duration-200 ${expanded ? "rotate-0" : "-rotate-90"}`}>
+                            <path d="M2 3.5l3 3 3-3" />
+                        </svg>
+                    </button>
+
+                    {/* Zone label — always visible */}
+                    <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-400 font-bold uppercase tracking-wider shrink-0">
+                        <svg width="7" height="7" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                            <rect x="1" y="1" width="6" height="6" rx="1" />
+                        </svg>
+                        Item {index + 1}
+                    </span>
+
+                    {/* Source → Output summary */}
+                    <div className="flex-1 flex items-center gap-1.5 min-w-0 overflow-hidden">
+                        {sourceFileName ? (
+                            <span className="text-[10px] font-mono text-neutral-300 truncate">{sourceFileName}</span>
+                        ) : (
+                            <span className="text-[10px] text-red-500/70 italic">no source set</span>
+                        )}
+                        {canDispatch && (
+                            <>
+                                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="text-neutral-700 shrink-0">
+                                    <path d="M2 5h6M5 2l3 3-3 3" />
+                                </svg>
+                                <span className="text-[10px] font-mono text-neutral-500 truncate">{outputFileName}</span>
+                            </>
+                        )}
+                    </div>
+
+                    {/* Status badges */}
+                    <div className="flex items-center gap-1.5 shrink-0">
+                        {canDispatch ? (
+                            <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-950/60 text-emerald-400 border border-emerald-800/50 font-medium">
+                                <span className="w-1 h-1 rounded-full bg-emerald-400" />
+                                ready
+                            </span>
+                        ) : (
+                            <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-full bg-neutral-800 text-neutral-600 border border-neutral-700/50">
+                                incomplete
+                            </span>
+                        )}
+                        {hasOverrides && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-950/60 text-amber-400 border border-amber-800/50 font-medium">
+                                {overriddenKeys.size} override{overriddenKeys.size !== 1 ? "s" : ""}
+                            </span>
+                        )}
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-0.5 shrink-0">
+                        {/* Copy from dropdown */}
+                        <div className="relative" ref={copyMenuRef}>
+                            <button type="button" onClick={() => setShowCopyMenu((v) => !v)}
+                                    title="Copy settings from template or another item"
+                                    className="flex items-center gap-1 px-2 py-1.5 rounded text-[10px] text-neutral-500 hover:text-violet-400 hover:bg-violet-950/30 transition-colors">
+                                <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                    <rect x="4" y="4" width="9" height="11" rx="1.5" />
+                                    <path d="M4 4V3a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-1" />
+                                </svg>
+                                <span className="hidden sm:inline">Copy from</span>
+                            </button>
+                            {showCopyMenu && (
+                                <div className="absolute right-0 top-full mt-1 bg-neutral-950 border border-neutral-700 rounded-xl shadow-2xl z-50 overflow-hidden min-w-52">
+                                    <div className="px-3 py-2 text-[9px] text-neutral-600 uppercase tracking-widest font-bold border-b border-neutral-800 bg-neutral-900/60">
+                                        Copy all settings from
+                                    </div>
+                                    {copyTargets.map((t) => (
+                                        <button key={`${t.kind}-${t.index}`} type="button"
+                                                onClick={() => {
+                                                    if (t.kind === "main") {
+                                                        onChange({ ...item, overrides: {} });
+                                                    } else {
+                                                        onCopyFrom(t.index);
+                                                    }
+                                                    setShowCopyMenu(false);
+                                                }}
+                                                className="w-full px-3 py-2.5 text-left text-xs hover:bg-neutral-800/80 transition-colors border-b border-neutral-800/50 last:border-0">
+                                            <div className="flex items-center gap-2">
+                                                {t.kind === "main" ? (
+                                                    <span className="w-5 h-5 rounded bg-violet-600/20 border border-violet-500/40 flex items-center justify-center shrink-0">
+                                                        <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor" className="text-violet-400">
+                                                            <circle cx="4" cy="4" r="2.5" />
+                                                        </svg>
+                                                    </span>
+                                                ) : (
+                                                    <span className="w-5 h-5 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center shrink-0 text-[8px] text-neutral-400 font-bold">
+                                                        {t.index + 1}
+                                                    </span>
+                                                )}
+                                                <div className="min-w-0">
+                                                    <div className={`font-semibold text-[11px] ${t.kind === "main" ? "text-violet-300" : "text-neutral-300"}`}>
+                                                        {t.label}
+                                                    </div>
+                                                    {t.kind === "main" && (
+                                                        <div className="text-[9px] text-neutral-600">Clears all overrides on this item</div>
+                                                    )}
+                                                    {t.kind === "item" && allItems[t.index]?.jsonFilePath && (
+                                                        <div className="text-[9px] text-neutral-600 font-mono truncate">
+                                                            {allItems[t.index].jsonFilePath.split(/[/\\]/).pop()}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </button>
+                                    ))}
                                 </div>
-                                {copyTargets.map((t) => (
-                                    <button key={t.index} type="button"
-                                            onClick={() => { onCopyFrom(t.index); setShowCopyMenu(false); }}
-                                            className="w-full px-2.5 py-1.5 text-left text-xs text-neutral-300 hover:bg-neutral-800 transition-colors">
-                                        {t.label}
-                                        {allItems[t.index]?.jsonFilePath && (
-                                            <span className="block text-[10px] text-neutral-600 font-mono truncate">
-                                                {allItems[t.index].jsonFilePath.split(/[/\\]/).pop()}
-                                            </span>
-                                        )}
-                                    </button>
+                            )}
+                        </div>
+
+                        <button type="button" onClick={onRemove} title="Remove item"
+                                className="w-6 h-6 flex items-center justify-center text-neutral-700 hover:text-red-400 rounded hover:bg-red-950/20 transition-colors">
+                            <svg width="9" height="9" viewBox="0 0 8 8" fill="none"><path d="M1 1l6 6M7 1L1 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            {/* ── Card Body (collapsible) ────────────────────────────────────── */}
+            {expanded && (
+                <div className="border-t border-neutral-800/60 bg-neutral-950/30">
+                    {/* ── Required fields ─────────────────────────────────────────── */}
+                    <div className="px-4 pt-3.5 pb-3 space-y-2.5">
+                        <div className="flex items-center gap-2 mb-2">
+                            <span className="flex items-center gap-1 text-[9px] font-bold text-neutral-400 uppercase tracking-widest">
+                                <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                                    <path d="M4 1v6M1 4h6" />
+                                </svg>
+                                Item {index + 1} — required
+                            </span>
+                            <div className="flex-1 border-t border-neutral-800/80" />
+                            <span className="text-[9px] text-neutral-700">unique per item</span>
+                        </div>
+
+                        <div>
+                            <FieldLabel>Chat source (.jsonl)</FieldLabel>
+                            <BrowseInput value={item.jsonFilePath} onChange={handleJsonPathChange}
+                                         onBrowse={handleSelectJsonl} placeholder="/path/to/chat.jsonl" browseLabel="Browse" />
+                        </div>
+                        <div>
+                            <FieldLabel>Output path</FieldLabel>
+                            <BrowseInput value={item.outputPath} onChange={handleOutputPathChange}
+                                         onBrowse={handleSelectOutput} placeholder="/path/to/output.mp4" browseLabel="Browse" />
+                        </div>
+                    </div>
+
+                    {/* ── Video overlay (item-exclusive) ───────────────────────────── */}
+                    <div className="px-4 pb-3 pt-2 border-t border-neutral-800/50 space-y-2.5">
+                        <div className="flex items-center gap-2 mb-2">
+                            <span className="flex items-center gap-1 text-[9px] font-bold text-neutral-500 uppercase tracking-widest">
+                                <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                                    <rect x="1" y="1" width="6" height="6" rx="1" />
+                                </svg>
+                                Item {index + 1} — video source
+                            </span>
+                            <div className="flex-1 border-t border-neutral-800/80" />
+                            <span className="text-[9px] text-orange-500/70">not inherited from template</span>
+                        </div>
+                        <Toggle value={item.useImmediatePipeOverlay} onChange={handlePipeModeToggle}
+                                label="Direct Pipe Mode (Video Overlay)"
+                                description="Overlay chat directly onto a base video. Each item has its own video source." />
+                        {item.useImmediatePipeOverlay && (
+                            <div>
+                                <FieldLabel>Base video</FieldLabel>
+                                <BrowseInput value={item.overlayVideoPath || ""} onChange={handleOverlayPathChange}
+                                             onBrowse={handleSelectOverlayVideo} onClear={handleClearOverlayPath}
+                                             placeholder="/path/to/stream.mp4" browseLabel="Browse" />
+                            </div>
+                        )}
+                    </div>
+
+                    {/* ── Canvas editor (when pipe mode + video set) ─────────────── */}
+                    {effectiveOpts.useImmediatePipeOverlay && !!effectiveOpts.overlayVideoPath && (
+                        <div className="px-4 pb-3 pt-2 border-t border-neutral-800/50">
+                            <p className="text-[10px] text-neutral-600 mb-2">
+                                Canvas editor — overlays inherited from shared settings. Changes here create per-item overrides.
+                            </p>
+                            {videoLoading ? (
+                                <div className="w-full h-28 rounded-lg bg-neutral-900/60 border border-neutral-700/50 flex flex-col items-center justify-center gap-2 text-neutral-500">
+                                    <span className="w-4 h-4 border-2 border-neutral-700 border-t-indigo-500 rounded-full animate-spin" />
+                                    <span className="text-[10px]">Loading video…</span>
+                                </div>
+                            ) : (
+                                <CanvasEditor
+                                    bgWidth={bgWidth}
+                                    bgHeight={bgHeight}
+                                    videoMeta={videoMeta ?? null}
+                                    isOverlayMode={isOverlayMode}
+                                    shapeOverlays={effectiveOpts.shapeOverlays}
+                                    imageOverlays={effectiveOpts.imageOverlays}
+                                    chatX={effectiveOpts.overlayX ?? 0}
+                                    chatY={effectiveOpts.overlayY ?? 0}
+                                    chatW={effectiveOpts.overlayWidth ?? effectiveOpts.width}
+                                    chatH={effectiveOpts.overlayHeight ?? effectiveOpts.height}
+                                    onChatChange={handleItemChatChange}
+                                    onShapeChange={handleItemShapeChange}
+                                    onImageChange={handleItemImageChange}
+                                    onShapeAdd={handleItemShapeAdd}
+                                    onShapeRemove={handleItemShapeRemove}
+                                    onImageAdd={handleItemImageAdd}
+                                    onImageRemove={handleItemImageRemove}
+                                    onImageBrowse={handleItemImageBrowse}
+                                />
+                            )}
+                        </div>
+                    )}
+
+
+                    {/* ── Render settings override zone ────────────────────────────── */}
+                    <div className="border-t border-neutral-800/50">
+                        <button type="button" onClick={() => setShowOverrides((v) => !v)}
+                                className="w-full flex items-center gap-2 px-4 py-2.5 group hover:bg-neutral-900/40 transition-colors">
+                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                                 className={`text-neutral-600 group-hover:text-neutral-400 transition-transform duration-150 shrink-0 ${showOverrides ? "rotate-0" : "-rotate-90"}`}>
+                                <path d="M2 3.5l3 3 3-3" />
+                            </svg>
+
+                            {/* Context badge — always visible, always unambiguous */}
+                            {!hasOverrides ? (
+                                <span className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-neutral-600">
+                                    <span className="px-1.5 py-0.5 rounded bg-violet-950/60 text-violet-400/70 border border-violet-800/40">
+                                        Template
+                                    </span>
+                                    Render settings — all from shared template
+                                </span>
+                            ) : (
+                                <span className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-amber-400">
+                                    <span className="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-400">
+                                        Item {index + 1}
+                                    </span>
+                                    {overriddenKeys.size} override{overriddenKeys.size !== 1 ? "s" : ""} — rest from template
+                                </span>
+                            )}
+
+                            {hasOverrides && (
+                                <button type="button" onClick={resetAllOverrides}
+                                        className="ml-auto text-[9px] text-neutral-600 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded hover:bg-red-950/20 shrink-0 font-normal normal-case tracking-normal">
+                                    ↺ Reset all to template
+                                </button>
+                            )}
+                        </button>
+
+                        {/* Collapsed: show override pills */}
+                        {!showOverrides && hasOverrides && (
+                            <div className="flex flex-wrap gap-1 px-4 pb-3">
+                                {Array.from(overriddenKeys).map((k) => (
+                                    <InheritBadge key={k} label={k} isOverridden onReset={() => resetOverride(k)} />
                                 ))}
                             </div>
                         )}
-                    </div>
-                )}
 
-                {hasOverrides && (
-                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 border border-amber-700/40 shrink-0">
-                        {overriddenKeys.size} override{overriddenKeys.size !== 1 ? "s" : ""}
-                    </span>
-                )}
-                <button type="button" onClick={onRemove} title="Remove item"
-                        className="w-5 h-5 flex items-center justify-center text-neutral-600 hover:text-red-400 rounded transition-colors shrink-0">
-                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M1 1l6 6M7 1L1 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
-                </button>
-            </div>
+                        {/* Collapsed + clean: brief confirmation */}
+                        {!showOverrides && !hasOverrides && (
+                            <p className="text-[10px] text-neutral-700 px-4 pb-3">
+                                Canvas, background, typography, colors, quality — all from the shared template above.
+                            </p>
+                        )}
 
-            <div className="px-3 py-3 space-y-3 border-t border-neutral-800/60">
-                {/* Source + output */}
-                <div className="space-y-2.5">
-                    <div>
-                        <FieldLabel>Chat source (.jsonl)</FieldLabel>
-                        <BrowseInput value={item.jsonFilePath} onChange={handleJsonPathChange} onBrowse={handleSelectJsonl} placeholder="/path/to/chat.jsonl" browseLabel="Browse" />
-                    </div>
-                    <div>
-                        <FieldLabel>Output path</FieldLabel>
-                        <BrowseInput value={item.outputPath} onChange={handleOutputPathChange} onBrowse={handleSelectOutput} placeholder="/path/to/output.mp4" browseLabel="Browse" />
-                    </div>
-                </div>
-
-                {/* Per-item overlay video */}
-                <div className="pt-2 border-t border-neutral-800/40 space-y-3">
-                    <Toggle value={item.useImmediatePipeOverlay} onChange={handlePipeModeToggle}
-                            label="Direct Pipe Mode (Video Overlay)" description="Enables direct zero-copy video overlay functionality." />
-
-                    {item.useImmediatePipeOverlay && (
-                        <div>
-                            <FieldLabel>Video overlay — item-specific (not inherited)</FieldLabel>
-                            <BrowseInput value={item.overlayVideoPath || ""} onChange={handleOverlayPathChange}
-                                         onBrowse={handleSelectOverlayVideo} onClear={handleClearOverlayPath}
-                                         placeholder="/path/to/stream.mp4 (optional)" browseLabel="Browse" />
-                        </div>
-                    )}
-                </div>
-
-                {/* Canvas editor */}
-                {effectiveOpts.useImmediatePipeOverlay && !!effectiveOpts.overlayVideoPath && (
-                    <div className="pt-1 border-t border-neutral-800/40">
-                        <p className="text-[10px] text-neutral-600 mb-2 mt-2">
-                            Canvas editor — shape/image overlays are inherited from shared settings. Drag to reposition, click to select &amp; edit. Changes here create per-item overrides.
-                        </p>
-                        {videoLoading ? (
-                            <div className="w-full h-28 rounded-lg bg-neutral-900/60 border border-neutral-700/50 flex flex-col items-center justify-center gap-2 text-neutral-500">
-                                <span className="w-4 h-4 border-2 border-neutral-700 border-t-indigo-500 rounded-full animate-spin" />
-                                <span className="text-[10px]">Loading video…</span>
+                        {/* Expanded: full settings panel with edit context banner */}
+                        {showOverrides && (
+                            <div className="border-t border-neutral-800/50">
+                                {/* Sticky context banner so you never forget what you're editing */}
+                                <div className="flex items-center gap-2 px-4 py-2 bg-neutral-900 border-b border-neutral-800 sticky top-0 z-10">
+                                    <span className="text-[9px] font-bold uppercase tracking-widest text-neutral-600">Editing</span>
+                                    <span className="flex items-center gap-1 text-[9px] px-2 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-300 font-bold">
+                                        <svg width="7" height="7" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                                            <rect x="1" y="1" width="6" height="6" rx="1" />
+                                        </svg>
+                                        Item {index + 1} overrides
+                                    </span>
+                                    <span className="text-[9px] text-neutral-700">
+                                        — changes here only affect this item
+                                    </span>
+                                    <div className="ml-auto flex items-center gap-1">
+                                        <span className="text-[9px] text-neutral-700">Base:</span>
+                                        <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-violet-950/50 border border-violet-800/40 text-violet-400 font-bold">
+                                            <svg width="6" height="6" viewBox="0 0 8 8" fill="currentColor" className="text-violet-400">
+                                                <circle cx="4" cy="4" r="3" />
+                                            </svg>
+                                            Shared template
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="px-4 py-4 space-y-4">
+                                    <SettingsPanel
+                                        opts={effectiveOpts}
+                                        setOpt={setOverride}
+                                        setOpts={setOverrides}
+                                        overriddenKeys={overriddenKeys}
+                                        onResetKey={resetOverride}
+                                        isBatchItem={true}
+                                    />
+                                </div>
                             </div>
-                        ) : (
-                            <CanvasEditor
-                                bgWidth={bgWidth}
-                                bgHeight={bgHeight}
-                                videoMeta={videoMeta ?? null}
-                                isOverlayMode={isOverlayMode}
-                                shapeOverlays={effectiveOpts.shapeOverlays}
-                                imageOverlays={effectiveOpts.imageOverlays}
-                                chatX={effectiveOpts.overlayX ?? 0}
-                                chatY={effectiveOpts.overlayY ?? 0}
-                                chatW={effectiveOpts.overlayWidth ?? effectiveOpts.width}
-                                chatH={effectiveOpts.overlayHeight ?? effectiveOpts.height}
-                                onChatChange={handleItemChatChange}
-                                onShapeChange={handleItemShapeChange}
-                                onImageChange={handleItemImageChange}
-                                onShapeAdd={handleItemShapeAdd}
-                                onShapeRemove={handleItemShapeRemove}
-                                onImageAdd={handleItemImageAdd}
-                                onImageRemove={handleItemImageRemove}
-                                onImageBrowse={handleItemImageBrowse}
-                            />
                         )}
                     </div>
-                )}
-
-                {/* Settings overrides */}
-                <div className="pt-1 border-t border-neutral-800/40">
-                    <button type="button" onClick={() => setShowOverrides((v) => !v)}
-                            className="w-full flex items-center justify-between py-1.5">
-                        <span className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wide flex items-center gap-1.5">
-                            Override render settings
-                            {hasOverrides && (
-                                <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-900/40 text-amber-400 border border-amber-700/30 normal-case font-normal tracking-normal">
-                                    {overriddenKeys.size} active
-                                </span>
-                            )}
-                        </span>
-                        <div className="flex items-center gap-2">
-                            {hasOverrides && (
-                                <button type="button" onClick={resetAllOverrides}
-                                        className="text-[9px] text-neutral-600 hover:text-red-400 transition-colors">
-                                    Reset all
-                                </button>
-                            )}
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
-                                 className={`text-neutral-600 transition-transform duration-150 ${showOverrides ? "rotate-180" : ""}`}>
-                                <path d="M2 3.5l3 3 3-3" />
-                            </svg>
-                        </div>
-                    </button>
-                    {!showOverrides && !hasOverrides && <p className="text-[10px] text-neutral-700 pb-1">All settings inherited from main — expand to override any.</p>}
-                    {!showOverrides && hasOverrides && (
-                        <div className="flex flex-wrap gap-1 pb-1">
-                            {Array.from(overriddenKeys).map((k) => (
-                                <span key={k} className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700">
-                                    {k}
-                                    <button type="button" onClick={() => resetOverride(k)} className="text-neutral-600 hover:text-red-400 leading-none">×</button>
-                                </span>
-                            ))}
-                        </div>
-                    )}
-                    {showOverrides && (
-                        <div className="space-y-4 pt-2">
-                            <SettingsPanel
-                                opts={effectiveOpts}
-                                setOpt={setOverride}
-                                setOpts={setOverrides}
-                                overriddenKeys={overriddenKeys}
-                                onResetKey={resetOverride}
-                                isBatchItem={true}
-                            />
-                        </div>
-                    )}
                 </div>
-            </div>
+            )}
         </div>
     );
 }
@@ -1638,7 +1896,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
         onUpdate({ renderOptions: { ...opts, ...patch } });
     }, [onUpdate, opts]);
 
-    const { meta: videoMeta, loading: videoLoading } = useVideoMeta(opts.useImmediatePipeOverlay ? opts.overlayVideoPath : undefined);
+    const { meta: videoMeta, loading: videoLoading, error: videoError } = useVideoMeta(opts.useImmediatePipeOverlay ? opts.overlayVideoPath : undefined);
 
     const [isDispatching, setIsDispatching] = useState(false);
     const [dispatchError, setDispatchError] = useState<string | null>(null);
@@ -1654,7 +1912,9 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
         try {
             const sel = await open({ multiple: false, directory: true });
             if (typeof sel === "string") {
-                const sep = sel.includes("\\") ? "\\" : "/";
+                // Derive separator from the path rather than guessing platform —
+                // backslashes are valid in macOS filenames so sniffing is unreliable.
+                const sep = sel.includes("\\") && !sel.includes("/") ? "\\" : "/";
                 setOpt("outputPath", sel.endsWith(sep) ? `${sel}output.mp4` : `${sel}${sep}output.mp4`);
             }
         } catch {}
@@ -1694,28 +1954,62 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
 
     const handleBatchDispatch = useCallback(async () => {
         if (readyBatchItems.length === 0 || batchDispatching) return;
-        setBatchDispatching(true); setBatchDispatchError(null);
+        setBatchDispatching(true);
+        setBatchDispatchError(null);
         try {
-            for (const item of readyBatchItems) {
-                const taskId = crypto.randomUUID();
-                const effectiveOpts = resolveItemOpts(opts, item);
-                await invoke("queue_chat_render", { id: taskId, jsonFilePath: item.jsonFilePath, options: effectiveOpts });
-                registerTaskSnapshot({ tabId: tab.id, taskId, url: tab.url, jsonFilePath: item.jsonFilePath, vodOptions: tab.vodOptions, chatOptions: tab.chatOptions, renderOptions: effectiveOpts });
-                onUpdate({ activeTaskId: taskId });
-            }
+            // Build the payload for the single atomic backend call.
+            // Each item gets its effective opts resolved against main before sending.
+            const batchPayload = readyBatchItems.map((item) => ({
+                id: crypto.randomUUID(),
+                jsonFilePath: item.jsonFilePath,
+                options: resolveItemOpts(opts, item),
+            }));
+
+            // Single invoke — backend handles semaphore throttling and ordering.
+            // Returns the task IDs in the same order as the input items.
+            const taskIds = await invoke<string[]>("queue_batch_chat_render", {
+                items: batchPayload,
+            });
+
+            // Register snapshots so "Return to workspace" works from QueueRow.
+            taskIds.forEach((taskId, i) => {
+                const item = batchPayload[i];
+                if (!item) return;
+                registerTaskSnapshot({
+                    tabId: tab.id,
+                    taskId,
+                    url: tab.url,
+                    jsonFilePath: item.jsonFilePath,
+                    vodOptions: tab.vodOptions,
+                    chatOptions: tab.chatOptions,
+                    renderOptions: item.options,
+                    downloadMode: tab.downloadMode,
+                    metadata: tab.metadata,
+                });
+            });
+
+            // Track the last task ID on the tab (mirrors single-render behaviour)
+            const lastId = taskIds[taskIds.length - 1];
+            if (lastId) onUpdate({ activeTaskId: lastId });
+
             navigate({ to: "/queue" });
-        } catch (e) { setBatchDispatchError(e instanceof Error ? e.message : String(e)); }
-        finally { setBatchDispatching(false); }
+        } catch (e) {
+            setBatchDispatchError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBatchDispatching(false);
+        }
     }, [readyBatchItems, batchDispatching, opts, tab, navigate, onUpdate, registerTaskSnapshot]);
 
     return (
         <div className="space-y-5 pb-4">
-            {/* Mode toggle */}
+            {/* ── Mode toggle ──────────────────────────────────────────────────── */}
             <div className="flex items-center gap-1 p-0.5 bg-neutral-900 border border-neutral-800 rounded-lg w-fit">
                 {(["single", "batch"] as const).map((m) => (
                     <button key={m} type="button" onClick={() => setMode(m)}
                             className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${
-                                mode === m ? "bg-violet-600 text-white shadow-sm shadow-violet-900/50" : "text-neutral-500 hover:text-neutral-300"
+                                mode === m
+                                    ? "bg-violet-600 text-white shadow-sm shadow-violet-900/50"
+                                    : "text-neutral-500 hover:text-neutral-300"
                             }`}>
                         {m === "single" ? "Single render" : "Batch render"}
                     </button>
@@ -1728,11 +2022,13 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                     <Section title="Source & Output">
                         <div>
                             <FieldLabel>Chat source (.jsonl)</FieldLabel>
-                            <BrowseInput value={tab.jsonFilePath ?? ""} onChange={(v) => onUpdate({ jsonFilePath: v })} onBrowse={handleSelectJsonl} placeholder="/path/to/chat.jsonl" browseLabel="Browse" />
+                            <BrowseInput value={tab.jsonFilePath ?? ""} onChange={(v) => onUpdate({ jsonFilePath: v })}
+                                         onBrowse={handleSelectJsonl} placeholder="/path/to/chat.jsonl" browseLabel="Browse" />
                         </div>
                         <div>
                             <FieldLabel>Output path</FieldLabel>
-                            <BrowseInput value={opts.outputPath} onChange={(v) => setOpt("outputPath", v)} onBrowse={handleSelectOutput} placeholder="/path/to/output.mp4" browseLabel="Browse" />
+                            <BrowseInput value={opts.outputPath} onChange={(v) => setOpt("outputPath", v)}
+                                         onBrowse={handleSelectOutput} placeholder="/path/to/output.mp4" browseLabel="Browse" />
                         </div>
                     </Section>
 
@@ -1743,6 +2039,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                         onSetOverlayVideoPath={handleSetOverlayVideoPath}
                         videoMeta={videoMeta}
                         videoLoading={videoLoading}
+                        videoError={videoError}
                     />
 
                     {dispatchError && (
@@ -1755,10 +2052,15 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                     )}
                     <button type="button" onClick={handleDispatch} disabled={!canDispatch}
                             className={`w-full py-3 text-sm font-bold rounded-xl transition-all tracking-wide ${
-                                canDispatch ? "bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-900/40 active:scale-[0.99]" : "bg-neutral-800 text-neutral-600 cursor-not-allowed"
+                                canDispatch
+                                    ? "bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-900/40 active:scale-[0.99]"
+                                    : "bg-neutral-800 text-neutral-600 cursor-not-allowed"
                             }`}>
                         {isDispatching
-                            ? <span className="flex items-center justify-center gap-2"><span className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-white/80 rounded-full animate-spin" />Queuing…</span>
+                            ? <span className="flex items-center justify-center gap-2">
+                                <span className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-white/80 rounded-full animate-spin" />
+                                Queuing…
+                              </span>
                             : "Queue Render"}
                     </button>
                 </>
@@ -1767,72 +2069,155 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
             {/* ── BATCH ────────────────────────────────────────────────────────── */}
             {mode === "batch" && (
                 <>
-                    <div className="flex items-start gap-2.5 px-3 py-2.5 bg-violet-950/25 border border-violet-800/30 rounded-lg">
-                        <svg className="shrink-0 mt-0.5 text-violet-400" width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
-                            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4h1.5v5h-1.5V5zm0 6h1.5v1.5h-1.5V11z" />
-                        </svg>
-                        <p className="text-[11px] text-violet-300/80 leading-relaxed">
-                            <strong className="font-semibold">Batch mode:</strong> set shared render settings below — all items inherit them automatically. Each item only needs a source and output. Shape/image overlays and their positions are also inherited; drag them in any item's canvas to create a per-item override.
-                        </p>
+                    {/* ═══════════════════════════════════════════════════════════════
+                        ZONE 1 — SHARED TEMPLATE
+                        Anything you set here applies to EVERY item by default.
+                        Items only need a source file + output path.
+                    ═══════════════════════════════════════════════════════════════ */}
+                    <div className="rounded-xl border-2 border-violet-700/40 overflow-hidden shadow-lg shadow-violet-900/10">
+                        {/* Unmissable zone header */}
+                        <div className="flex items-center gap-3 px-4 py-2.5 bg-violet-950/40 border-b border-violet-800/40">
+                            <div className="flex items-center gap-2 flex-1 min-w-0">
+                                <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-violet-600 text-white text-[10px] font-bold tracking-wider uppercase shrink-0">
+                                    <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor">
+                                        <circle cx="4" cy="4" r="3" />
+                                    </svg>
+                                    Shared template
+                                </span>
+                                <span className="text-[10px] text-violet-300/60">
+                                    Applies to every item below unless overridden per-item
+                                </span>
+                            </div>
+                            <span className="text-[9px] text-violet-500 font-mono shrink-0">
+                                {batchItems.length} item{batchItems.length !== 1 ? "s" : ""} inherit this
+                            </span>
+                        </div>
+                        {/* Settings body */}
+                        <div className="px-4 py-4 bg-neutral-950/20">
+                            <SettingsPanel
+                                opts={opts} setOpt={setOpt} setOpts={setOpts}
+                                isBatchItem={false}
+                            />
+                        </div>
                     </div>
 
-                    {/* Items */}
-                    <div className="space-y-2">
+                    {/* ═══════════════════════════════════════════════════════════════
+                        ZONE 2 — RENDER ITEMS
+                        Each item = one output file. Set its source (.jsonl) and
+                        output path. All other settings come from the template above
+                        unless you explicitly override them inside the item.
+                    ═══════════════════════════════════════════════════════════════ */}
+                    <div className="space-y-2.5">
+                        {/* Zone header */}
                         <div className="flex items-center justify-between">
-                            <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-[0.15em]">
-                                Render items <span className="text-neutral-700">({batchItems.length})</span>
-                            </h3>
-                            {readyBatchItems.length > 0 && (
-                                <span className="text-[10px] text-emerald-500 font-medium">{readyBatchItems.length}/{batchItems.length} ready</span>
+                            <div className="flex items-center gap-2">
+                                <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-bold tracking-wider uppercase">
+                                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                                        <rect x="1" y="1" width="6" height="6" rx="1" />
+                                    </svg>
+                                    Render items
+                                </span>
+                                <span className="text-[10px] text-neutral-600">
+                                    {batchItems.length} total
+                                    {readyBatchItems.length > 0 && (
+                                        <> · <span className="text-emerald-500 font-medium">{readyBatchItems.length} ready</span></>
+                                    )}
+                                </span>
+                            </div>
+                            {batchItems.length > 1 && (
+                                <span className="text-[9px] text-neutral-700">
+                                    Run order: top → bottom (backend-throttled)
+                                </span>
                             )}
                         </div>
-                        {batchItems.map((item, index) => (
-                            <BatchItemPanel key={item.id} item={item} index={index} mainOpts={opts} allItems={batchItems}
-                                            onChange={(updated) => updateBatchItem(item.id, updated)}
-                                            onRemove={() => removeBatchItem(item.id)}
-                                            onCopyFrom={(si) => copySettingsFromItem(item.id, si)}
-                            />
-                        ))}
-                        <button type="button" onClick={addBatchItem}
-                                className="w-full py-2.5 border border-dashed border-neutral-700 hover:border-violet-500/50 rounded-xl text-xs text-neutral-600 hover:text-violet-400 transition-all flex items-center justify-center gap-1.5">
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M5 1v8M1 5h8" /></svg>
-                            Add render item
-                        </button>
+
+                        {/* Item cards */}
+                        <div className="space-y-2">
+                            {batchItems.map((item, index) => (
+                                <BatchItemPanel
+                                    key={item.id}
+                                    item={item}
+                                    index={index}
+                                    mainOpts={opts}
+                                    allItems={batchItems}
+                                    onChange={(updated) => updateBatchItem(item.id, updated)}
+                                    onRemove={() => removeBatchItem(item.id)}
+                                    onCopyFrom={(si) => copySettingsFromItem(item.id, si)}
+                                />
+                            ))}
+
+                            {/* Add item */}
+                            <button type="button" onClick={addBatchItem}
+                                    className="w-full py-3 border border-dashed border-neutral-800 hover:border-violet-600/50 rounded-xl text-xs text-neutral-600 hover:text-violet-400 transition-all flex items-center justify-center gap-2 group">
+                                <span className="w-5 h-5 rounded-full border border-dashed border-current flex items-center justify-center">
+                                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                                        <path d="M4 1v6M1 4h6" />
+                                    </svg>
+                                </span>
+                                Add render item
+                                <span className="text-[9px] text-neutral-700 group-hover:text-violet-600/60 transition-colors">
+                                    — inherits shared template
+                                </span>
+                            </button>
+                        </div>
                     </div>
 
-                    {/* Shared settings */}
-                    <div className="pt-2 border-t border-neutral-800">
-                        <div className="flex items-center gap-2 mb-4">
-                            <h3 className="text-[10px] font-bold text-neutral-500 uppercase tracking-[0.15em]">Shared render settings</h3>
-                            <span className="text-[9px] text-neutral-700">inherited by all items unless overridden</span>
-                        </div>
-                        <SettingsPanel
-                            opts={opts} setOpt={setOpt} setOpts={setOpts}
-                            isBatchItem={false}
-                        />
-                    </div>
+                    {/* ── Dispatch footer ───────────────────────────────────────── */}
+                    <div className="space-y-2">
+                        {batchDispatchError && (
+                            <div className="flex items-start gap-2 px-3 py-2.5 bg-red-950/40 border border-red-800/50 rounded-lg text-xs text-red-400">
+                                <svg className="shrink-0 mt-0.5" width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                                    <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4h1.5v5h-1.5V5zm0 6h1.5v1.5h-1.5V11z" />
+                                </svg>
+                                <span><strong className="font-semibold">Batch dispatch failed: </strong>{batchDispatchError}</span>
+                            </div>
+                        )}
 
-                    {batchDispatchError && (
-                        <div className="flex items-start gap-2 px-3 py-2.5 bg-red-950/40 border border-red-800/50 rounded-lg text-xs text-red-400">
-                            <svg className="shrink-0 mt-0.5" width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-                                <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4h1.5v5h-1.5V5zm0 6h1.5v1.5h-1.5V11z" />
-                            </svg>
-                            <span><strong className="font-semibold">Batch dispatch failed: </strong>{batchDispatchError}</span>
-                        </div>
-                    )}
-                    <button type="button" onClick={handleBatchDispatch} disabled={readyBatchItems.length === 0 || batchDispatching}
+                        {/* Summary + queue button */}
+                        {batchItems.length > 0 && (
+                            <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/60 border border-neutral-800 rounded-lg text-[10px]">
+                                <span className={`flex items-center gap-1.5 font-medium ${readyBatchItems.length > 0 ? "text-emerald-400" : "text-neutral-600"}`}>
+                                    <span className={`w-1.5 h-1.5 rounded-full ${readyBatchItems.length > 0 ? "bg-emerald-400" : "bg-neutral-700"}`} />
+                                    {readyBatchItems.length} ready
+                                </span>
+                                {batchItems.length - readyBatchItems.length > 0 && (
+                                    <span className="flex items-center gap-1.5 text-neutral-600">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-neutral-700" />
+                                        {batchItems.length - readyBatchItems.length} need source + output
+                                    </span>
+                                )}
+                                <span className="ml-auto text-neutral-700">
+                                    Renders throttled by backend · max 1–2 simultaneous
+                                </span>
+                            </div>
+                        )}
+
+                        <button
+                            type="button"
+                            onClick={handleBatchDispatch}
+                            disabled={readyBatchItems.length === 0 || batchDispatching}
                             className={`w-full py-3 text-sm font-bold rounded-xl transition-all tracking-wide ${
                                 readyBatchItems.length > 0 && !batchDispatching
                                     ? "bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-900/40 active:scale-[0.99]"
                                     : "bg-neutral-800 text-neutral-600 cursor-not-allowed"
                             }`}>
-                        {batchDispatching
-                            ? <span className="flex items-center justify-center gap-2"><span className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-white/80 rounded-full animate-spin" />Queuing batch…</span>
-                            : readyBatchItems.length === 0
-                                ? "Add at least one item with source + output"
-                                : `Queue ${readyBatchItems.length} render${readyBatchItems.length !== 1 ? "s" : ""}`
-                        }
-                    </button>
+                            {batchDispatching ? (
+                                <span className="flex items-center justify-center gap-2">
+                                    <span className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-white/80 rounded-full animate-spin" />
+                                    Sending {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""} to backend…
+                                </span>
+                            ) : readyBatchItems.length === 0 ? (
+                                "Set a source + output on at least one item"
+                            ) : (
+                                <span className="flex items-center justify-center gap-2">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M3 8h10M8 3l5 5-5 5" />
+                                    </svg>
+                                    Queue {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""}
+                                </span>
+                            )}
+                        </button>
+                    </div>
                 </>
             )}
         </div>

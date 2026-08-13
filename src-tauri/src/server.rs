@@ -13,12 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex as TokioMutex;
-use tokio_stream::wrappers::ReceiverStream;
 
-use crate::core::fetcher::analyze_url_core;
-use crate::core::manager::manager::{AppTask, FrontendChatOptions, FrontendVodOptions};
-use crate::core::{RenderVideoArgs, TaskManager};
+use crate::core::{analyze_url_core, AppTask, FrontendChatOptions, FrontendVodOptions, QueueSettings, RenderVideoArgs, TaskManager};
 use stream_extractor::StreamClient;
+use tokio::sync::broadcast::error::RecvError;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -70,6 +68,10 @@ impl ServerController {
                 .route("/api/vod/download", post(trigger_video_download))
                 .route("/api/chat/download", post(trigger_chat_download))
                 .route("/api/chat/render", post(trigger_chat_render))
+                .route(
+                    "/api/settings/queue",
+                    get(get_queue_settings_handler).post(update_queue_settings_handler),
+                )
                 .with_state(state);
 
             match tokio::net::TcpListener::bind("127.0.0.1:61423").await {
@@ -82,7 +84,7 @@ impl ServerController {
                         })
                         .await
                     {
-                        log::error!("API Server encountered an error: {}", e);
+                        log::error!("API Server error: {}", e);
                     }
                 }
                 Err(e) => {
@@ -112,13 +114,9 @@ async fn health_check() -> impl axum::response::IntoResponse {
     )
 }
 
-// ==========================================
-// TAURI COMMANDS
-// ==========================================
-
 #[tauri::command]
 pub async fn start_api_server(
-    app_handle: tauri::AppHandle,
+    app_handle: AppHandle,
     manager: tauri::State<'_, TaskManager>,
     client: tauri::State<'_, StreamClient>,
     controller: tauri::State<'_, ServerController>,
@@ -136,10 +134,6 @@ pub async fn stop_api_server(
     controller.stop().await?;
     Ok("API Server stopped".to_string())
 }
-
-// ==========================================
-// AXUM ENDPOINTS
-// ==========================================
 
 async fn get_tasks(State(state): State<ServerState>) -> Json<Vec<AppTask>> {
     Json(state.manager.get_tasks())
@@ -170,18 +164,41 @@ async fn stream_task_events(
     State(state): State<ServerState>,
 ) -> Sse<impl FuturesStream<Item = Result<Event, Infallible>>> {
     let rx = state.manager.subscribe_events();
-    let stream = ReceiverStream::new(rx).map(|task| {
-        Ok(Event::default()
-            .json_data(&task)
-            .unwrap_or_else(|_| Event::default().comment("serialization error")))
-    });
+
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(task) => return Some((task, rx)),
+                Err(RecvError::Lagged(_)) => continue, // Automatically skip lagged frames
+                Err(RecvError::Closed) => return None,  // Channel closed, terminate stream
+            }
+        }
+    })
+        .map(|task| {
+            Ok(Event::default()
+                .json_data(&task)
+                .unwrap_or_else(|_| Event::default().comment("serialization error")))
+        });
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
-// ==========================================
-// NEW ANALYZE & DOWNLOAD HANDLERS
-// ==========================================
+async fn get_queue_settings_handler(
+    State(state): State<ServerState>,
+) -> Json<QueueSettings> {
+    Json(state.manager.get_settings())
+}
+
+async fn update_queue_settings_handler(
+    State(state): State<ServerState>,
+    Json(payload): Json<QueueSettings>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    state
+        .manager
+        .apply_settings(payload)
+        .map(|_| Json("Settings updated successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
 
 #[derive(Deserialize)]
 pub struct AnalyzeReq {
@@ -230,8 +247,8 @@ async fn trigger_video_download(
             &state.stream_client,
             &cache,
         )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     let task_id = state.manager.enqueue_vod_download(
@@ -274,8 +291,8 @@ async fn trigger_chat_download(
             &state.stream_client,
             &cache,
         )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     let stream_metadata = meta.stream_metadata.ok_or_else(|| {

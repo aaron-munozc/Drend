@@ -74,12 +74,14 @@ export function useQueueManager() {
 		async (taskId: string) => {
 			try {
 				await invoke("cancel_task", { taskId });
-				// Optimistically mark as cancelled immediately so UI responds
-				upsertTask(
-					// We don't know the full task shape here, so just patch status
-					// The backend will emit a proper update shortly
-					{ ...tasks.find((t) => t.taskId === taskId)!, status: "cancelled" },
-				);
+				// Optimistically mark as cancelled immediately so UI responds.
+				// Guard against the task already being removed from state (race with
+				// an incoming task-progress event) — the backend will emit the
+				// authoritative update shortly either way.
+				const existing = tasks.find((t) => t.taskId === taskId);
+				if (existing) {
+					upsertTask({ ...existing, status: "cancelled" });
+				}
 			} catch (e) {
 				console.error("Failed to cancel task:", e);
 			}

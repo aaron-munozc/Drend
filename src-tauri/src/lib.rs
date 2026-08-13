@@ -1,5 +1,10 @@
 use crate::core::{
-    analyze_url, get_download_queue, queue_chat_download, queue_chat_render, queue_vod_download, cancel_task
+    analyze_url, get_download_queue,
+    queue_chat_download, queue_chat_render,
+    queue_vod_download, cancel_task,
+    update_queue_settings,
+    get_queue_settings,
+    queue_batch_chat_render,
 };
 use crate::types::Metadata;
 use lru::LruCache;
@@ -185,6 +190,9 @@ pub fn run() {
             queue_chat_render,
             get_download_queue,
             cancel_task,
+            update_queue_settings,
+            get_queue_settings,
+            queue_batch_chat_render,
             tools::check_ytdlp,
             tools::install_ytdlp,
             tools::check_ffmpeg,
