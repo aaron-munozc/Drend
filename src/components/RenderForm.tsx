@@ -1384,7 +1384,7 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
     const copyMenuRef = useRef<HTMLDivElement>(null);
 
     const effectiveOpts = useMemo(() => resolveItemOpts(mainOpts, item), [mainOpts, item]);
-    const { meta: videoMeta, loading: videoLoading, error: videoError } = useVideoMeta(effectiveOpts.useImmediatePipeOverlay ? (item.overlayVideoPath || undefined) : undefined);
+    const { meta: videoMeta, loading: videoLoading} = useVideoMeta(effectiveOpts.useImmediatePipeOverlay ? (item.overlayVideoPath || undefined) : undefined);
 
     useEffect(() => {
         if (!showCopyMenu) return;

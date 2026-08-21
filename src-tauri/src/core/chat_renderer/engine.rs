@@ -29,6 +29,21 @@ use crate::core::chat_renderer::types::{
 use crate::error::AppError;
 use crate::types::AppResult;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+fn hidden_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1178,7 +1193,7 @@ fn probe_video_frames(path: &str, fps: u32) -> Option<u32> {
     // Helper: run ffprobe with the given show_entries arg and return the
     // first non-empty line of stdout as an f64.
     let try_probe = |show_entries: &str| -> Option<f64> {
-        let out = Command::new("ffprobe")
+        let out = hidden_command("ffprobe")
             .args([
                 "-v", "error",
                 "-select_streams", "v:0",
@@ -1217,7 +1232,7 @@ fn probe_video_frames(path: &str, fps: u32) -> Option<u32> {
 /// the absolute fastest encode, consider lowering `fps` or `quality_preset`
 /// rather than relying on NVENC.
 fn probe_nvenc() -> bool {
-    Command::new("ffmpeg")
+    hidden_command("ffmpeg")
         .args(["-h", "encoder=h264_nvenc"])
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("h264_nvenc"))
@@ -1706,7 +1721,7 @@ pub async fn process_chat_render(
     };
 
     // ── Spawn FFmpeg ──────────────────────────────────────────────────────────
-    let mut ffmpeg_child = Command::new("ffmpeg")
+    let mut ffmpeg_child = hidden_command("ffmpeg")
         .args(&ffmpeg_args)
         .stdin(Stdio::piped())
         // Capture stderr so FFmpeg errors surface instead of being silently
