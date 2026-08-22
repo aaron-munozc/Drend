@@ -1,4 +1,3 @@
-
 /**
  * RenderForm.tsx
  */
@@ -122,42 +121,119 @@ function joinPath(directory: string, fileName: string) {
 }
 
 function globToRegExp(glob: string) {
-    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`^${escaped.replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
+    // Glob matcher intentionally stays path-agnostic: users can target the
+    // filename, stem, or extension without needing to know our internal key.
+    // Supported syntax: * (any chars), ? (one char), [] (character classes),
+    // and {a,b} (simple alternatives). Everything else is treated literally.
+    let out = "^";
+    for (let i = 0; i < glob.length; i += 1) {
+        const ch = glob[i];
+
+        if (ch === "*") {
+            if (glob[i + 1] === "*") {
+                i += 1;
+                out += ".*";
+            } else {
+                out += ".*";
+            }
+            continue;
+        }
+
+        if (ch === "?") {
+            out += ".";
+            continue;
+        }
+
+        if (ch === "[") {
+            const end = glob.indexOf("]", i + 1);
+            if (end !== -1) {
+                let cls = glob.slice(i + 1, end);
+                if (cls.startsWith("!")) cls = "^" + cls.slice(1);
+                out += `[${cls}]`;
+                i = end;
+                continue;
+            }
+        }
+
+        if (ch === "{") {
+            const end = glob.indexOf("}", i + 1);
+            if (end !== -1) {
+                const alternatives = glob.slice(i + 1, end).split(",");
+                if (alternatives.length > 1) {
+                    out += `(?:${alternatives.map((part) => part.replace(/[.+^${}()|[\]\\]/g, "\\$&")).join("|")})`;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
+        out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+
+    return new RegExp(`${out}$`, "i");
 }
 
-function matchesBatchPattern(stem: string, pattern: string, mode: BatchMatchMode) {
+function matchesBatchPattern(path: string, pattern: string, mode: BatchMatchMode) {
+    const fileName = getPathFileName(path);
+    const stem = getPathStem(path);
     if (!pattern.trim()) return true;
+
     try {
-        return mode === "regex" ? new RegExp(pattern, "i").test(stem) : globToRegExp(pattern).test(stem);
+        const re = mode === "regex" ? new RegExp(pattern, "i") : globToRegExp(pattern);
+        // Match against both forms so users can write either:
+        //   *-cut*_chat / *-cut*_video       (stem-oriented)
+        //   *-cut*_*.jsonl / *-cut*_*.mp4    (extension-oriented)
+        //   ^foo.*\.jsonl$                  (regex-oriented)
+        return re.test(stem) || re.test(fileName);
     } catch {
         return false;
     }
 }
 
+function getGenericPairKey(path: string) {
+    const stem = getPathStem(path).trim().toLowerCase();
+
+    // First choice is the exact stem. This supports perfectly identical
+    // JSONL/video filenames without changing their names.
+    // For files whose two formats use different final labels (chat/video,
+    // preview/render, source/output, etc.), remove one trailing token after a
+    // separator. Nothing here depends on the literal words "chat" or "video".
+    const normalized = stem.replace(/(?:[_-])[^_-]+$/i, "");
+    return { exact: stem, normalized: normalized || stem };
+}
+
 function pairBatchFiles(paths: string[], pattern: string, mode: BatchMatchMode): BatchPair[] {
-    const jsonByStem = new Map<string, string>();
-    const videoByStem = new Map<string, string>();
+    const jsonFiles = new Map<string, string>();
+    const videoFiles = new Map<string, string>();
+    const videoByNormalized = new Map<string, string>();
 
     for (const path of paths) {
-        const ext = getPathFileName(path).split(".").pop()?.toLowerCase();
-        const stem = getPathStem(path);
-        if (!stem || !matchesBatchPattern(stem, pattern, mode)) continue;
+        const fileName = getPathFileName(path);
+        const ext = fileName.split(".").pop()?.toLowerCase();
+        if (!matchesBatchPattern(path, pattern, mode)) continue;
 
-        const key = stem.toLowerCase();
-        if (ext === "jsonl" && !jsonByStem.has(key)) jsonByStem.set(key, path);
-        if (["mp4", "mkv", "mov", "avi", "webm"].includes(ext ?? "") && !videoByStem.has(key)) {
-            videoByStem.set(key, path);
+        const { exact, normalized } = getGenericPairKey(path);
+        if (ext === "jsonl") {
+            if (!jsonFiles.has(exact)) jsonFiles.set(exact, path);
+        } else if (["mp4", "mkv", "mov", "avi", "webm"].includes(ext ?? "")) {
+            if (!videoFiles.has(exact)) videoFiles.set(exact, path);
+            if (!videoByNormalized.has(normalized)) videoByNormalized.set(normalized, path);
         }
     }
 
-    return Array.from(jsonByStem.entries())
+    return Array.from(jsonFiles.entries())
         .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
-        .map(([key, jsonFilePath]) => ({
-            key,
-            jsonFilePath,
-            videoFilePath: videoByStem.get(key),
-        }));
+        .map(([exactKey, jsonFilePath]) => {
+            const { normalized } = getGenericPairKey(jsonFilePath);
+            return {
+                // Stable human/debug key uses the JSONL stem.
+                key: exactKey,
+                jsonFilePath,
+                // Exact stem wins. Otherwise fall back to the generic shared
+                // base, allowing `foo_cut0_chat.jsonl` ↔ `foo_cut0_video.mp4`.
+                videoFilePath: videoFiles.get(exactKey) ?? videoByNormalized.get(normalized),
+            };
+        });
 }
 
 function deriveBatchOutputPath(directory: string, jsonPath: string) {
@@ -414,13 +490,21 @@ function Section({ title, defaultOpen = true, children }: {
 // useVideoMeta
 // ─────────────────────────────────────────────────────────────────────────────
 
-function useVideoMeta(path: string | undefined): { meta: VideoMeta | null; loading: boolean; error: string | null } {
+function useVideoMeta(
+    path: string | undefined,
+): { meta: VideoMeta | null; loading: boolean; error: string | null } {
     const [meta, setMeta] = useState<VideoMeta | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
-        if (!path) { setMeta(null); setError(null); return; }
+        if (!path) {
+            setMeta(null);
+            setError(null);
+            setLoading(false);
+            return;
+        }
+
         let cancelled = false;
         setLoading(true);
         setMeta(null);
@@ -428,68 +512,84 @@ function useVideoMeta(path: string | undefined): { meta: VideoMeta | null; loadi
 
         const videoSrc = convertFileSrc(path);
 
-        const tryHtmlVideo = () => new Promise<void>((resolve) => {
-            const vid = document.createElement("video");
-            vid.crossOrigin = "anonymous";
-            vid.src = videoSrc;
-            vid.muted = true;
-            vid.preload = "metadata";
-            vid.onloadedmetadata = () => { vid.currentTime = Math.min(1.5, vid.duration * 0.1); };
-            vid.onseeked = () => {
-                try {
-                    const c = document.createElement("canvas");
-                    c.width = vid.videoWidth; c.height = vid.videoHeight;
-                    c.getContext("2d")?.drawImage(vid, 0, 0);
-                    if (!cancelled) {
-                        setMeta({
-                            width: vid.videoWidth, height: vid.videoHeight, duration: vid.duration,
-                            videoSrc,
-                            posterDataUrl: c.toDataURL("image/jpeg", 0.75),
-                        });
-                    }
-                } catch {
-                    // Canvas tainted (cross-origin) — still set meta without a poster
-                    if (!cancelled) {
-                        setMeta({
-                            width: vid.videoWidth, height: vid.videoHeight, duration: vid.duration,
-                            videoSrc,
-                            posterDataUrl: "",
-                        });
-                    }
-                }
-                vid.remove(); resolve();
-            };
-            vid.onerror = () => {
-                vid.remove();
-                if (!cancelled) setError("Could not load video preview.");
-                resolve();
-            };
-        });
+        const video = document.createElement("video");
+        video.crossOrigin = "anonymous";
+        video.src = videoSrc;
+        video.muted = true;
+        video.preload = "metadata";
 
-        const tryTauriCommand = async () => {
-            try {
-                const r = await invoke<{ width: number; height: number; duration: number; frameBase64: string }>(
-                    "extract_video_frame", { path, seekSecs: 1.0 }
-                );
-                if (!cancelled) {
-                    setMeta({
-                        width: r.width, height: r.height, duration: r.duration,
-                        videoSrc,
-                        posterDataUrl: `data:image/jpeg;base64,${r.frameBase64}`,
-                    });
-                }
-            } catch {
-                await tryHtmlVideo();
-            }
+        const cleanup = () => {
+            video.pause();
+            video.removeAttribute("src");
+            video.load();
+            video.remove();
         };
 
-        tryTauriCommand().finally(() => { if (!cancelled) setLoading(false); });
-        return () => { cancelled = true; };
+        video.onloadedmetadata = () => {
+            if (cancelled) {
+                cleanup();
+                return;
+            }
+
+            // Seek to a useful preview frame.
+            video.currentTime = Math.min(1.5, video.duration * 0.1);
+        };
+
+        video.onseeked = () => {
+            if (cancelled) {
+                cleanup();
+                return;
+            }
+
+            let posterDataUrl = "";
+
+            try {
+                const canvas = document.createElement("canvas");
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                const ctx = canvas.getContext("2d");
+                if (ctx) {
+                    ctx.drawImage(video, 0, 0);
+                    posterDataUrl = canvas.toDataURL("image/jpeg", 0.75);
+                }
+            } catch {
+                // Preview poster generation is optional.
+                // The actual <video> can still be used.
+                posterDataUrl = "";
+            }
+
+            if (!cancelled) {
+                setMeta({
+                    width: video.videoWidth,
+                    height: video.videoHeight,
+                    duration: video.duration,
+                    videoSrc,
+                    posterDataUrl,
+                });
+                setLoading(false);
+            }
+
+            cleanup();
+        };
+
+        video.onerror = () => {
+            if (!cancelled) {
+                setError("Could not load video preview.");
+                setLoading(false);
+            }
+
+            cleanup();
+        };
+
+        return () => {
+            cancelled = true;
+            cleanup();
+        };
     }, [path]);
 
     return { meta, loading, error };
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // CanvasEditor — video player + draggable/resizable overlay editor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2014,7 +2114,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
     const [mode, setMode] = useState<"single" | "batch">("single");
     const [batchItems, setBatchItems] = useState<BatchItem[]>(() => [makeBatchItem()]);
     const [batchOutputDirectory, setBatchOutputDirectoryState] = useState("");
-    const [batchPattern, setBatchPattern] = useState("*-cut*");
+    const [batchPattern, setBatchPattern] = useState("*-cut*_*");
     const [batchMatchMode, setBatchMatchMode] = useState<BatchMatchMode>("glob");
     const [batchImportError, setBatchImportError] = useState<string | null>(null);
     const [batchImportNotice, setBatchImportNotice] = useState<string | null>(null);
@@ -2416,7 +2516,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                     </div>
                                     <div className="flex-1 min-w-0">
                                         <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-neutral-300">Import chat logs + optional cut videos</div>
-                                        <div className="text-[9px] text-neutral-600 mt-0.5">Matches identical filename stems. Matching videos are attached automatically; they are only required for items using Direct Pipe mode.</div>
+                                        <div className="text-[9px] text-neutral-600 mt-0.5">Pattern matching works on the filename or stem; files are paired by the exact stem first, then by a shared base before the final `_` / `-` label.</div>
                                     </div>
                                 </div>
                                 <div className="p-3.5 space-y-3">
@@ -2426,8 +2526,8 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                             <PillTabs options={[{ value: "glob" as BatchMatchMode, label: "Glob" }, { value: "regex" as BatchMatchMode, label: "Regex" }]} value={batchMatchMode} onChange={setBatchMatchMode} />
                                         </div>
                                         <div className="sm:col-span-2">
-                                            <div className="flex items-center mb-1"><FieldLabel>{batchMatchMode === "glob" ? "Filename stem pattern" : "Stem regex"}</FieldLabel><span className="text-[9px] text-neutral-700 ml-2">example: <span className="font-mono">*-cut*</span></span></div>
-                                            <TextInput value={batchPattern} onChange={setBatchPattern} placeholder="*-cut*" mono />
+                                            <div className="flex items-center mb-1"><FieldLabel>{batchMatchMode === "glob" ? "Filename pattern" : "Filename regex"}</FieldLabel><span className="text-[9px] text-neutral-700 ml-2">matches stem or filename</span></div>
+                                            <TextInput value={batchPattern} onChange={setBatchPattern} placeholder={batchMatchMode === "glob" ? "*-cut*_*" : ".*-cut.*"} mono />
                                         </div>
                                     </div>
                                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
@@ -2445,7 +2545,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                         </button>
                                     </div>
                                     <div className="flex flex-wrap items-center gap-2 text-[9px] text-neutral-700">
-                                        <span className="font-mono">name123-cut01.jsonl</span><span>↔</span><span className="font-mono">name123-cut01.mp4</span>
+                                        <span className="font-mono">benjaz-1787414330019-cut0_chat.jsonl</span><span>↔</span><span className="font-mono">benjaz-1787414330019-cut0_video.mp4</span>
                                         <span className="ml-auto">JSONL-only imports are valid; matching videos are auto-attached when present.</span>
                                     </div>
                                     {batchImportNotice && (

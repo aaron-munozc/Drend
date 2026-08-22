@@ -56,6 +56,61 @@ impl From<&ObjectColor> for Color {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Per-platform channel identifiers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Platform-specific channel IDs needed to fetch channel-scoped emotes.
+///
+/// Each platform uses a different identifier format:
+/// - Twitch: numeric user/broadcaster ID (e.g. `"12345678"`)
+///
+/// Fields are `None` when the corresponding platform is not in use.
+/// Adding a new platform only requires adding a field here and a matching
+/// fetcher in `EmoteNameMap::build_emote_map` — nothing else changes.
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelIdentifiers {
+    /// Twitch numeric broadcaster ID. Used by 7TV, BTTV, FFZ, and the Twitch
+    /// channel-emote endpoint — all four require the same ID format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twitch_id: Option<String>,
+
+    // Future platforms — uncomment when support is added:
+    // /// YouTube channel ID (e.g. `"UCxxxxxx"`). Used by YouTube emoji endpoints.
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub youtube_id: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-platform auth credentials
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Auth credentials for platforms that require API keys or OAuth tokens.
+///
+/// All fields are `Option` — leave `None` for any platform that is disabled
+/// or that requires no credentials. `build_emote_map` short-circuits cleanly
+/// when credentials are absent and logs a warning rather than returning an error.
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCredentials {
+    /// Twitch OAuth Bearer token. Required when `EmoteProviderFlags::twitch_global`
+    /// is `true`. Obtain via the Client Credentials flow (app access token) — no
+    /// user login is needed for emote endpoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twitch_token: Option<String>,
+
+    /// Twitch application Client-ID. Sent alongside `twitch_token` on every
+    /// Twitch Helix API request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twitch_client_id: Option<String>,
+
+    // Future platforms — uncomment when support is added:
+    // /// YouTube Data API v3 key. Required when a YouTube emote provider is enabled.
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub youtube_api_key: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Emote provider feature flags
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -79,7 +134,12 @@ pub struct EmoteProviderFlags {
     pub bttv: bool,
     /// Enable FrankerFaceZ (FFZ) emotes resolved from the emote name map.
     pub ffz: bool,
-    /// Enable Twitch global emotes resolved from the emote name map.
+    /// Enable Twitch global and channel emotes resolved from the emote name map.
+    ///
+    /// Requires `ProviderCredentials::twitch_token` and `twitch_client_id` to
+    /// be set on the render args, and `ChannelIdentifiers::twitch_id` for
+    /// channel-scoped emotes. Without credentials only the word-map lookup is
+    /// skipped — no error is produced.
     pub twitch_global: bool,
     /// Render bare image URLs (`http(s)://...png|gif|webp|jpg`) found in
     /// message text as inline images.
@@ -105,9 +165,13 @@ impl Default for EmoteProviderFlags {
 }
 
 impl EmoteProviderFlags {
-    /// Returns `true` if any named-emote provider (7TV/BTTV/FFZ/Twitch) is
-    /// enabled. Used to short-circuit the emote-map lookup path entirely when
-    /// all name-based providers are disabled.
+    /// Returns `true` if any word-map emote provider (7TV / BTTV / FFZ / Twitch)
+    /// is enabled. Used to short-circuit the hash-map lookup in `push_word`
+    /// entirely when all name-based providers are disabled, so plain-text
+    /// messages pay zero map cost.
+    ///
+    /// Kick is intentionally excluded — it uses structured `[emote:id:name]`
+    /// tags, not the word map, and is gated separately in `tokenise`.
     #[inline(always)]
     pub fn any_name_provider_enabled(&self) -> bool {
         self.seven_tv || self.bttv || self.ffz || self.twitch_global
@@ -343,6 +407,16 @@ pub struct RenderVideoArgs {
     /// emote resolution, cache population, and network requests entirely.
     pub emote_providers: EmoteProviderFlags,
 
+    /// Platform channel IDs used to fetch channel-scoped emotes (7TV, BTTV,
+    /// FFZ, Twitch channel emotes). Required when any name-based provider is
+    /// enabled. Ignored — no network call is made — when all flags are off.
+    pub channel_ids: ChannelIdentifiers,
+
+    /// OAuth tokens and API keys for platforms that require authentication.
+    /// Twitch requires `twitch_token` + `twitch_client_id` when
+    /// `emote_providers.twitch_global` is `true`.
+    pub provider_credentials: ProviderCredentials,
+
     // ── Emotes & images ───────────────────────────────────────────────────────
     pub quality_preset: QualityPreset,
     /// Maximum number of decoded emote images held in the in-process LRU cache.
@@ -487,6 +561,8 @@ impl Default for RenderVideoArgs {
 
             // Emote providers — all off by default; callers opt in
             emote_providers: EmoteProviderFlags::default(),
+            channel_ids: ChannelIdentifiers::default(),
+            provider_credentials: ProviderCredentials::default(),
 
             // Emotes & images
             quality_preset: QualityPreset::Standard,

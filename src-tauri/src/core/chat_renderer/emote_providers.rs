@@ -1,4 +1,4 @@
-use crate::core::chat_renderer::args::EmoteProviderFlags;
+use crate::core::chat_renderer::args::{ChannelIdentifiers, EmoteProviderFlags, ProviderCredentials};
 use crate::core::chat_renderer::regex::{EMOTE_REGEX, IMAGE_URL_REGEX};
 use crate::types::AppResult;
 use serde::Deserialize;
@@ -205,28 +205,49 @@ impl EmoteNameMap {
     /// rather than propagating an error, so a single unreachable CDN doesn't
     /// abort the entire render.
     ///
-    /// `twitch_token` and `twitch_client_id` are only required when
-    /// `flags.twitch_global` is true. Pass empty strings (or `None` via a
-    /// wrapper) when Twitch is disabled — the Twitch future short-circuits
-    /// before making any network calls.
+    /// # Credentials
+    ///
+    /// Twitch requires `credentials.twitch_token` and `credentials.twitch_client_id`
+    /// when `flags.twitch_global` is `true`. If either is absent or empty the
+    /// Twitch future short-circuits before making any network call and logs a
+    /// warning — no error is returned.
+    ///
+    /// 7TV, BTTV, and FFZ require `channel_ids.twitch_id` to fetch
+    /// channel-scoped emotes. When it is `None` those fetches are skipped and
+    /// a warning is logged.
+    ///
+    /// # Adding a new platform
+    ///
+    /// 1. Add a field to `ChannelIdentifiers` and `ProviderCredentials` in `args.rs`.
+    /// 2. Add a flag to `EmoteProviderFlags`.
+    /// 3. Add a provider variant to `EmoteProvider`.
+    /// 4. Write a `fetch_<platform>` async fn and an `add_<platform>` ingestion fn.
+    /// 5. Wire them into the `tokio::join!` block below.
     pub async fn build_emote_map(
         client: &reqwest::Client,
         flags: &EmoteProviderFlags,
-        channel_id: &str,
-        twitch_token: &str,
-        twitch_client_id: &str,
+        channel_ids: &ChannelIdentifiers,
+        credentials: &ProviderCredentials,
     ) -> AppResult<Self> {
         let mut map = EmoteNameMap::new();
+
+        // Resolve the Twitch channel ID once — shared by 7TV, BTTV, FFZ, and
+        // the Twitch channel-emote endpoint.
+        let twitch_id = channel_ids.twitch_id.as_deref().unwrap_or("");
 
         // ── 7TV ──────────────────────────────────────────────────────────────
         let seven_tv_fut = async {
             if !flags.seven_tv {
                 return vec![];
             }
-            Self::fetch_7tv(client, channel_id)
+            if twitch_id.is_empty() {
+                log::warn!("[emotes] 7TV is enabled but channel_ids.twitch_id is not set — skipping");
+                return vec![];
+            }
+            Self::fetch_7tv(client, twitch_id)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("[emotes] 7TV fetch error: {}", e);
+                    log::warn!("[emotes] 7TV fetch error: {}", e);
                     vec![]
                 })
         };
@@ -236,10 +257,14 @@ impl EmoteNameMap {
             if !flags.bttv {
                 return vec![];
             }
-            Self::fetch_bttv(client, channel_id)
+            if twitch_id.is_empty() {
+                log::warn!("[emotes] BTTV is enabled but channel_ids.twitch_id is not set — skipping");
+                return vec![];
+            }
+            Self::fetch_bttv(client, twitch_id)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("[emotes] BTTV fetch error: {}", e);
+                    log::warn!("[emotes] BTTV fetch error: {}", e);
                     vec![]
                 })
         };
@@ -249,10 +274,14 @@ impl EmoteNameMap {
             if !flags.ffz {
                 return vec![];
             }
-            Self::fetch_ffz(client, channel_id)
+            if twitch_id.is_empty() {
+                log::warn!("[emotes] FFZ is enabled but channel_ids.twitch_id is not set — skipping");
+                return vec![];
+            }
+            Self::fetch_ffz(client, twitch_id)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("[emotes] FFZ fetch error: {}", e);
+                    log::warn!("[emotes] FFZ fetch error: {}", e);
                     vec![]
                 })
         };
@@ -264,31 +293,37 @@ impl EmoteNameMap {
         // this function only uses whatever it is handed.
         //
         // If twitch_global is disabled the future returns two empty vecs
-        // without touching the network, so stale/empty credentials are safe.
+        // without touching the network, so absent/stale credentials are safe.
         let twitch_fut = async {
             if !flags.twitch_global {
                 return (Vec::new(), Vec::new());
             }
 
-            if twitch_token.is_empty() || twitch_client_id.is_empty() {
-                eprintln!("[emotes] Twitch is enabled but token/client_id are empty — skipping");
+            let token = credentials.twitch_token.as_deref().unwrap_or("");
+            let client_id = credentials.twitch_client_id.as_deref().unwrap_or("");
+
+            if token.is_empty() || client_id.is_empty() {
+                log::warn!(
+                    "[emotes] Twitch is enabled but provider_credentials.twitch_token / \
+                     twitch_client_id are not set — skipping"
+                );
                 return (Vec::new(), Vec::new());
             }
 
             // Run global and channel fetches in parallel — they hit different
             // endpoints and neither depends on the other's result.
             let (global_result, channel_result) = tokio::join!(
-                Self::fetch_twitch_global(client, twitch_token, twitch_client_id),
-                Self::fetch_twitch_channel(client, twitch_token, twitch_client_id, channel_id),
+                Self::fetch_twitch_global(client, token, client_id),
+                Self::fetch_twitch_channel(client, token, client_id, twitch_id),
             );
 
             let global = global_result.unwrap_or_else(|e| {
-                eprintln!("[emotes] Twitch global emote fetch error: {}", e);
+                log::warn!("[emotes] Twitch global emote fetch error: {}", e);
                 Vec::new()
             });
 
             let channel = channel_result.unwrap_or_else(|e| {
-                eprintln!("[emotes] Twitch channel emote fetch error: {}", e);
+                log::warn!("[emotes] Twitch channel emote fetch error: {}", e);
                 Vec::new()
             });
 
@@ -300,6 +335,12 @@ impl EmoteNameMap {
             tokio::join!(seven_tv_fut, bttv_fut, ffz_fut, twitch_fut);
 
         // ── Populate map (insertion order determines shadowing priority) ───────
+        //
+        // Priority (last writer wins in the flat FxHashMap):
+        //   7TV → BTTV → FFZ → TwitchGlobal → TwitchChannel
+        //
+        // TwitchChannel is inserted last so a broadcaster's custom emote
+        // (e.g. a channel-specific "LUL" variant) shadows the global one.
         if !seven_tv_emotes.is_empty() {
             map.add_7tv(&seven_tv_emotes);
         }
@@ -312,8 +353,6 @@ impl EmoteNameMap {
         if !twitch_global.is_empty() {
             map.add_twitch(&twitch_global, EmoteProvider::TwitchGlobal);
         }
-        // Channel emotes inserted last — they shadow global emotes of the
-        // same name (e.g. a channel's custom "LUL" variant overrides global LUL).
         if !twitch_channel.is_empty() {
             map.add_twitch(&twitch_channel, EmoteProvider::TwitchChannel);
         }
@@ -541,7 +580,7 @@ impl EmoteNameMap {
     /// - **Scale** — "2.0" (56 px) is preferred; falls back to whatever the
     ///   API reports, then hard-codes "2.0" as a last resort (it exists for
     ///   every emote in practice).
-    pub fn add_twitch(&mut self, entries: &[TwitchEmote], provider: EmoteProvider) {
+    fn add_twitch(&mut self, entries: &[TwitchEmote], provider: EmoteProvider) {
         self.map.reserve(entries.len());
         for emote in entries {
             self.map.insert(
@@ -584,35 +623,6 @@ impl EmoteNameMap {
         }
     }
 
-    /// Iterate over all resolved emote URLs that pass the given provider flags.
-    ///
-    /// Used during the metadata scan pass to pre-warm the image cache for every
-    /// provider emote that could appear in the log.
-    pub fn all_urls_filtered<'a>(
-        &'a self,
-        flags: &'a EmoteProviderFlags,
-    ) -> impl Iterator<Item = &'a str> + 'a {
-        self.map.values().filter_map(move |e| {
-            let allowed = match e.provider {
-                EmoteProvider::SevenTv => flags.seven_tv,
-                EmoteProvider::Bttv => flags.bttv,
-                EmoteProvider::Ffz => flags.ffz,
-                EmoteProvider::TwitchGlobal | EmoteProvider::TwitchChannel => flags.twitch_global,
-            };
-            if allowed {
-                Some(e.emote.url.as_ref())
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Unconditional iterator — kept for call sites that pre-filter on their
-    /// own or that need all URLs regardless of flags (e.g. cache invalidation).
-    #[inline]
-    pub fn all_urls(&self) -> impl Iterator<Item = &str> {
-        self.map.values().map(|e| e.emote.url.as_ref())
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,41 +647,6 @@ pub enum MessageToken<'a> {
     /// Twitch chat embeds no per-message emote metadata in VOD logs.
     ProviderEmote(ResolvedEmote),
     ImageUrl(&'a str),
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OwnedMessageToken — owning variant (layout pass)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Owned counterpart of [`MessageToken`] used for layout where the original
-/// string slice is no longer available.
-///
-/// `Text` stores a `Box<str>` instead of `String` to avoid the 3-word overhead
-/// of `String`'s unused capacity field on the heap.
-#[derive(Debug, Clone)]
-pub enum OwnedMessageToken {
-    Text(Box<str>),
-    KickEmote { id: Box<str> },
-    ProviderEmote(ResolvedEmote),
-    ImageUrl(Box<str>),
-}
-
-impl OwnedMessageToken {
-    #[inline(always)]
-    pub fn from_borrowed(tok: &MessageToken<'_>) -> Self {
-        match tok {
-            MessageToken::Text(s) => Self::Text((*s).into()),
-            MessageToken::KickEmote { id } => Self::KickEmote { id: (*id).into() },
-            MessageToken::ProviderEmote(e) => Self::ProviderEmote(e.clone()),
-            MessageToken::ImageUrl(url) => Self::ImageUrl((*url).into()),
-        }
-    }
-
-    /// Convert a borrow-token vector to an owned-token vector in one pass.
-    #[inline]
-    pub fn vec_from_borrowed(tokens: &[MessageToken<'_>]) -> Vec<Self> {
-        tokens.iter().map(Self::from_borrowed).collect()
-    }
 }
 
 // No-op stub kept for call-site compatibility.

@@ -324,9 +324,8 @@ impl TaskManager {
             let emote_map = EmoteNameMap::build_emote_map(
                 &http_client,
                 &args.emote_providers,
-                "12345678",
-                "",
-                ""
+                &args.channel_ids,
+                &args.provider_credentials,
             )
                 .await
                 .unwrap_or_else(|e| {

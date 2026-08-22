@@ -1,3 +1,4 @@
+use std::fs;
 use crate::core::{
     analyze_url, get_download_queue,
     queue_chat_download, queue_chat_render,
@@ -9,6 +10,7 @@ use crate::core::{
 use crate::types::Metadata;
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -24,6 +26,40 @@ mod types;
 
 pub struct AppCache {
     pub streams: Mutex<LruCache<String, Metadata>>,
+}
+
+
+
+#[tauri::command]
+fn read_directory_files(path: String) -> Result<Vec<String>, String> {
+    let dir = Path::new(&path);
+
+    if !dir.exists() {
+        return Err(format!("Directory does not exist: {}", path));
+    }
+
+    if !dir.is_dir() {
+        return Err(format!("Path is not a directory: {}", path));
+    }
+
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory '{}': {}", path, e))?;
+
+    let mut files = Vec::new();
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("Failed to read directory entry: {}", e))?;
+
+        let entry_path = entry.path();
+
+        // Only return files, not subdirectories.
+        if entry_path.is_file() {
+            files.push(entry_path.to_string_lossy().into_owned());
+        }
+    }
+
+    Ok(files)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -184,6 +220,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            read_directory_files,
             analyze_url,
             queue_chat_download,
             queue_vod_download,
