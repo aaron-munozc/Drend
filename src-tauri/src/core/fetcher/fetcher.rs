@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use crate::error::AppError;
-use crate::types::{
-    AppResult, Chapter, Metadata, NormalizedFormat, NormalizedMetadata, YtDlpMetadata,
+use crate::types::{ // Adjust import paths as necessary
+                    AppResult, Chapter, Metadata, NormalizedFormat, NormalizedMetadata, YtDlpMetadata,
 };
-use crate::{tools, AppCache};
+use crate::{tools, AppCache}; // Adjust import paths as necessary
 use stream_extractor::{fetch_stream, StreamClient};
 use tauri::{AppHandle, State};
 use tokio::process::Command;
@@ -40,7 +40,6 @@ pub async fn analyze_url_core(
     let yt_meta: YtDlpMetadata = serde_json::from_str(&json_str)
         .map_err(|e| AppError::Generic(format!("Failed to parse yt-dlp output: {}", e)))?;
 
-    // 🚀 UPGRADE: Smarter chat support check based on the resolved extractor
     let extractor = yt_meta.extractor.as_deref().unwrap_or("").to_lowercase();
     let is_chat_supported = extractor.contains("twitch") || extractor.contains("kick");
 
@@ -59,7 +58,6 @@ pub async fn analyze_url_core(
         })
         .collect();
 
-    // 🚀 UPGRADE: Merge manual and automatic captions cleanly
     let mut subs_set = HashSet::new();
     if let Some(subs) = &yt_meta.subtitles {
         subs_set.extend(subs.keys().cloned());
@@ -76,13 +74,13 @@ pub async fn analyze_url_core(
         .unwrap_or_default()
         .into_iter()
         .filter_map(|f| {
-            // Skip if there's no actual download/stream URL
-            let format_url = f.url?;
+            // Some extractors use manifest_url instead of url
+            let format_url = f.url.clone().or_else(|| f.manifest_url.clone())?;
             if format_url.is_empty() { return None; }
 
             let ext = f.ext.clone().unwrap_or_else(|| "unknown".to_string());
             if ext == "mhtml" || f.format_id.starts_with("sb") {
-                return None;
+                return None; // Skip storyboards/webpages
             }
 
             let vcodec = f.vcodec.as_deref().unwrap_or("none");
@@ -102,10 +100,22 @@ pub async fn analyze_url_core(
                 "Audio Only".to_string()
             };
 
+            // 🚀 UPGRADE: Richer UI Label Construction
             let mut ui_parts = vec![resolution_label.clone()];
+
             if let Some(fps) = f.fps {
                 if fps > 0.0 {
                     ui_parts.push(format!("{}fps", fps.round()));
+                }
+            }
+            if let Some(dr) = &f.dynamic_range {
+                if dr != "SDR" {
+                    ui_parts.push(dr.clone()); // Adds "HDR10", "DV", etc.
+                }
+            }
+            if let Some(note) = &f.format_note {
+                if !note.is_empty() && !note.contains("DASH") {
+                    ui_parts.push(format!("({})", note)); // Adds things like "Premium" or "Source"
                 }
             }
 
@@ -116,7 +126,7 @@ pub async fn analyze_url_core(
                 _ => "Unknown",
             };
 
-            let ui_label = format!("{} ({}) - [{}]", ui_parts.join(" "), ext, type_badge);
+            let ui_label = format!("{} [{}] ({})", ui_parts.join(" "), type_badge, ext);
 
             Some(NormalizedFormat {
                 format_id: f.format_id,
@@ -126,24 +136,64 @@ pub async fn analyze_url_core(
                 has_video,
                 has_audio,
                 size_bytes: f.filesize.or(f.filesize_approx),
-                bitrate: f.tbr,
+                bitrate: f.tbr.or(f.vbr).or(f.abr),
+                protocol: f.protocol,
+                language: f.language,
+                dynamic_range: f.dynamic_range,
                 ui_label,
                 url: format_url,
             })
         })
         .collect();
 
-    // 🚀 UPGRADE: Sort formats for the frontend (Highest Quality Video+Audio First)
     formats.sort_by(|a, b| {
         let score_a = (a.has_video as u8 * 2) + (a.has_audio as u8);
         let score_b = (b.has_video as u8 * 2) + (b.has_audio as u8);
-        score_b.cmp(&score_a) // V+A first, then Video, then Audio
+        score_b.cmp(&score_a)
                .then_with(|| b.resolution_label.cmp(&a.resolution_label))
                .then_with(|| b.fps.unwrap_or(0.0).partial_cmp(&a.fps.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal))
     });
 
+    // --- 🚀 UPGRADE: Cross-Platform Metadata Coalescing ---
+    let display_creator = yt_meta.artist.clone()
+                                 .or_else(|| yt_meta.channel.clone())
+                                 .or_else(|| yt_meta.uploader.clone())
+                                 .unwrap_or_else(|| "Unknown Creator".to_string());
+
+    let display_title = yt_meta.track.clone()
+                               .or_else(|| yt_meta.episode.clone())
+                               .or_else(|| yt_meta.title.clone())
+                               .or_else(|| yt_meta.fulltitle.clone())
+                               .unwrap_or_else(|| "Unknown Title".to_string());
+
+    let series_context = if let (Some(s_num), Some(e_num)) = (yt_meta.season_number, yt_meta.episode_number) {
+        Some(format!("Season {}, Episode {}", s_num, e_num))
+    } else if let Some(playlist) = &yt_meta.playlist {
+        let index = yt_meta.playlist_index.map(|i| i.to_string()).unwrap_or_else(|| "?".to_string());
+        Some(format!("Playlist: {} (#{})", playlist, index))
+    } else {
+        None
+    };
+
+    let media_type = if yt_meta.track.is_some() || yt_meta.artist.is_some() {
+        "Music".to_string()
+    } else if yt_meta.series.is_some() || yt_meta.episode.is_some() {
+        "Episode".to_string()
+    } else if is_live {
+        "Live Stream".to_string()
+    } else {
+        "Video".to_string()
+    };
+
     let normalized = NormalizedMetadata {
         id: yt_meta.id,
+        // Unified UI Fields
+        display_title,
+        display_creator,
+        media_type,
+        series_context,
+
+        // Original standard fields
         title: yt_meta.title.or(yt_meta.fulltitle).unwrap_or_else(|| "Unknown Title".to_string()),
         description: yt_meta.description,
         duration: yt_meta.duration,
@@ -190,6 +240,7 @@ pub async fn analyze_url_core(
     lock.put(url, final_metadata.clone());
     Ok(final_metadata)
 }
+
 #[tauri::command]
 pub async fn analyze_url(
     url: String,
@@ -197,6 +248,5 @@ pub async fn analyze_url(
     client: State<'_, StreamClient>,
     cache: State<'_, AppCache>,
 ) -> AppResult<Metadata> {
-    // Pass it down to the core logic
     analyze_url_core(url, &app, &client, &cache).await
 }

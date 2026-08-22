@@ -325,6 +325,8 @@ impl TaskManager {
                 &http_client,
                 &args.emote_providers,
                 "12345678",
+                "",
+                ""
             )
                 .await
                 .unwrap_or_else(|e| {
@@ -368,24 +370,24 @@ impl TaskManager {
         meta: Stream,
         options: FrontendChatOptions,
     ) -> String {
+        // 1. Borrow `&meta` so we don't move fields out of `meta`
         let (title_opt, chat_id_opt) = match &meta {
-            Stream::Vod(v) => (v.title.clone(), v.chat_id),
-            Stream::Clip(c) => (c.title.clone(), c.chat_id),
-            Stream::Live(l) => (l.title.clone(), l.chat_id),
+            Stream::Vod(v) => (v.title.as_deref(), v.chat_id.as_deref()),
+            Stream::Clip(c) => (c.title.as_deref(), c.chat_id.as_deref()),
+            Stream::Live(l) => (l.title.as_deref(), l.chat_id.as_deref()),
             _ => (None, None),
         };
-        let title = title_opt.unwrap_or_else(|| "Unknown Stream".to_string());
+
+        let title = title_opt.unwrap_or("Unknown Stream");
 
         let task_id = task_id
             .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| {
-                let id_str = chat_id_opt
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(Self::timestamp_id);
-                format!("chat_{}", id_str)
+            .unwrap_or_else(|| match chat_id_opt {
+                Some(id) => format!("chat_{id}"),
+                None => format!("chat_{}", Self::timestamp_id()),
             });
 
-        self.setup_task(&task_id, TaskType::ChatDownload, title);
+        self.setup_task(&task_id, TaskType::ChatDownload, title.to_string());
 
         let app = self.app.clone();
         let tasks = Arc::clone(&self.tasks);
@@ -401,15 +403,15 @@ impl TaskManager {
             };
 
             let _permit = tokio::select! {
-                permit = limits.acquire_download() => permit,
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() {
-                        Self::mark_cancelled_waiting(&app, &tasks, &event_tx, &tid);
-                        return;
-                    }
-                    limits.acquire_download().await
+            permit = limits.acquire_download() => permit,
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    Self::mark_cancelled_waiting(&app, &tasks, &event_tx, &tid);
+                    return;
                 }
-            };
+                limits.acquire_download().await
+            }
+        };
 
             Self::mark_processing(&app, &tasks, &event_tx, &tid, "Connecting...");
 

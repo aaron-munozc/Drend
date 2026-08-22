@@ -1,17 +1,18 @@
+
 /**
  * RenderForm.tsx
  */
 
 import { useNavigate } from "@tanstack/react-router";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import React, {
+    memo,
     useCallback,
-    useState,
-    useRef,
     useEffect,
     useMemo,
-    memo,
+    useRef,
+    useState,
 } from "react";
 import { TabState, useWorkspace } from "@/stores/useWorkspaceStore.ts";
 import type {
@@ -65,28 +66,28 @@ interface DragState {
 }
 
 const BATCH_ITEM_EXCLUSIVE_KEYS = new Set<keyof RenderVideoArgs>([
+    // Source video and output destination are intrinsically item-specific.
+    // Direct Pipe mode + overlay geometry intentionally inherit from the template.
     "outputPath",
     "overlayVideoPath",
-    "overlayX",
-    "overlayY",
-    "overlayWidth",
-    "overlayHeight",
-    "useImmediatePipeOverlay",
 ]);
 
 interface BatchItem {
     id: string;
     jsonFilePath: string;
     outputPath: string;
+    outputPathOverridden?: boolean;
+    /** Base video stays item-specific. The Direct Pipe toggle inherits through overrides. */
     overlayVideoPath: string;
-    overlayX?: number;
-    overlayY?: number;
-    overlayWidth?: number;
-    overlayHeight?: number;
-    useImmediatePipeOverlay: boolean;
-    overrides: Partial<Omit<RenderVideoArgs,
-        "outputPath" | "overlayVideoPath" | "overlayX" | "overlayY" |
-        "overlayWidth" | "overlayHeight" | "useImmediatePipeOverlay">>;
+    overrides: Partial<Omit<RenderVideoArgs, "outputPath" | "overlayVideoPath">>;
+}
+
+type BatchMatchMode = "glob" | "regex";
+
+interface BatchPair {
+    key: string;
+    jsonFilePath: string;
+    videoFilePath: string;
 }
 
 function makeBatchItem(): BatchItem {
@@ -94,14 +95,66 @@ function makeBatchItem(): BatchItem {
         id: crypto.randomUUID(),
         jsonFilePath: "",
         outputPath: "",
+        outputPathOverridden: false,
         overlayVideoPath: "",
-        overlayX: undefined,
-        overlayY: undefined,
-        overlayWidth: undefined,
-        overlayHeight: undefined,
-        useImmediatePipeOverlay: false,
         overrides: {},
     };
+}
+
+function getPathFileName(path: string) {
+    return path.split(/[/\\]/).pop() ?? path;
+}
+
+function getPathStem(path: string) {
+    return getPathFileName(path).replace(/\.[^.]+$/, "");
+}
+
+function getPathDirectory(path: string) {
+    const match = path.match(/^(.*)[/\\][^/\\]+$/);
+    return match?.[1] ?? "";
+}
+
+function joinPath(directory: string, fileName: string) {
+    if (!directory) return fileName;
+    const sep = directory.includes("\\") && !directory.includes("/") ? "\\" : "/";
+    return directory.endsWith(sep) ? `${directory}${fileName}` : `${directory}${sep}${fileName}`;
+}
+
+function globToRegExp(glob: string) {
+    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^${escaped.replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
+}
+
+function matchesBatchPattern(stem: string, pattern: string, mode: BatchMatchMode) {
+    if (!pattern.trim()) return true;
+    try {
+        return mode === "regex" ? new RegExp(pattern, "i").test(stem) : globToRegExp(pattern).test(stem);
+    } catch {
+        return false;
+    }
+}
+
+function pairBatchFiles(paths: string[], pattern: string, mode: BatchMatchMode): BatchPair[] {
+    const jsonByStem = new Map<string, string>();
+    const videoByStem = new Map<string, string>();
+    for (const path of paths) {
+        const ext = getPathFileName(path).split(".").pop()?.toLowerCase();
+        const stem = getPathStem(path);
+        if (!stem || !matchesBatchPattern(stem, pattern, mode)) continue;
+        const key = stem.toLowerCase();
+        if (ext === "jsonl" && !jsonByStem.has(key)) jsonByStem.set(key, path);
+        if (ext === "mp4" && !videoByStem.has(key)) videoByStem.set(key, path);
+    }
+    return Array.from(jsonByStem.entries())
+        .filter(([key]) => videoByStem.has(key))
+        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
+        .map(([key, jsonFilePath]) => ({ key, jsonFilePath, videoFilePath: videoByStem.get(key)! }));
+}
+
+function deriveBatchOutputPath(directory: string, jsonPath: string) {
+    if (!jsonPath) return "";
+    const stem = getPathStem(jsonPath);
+    return joinPath(directory || getPathDirectory(jsonPath), `${stem}.rendered.mp4`);
 }
 
 function resolveItemOpts(main: RenderVideoArgs, item: BatchItem): RenderVideoArgs {
@@ -110,11 +163,6 @@ function resolveItemOpts(main: RenderVideoArgs, item: BatchItem): RenderVideoArg
         ...item.overrides,
         outputPath: item.outputPath,
         overlayVideoPath: item.overlayVideoPath || undefined,
-        overlayX: item.overlayX ?? main.overlayX,
-        overlayY: item.overlayY ?? main.overlayY,
-        overlayWidth: item.overlayWidth ?? main.overlayWidth,
-        overlayHeight: item.overlayHeight ?? main.overlayHeight,
-        useImmediatePipeOverlay: item.useImmediatePipeOverlay,
     };
 }
 
@@ -1067,6 +1115,8 @@ interface SettingsPanelProps {
     videoLoading?: boolean;
     videoError?: string | null;
     onSetOverlayVideoPath?: (v: string) => void;
+    /** Batch shared-template mode: show a canvas even without a shared base video. */
+    showTemplateCanvas?: boolean;
 }
 
 function SettingsPanel({
@@ -1074,6 +1124,7 @@ function SettingsPanel({
                            overriddenKeys, onResetKey,
                            isBatchItem = false,
                            overlayVideoPath, onSelectOverlayVideo, videoMeta, videoLoading, videoError, onSetOverlayVideoPath,
+                           showTemplateCanvas = false,
                        }: SettingsPanelProps) {
     const [pinnedRaw, setPinnedRaw] = useState(() => opts.pinnedUsers.join(", "));
     const [skipRaw, setSkipRaw] = useState(() => opts.skipUsers.join(", "));
@@ -1091,7 +1142,8 @@ function SettingsPanel({
     }, [opts.skipUsers]);
 
     const onChatChange = useCallback((x: number, y: number, w: number, h: number) => {
-        setOpts({ overlayX: x, overlayY: y, overlayWidth: w, overlayHeight: h, width: w, height: h });
+        // Chat geometry is an overlay property; resizing it must never resize the actual render canvas.
+        setOpts({ overlayX: x, overlayY: y, overlayWidth: w, overlayHeight: h });
     }, [setOpts]);
 
     const flush = useCallback((key: "pinnedUsers" | "skipUsers", raw: string) => {
@@ -1201,8 +1253,14 @@ function SettingsPanel({
                     </div>
                 )}
 
-                {!videoLoading && isOverlayMode && !!overlayVideoPath && (
+                {!videoLoading && isOverlayMode && (showTemplateCanvas || !!overlayVideoPath) && (
                     <div className="mt-3">
+                        {showTemplateCanvas && !overlayVideoPath && (
+                            <div className="mb-2 flex items-center gap-2 px-3 py-2 rounded-lg bg-violet-950/25 border border-violet-800/40 text-[10px] text-violet-300/80">
+                                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 shrink-0" />
+                                Template canvas · base video is selected per render item. Overlay geometry and styling are shared here.
+                            </div>
+                        )}
                         <CanvasEditor
                             bgWidth={bgWidth}
                             bgHeight={bgHeight}
@@ -1344,6 +1402,7 @@ interface BatchItemPanelProps {
     index: number;
     mainOpts: RenderVideoArgs;
     allItems: BatchItem[];
+    sharedOutputDirectory: string;
     onChange: (updated: BatchItem) => void;
     onRemove: () => void;
     onCopyFrom: (sourceIndex: number) => void;
@@ -1377,8 +1436,9 @@ const InheritBadge = memo(function InheritBadge({ label, isOverridden, onReset }
     );
 });
 
-function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, onCopyFrom }: BatchItemPanelProps) {
-    const [expanded, setExpanded] = useState(true);
+function BatchItemPanel({ item, index, mainOpts, allItems, sharedOutputDirectory, onChange, onRemove, onCopyFrom }: BatchItemPanelProps) {
+    // Batch cards start compact so a 50-item batch remains scannable.
+    const [expanded, setExpanded] = useState(false);
     const [showOverrides, setShowOverrides] = useState(false);
     const [showCopyMenu, setShowCopyMenu] = useState(false);
     const copyMenuRef = useRef<HTMLDivElement>(null);
@@ -1438,14 +1498,18 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
         onChange({ ...item, overrides: {} });
     }, [item, onChange]);
 
-    const handleJsonPathChange = useCallback((v: string) => onChange({ ...item, jsonFilePath: v }), [item, onChange]);
-    const handleOutputPathChange = useCallback((v: string) => onChange({ ...item, outputPath: v }), [item, onChange]);
+    const handleJsonPathChange = useCallback((v: string) => {
+        const nextOutput = item.outputPathOverridden ? item.outputPath : deriveBatchOutputPath(sharedOutputDirectory, v);
+        onChange({ ...item, jsonFilePath: v, outputPath: nextOutput, outputPathOverridden: item.outputPathOverridden ?? false });
+    }, [item, onChange, sharedOutputDirectory]);
+    const handleOutputPathChange = useCallback((v: string) => onChange({ ...item, outputPath: v, outputPathOverridden: true }), [item, onChange]);
+    const handleOutputReset = useCallback(() => onChange({ ...item, outputPath: deriveBatchOutputPath(sharedOutputDirectory, item.jsonFilePath), outputPathOverridden: false }), [item, onChange, sharedOutputDirectory]);
     const handleOverlayPathChange = useCallback((v: string) => onChange({ ...item, overlayVideoPath: v }), [item, onChange]);
     const handleClearOverlayPath = useCallback(() => onChange({ ...item, overlayVideoPath: "" }), [item, onChange]);
-    const handlePipeModeToggle = useCallback((v: boolean) => onChange({ ...item, useImmediatePipeOverlay: v }), [item, onChange]);
+    const handlePipeModeToggle = useCallback((v: boolean) => setOverride("useImmediatePipeOverlay", v), [setOverride]);
 
     const hasOverrides = overriddenKeys.size > 0;
-    const canDispatch = Boolean(item.jsonFilePath) && Boolean(item.outputPath);
+    const canDispatch = Boolean(item.jsonFilePath) && Boolean(item.outputPath || deriveBatchOutputPath(sharedOutputDirectory, item.jsonFilePath));
 
     // Copy targets: "Main settings" first, then sibling items
     const copyTargets = useMemo(() => {
@@ -1458,17 +1522,19 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
     const handleSelectJsonl = useCallback(async () => {
         try {
             const sel = await open({ multiple: false, filters: [{ name: "JSONL", extensions: ["jsonl"] }] });
-            if (typeof sel === "string") onChange({ ...item, jsonFilePath: sel });
+            if (typeof sel === "string") {
+                const nextOutput = item.outputPathOverridden ? item.outputPath : deriveBatchOutputPath(sharedOutputDirectory, sel);
+                onChange({ ...item, jsonFilePath: sel, outputPath: nextOutput, outputPathOverridden: item.outputPathOverridden ?? false });
+            }
         } catch {}
-    }, [item, onChange]);
+    }, [item, onChange, sharedOutputDirectory]);
 
     const handleSelectOutput = useCallback(async () => {
         try {
             const sel = await open({ multiple: false, directory: true });
             if (typeof sel === "string") {
-                const sep = sel.includes("\\") && !sel.includes("/") ? "\\" : "/";
-                const path = sel.endsWith(sep) ? `${sel}output_${index + 1}.mp4` : `${sel}${sep}output_${index + 1}.mp4`;
-                onChange({ ...item, outputPath: path });
+                const path = deriveBatchOutputPath(sel, item.jsonFilePath) || joinPath(sel, `output_${index + 1}.mp4`);
+                onChange({ ...item, outputPath: path, outputPathOverridden: true });
             }
         } catch {}
     }, [item, index, onChange]);
@@ -1511,7 +1577,7 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
     }, [effectiveOpts.imageOverlays, setOverride]);
 
     const handleItemChatChange = useCallback((x: number, y: number, w: number, h: number) =>
-            setOverrides({ overlayX: x, overlayY: y, overlayWidth: w, overlayHeight: h, width: w, height: h }),
+            setOverrides({ overlayX: x, overlayY: y, overlayWidth: w, overlayHeight: h }),
         [setOverrides]);
 
     const handleItemImageBrowse = useCallback(async (i: number) => {
@@ -1524,8 +1590,10 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
         } catch {}
     }, [effectiveOpts.imageOverlays, setOverride]);
 
-    const sourceFileName = item.jsonFilePath ? item.jsonFilePath.split(/[/\\]/).pop() : null;
-    const outputFileName = item.outputPath ? item.outputPath.split(/[/\\]/).pop() : null;
+    const sourceFileName = item.jsonFilePath ? getPathFileName(item.jsonFilePath) : null;
+    const effectiveOutputPath = item.outputPath || deriveBatchOutputPath(sharedOutputDirectory, item.jsonFilePath);
+    const outputFileName = effectiveOutputPath ? getPathFileName(effectiveOutputPath) : null;
+    const outputUsesTemplate = !item.outputPathOverridden;
 
     return (
         <div className={`rounded-xl border overflow-hidden transition-all duration-200 ${
@@ -1587,6 +1655,15 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
                         ) : (
                             <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-full bg-neutral-800 text-neutral-600 border border-neutral-700/50">
                                 incomplete
+                            </span>
+                        )}
+                        {outputUsesTemplate ? (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-950/50 text-violet-300 border border-violet-800/50 font-medium">
+                                template output
+                            </span>
+                        ) : (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-950/60 text-amber-400 border border-amber-800/50 font-medium">
+                                output override
                             </span>
                         )}
                         {hasOverrides && (
@@ -1687,8 +1764,20 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
                                          onBrowse={handleSelectJsonl} placeholder="/path/to/chat.jsonl" browseLabel="Browse" />
                         </div>
                         <div>
-                            <FieldLabel>Output path</FieldLabel>
-                            <BrowseInput value={item.outputPath} onChange={handleOutputPathChange}
+                            <div className="flex items-center justify-between mb-1">
+                                <div className="flex items-center gap-1.5">
+                                    <FieldLabel>Output path</FieldLabel>
+                                    <span className={`text-[9px] px-1.5 py-0.5 rounded border ${outputUsesTemplate ? "text-violet-300 bg-violet-950/40 border-violet-800/40" : "text-amber-300 bg-amber-950/40 border-amber-800/40"}`}>
+                                        {outputUsesTemplate ? "shared folder" : "override"}
+                                    </span>
+                                </div>
+                                {!outputUsesTemplate && (
+                                    <button type="button" onClick={handleOutputReset} className="text-[9px] text-neutral-600 hover:text-violet-400 transition-colors">
+                                        Use template folder
+                                    </button>
+                                )}
+                            </div>
+                            <BrowseInput value={effectiveOutputPath} onChange={handleOutputPathChange}
                                          onBrowse={handleSelectOutput} placeholder="/path/to/output.mp4" browseLabel="Browse" />
                         </div>
                     </div>
@@ -1705,10 +1794,21 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
                             <div className="flex-1 border-t border-neutral-800/80" />
                             <span className="text-[9px] text-orange-500/70">not inherited from template</span>
                         </div>
-                        <Toggle value={item.useImmediatePipeOverlay} onChange={handlePipeModeToggle}
-                                label="Direct Pipe Mode (Video Overlay)"
-                                description="Overlay chat directly onto a base video. Each item has its own video source." />
-                        {item.useImmediatePipeOverlay && (
+                        <div className="flex items-start gap-2">
+                            <div className="flex-1">
+                                <Toggle value={effectiveOpts.useImmediatePipeOverlay} onChange={handlePipeModeToggle}
+                                        label="Direct Pipe Mode (Video Overlay)"
+                                        description="The toggle inherits from the shared template; the base video is always item-specific." />
+                            </div>
+                            {!overriddenKeys.has("useImmediatePipeOverlay") ? (
+                                <span className="mt-0.5 text-[9px] px-1.5 py-0.5 rounded border text-violet-300 bg-violet-950/40 border-violet-800/40">Template</span>
+                            ) : (
+                                <button type="button" onClick={() => resetOverride("useImmediatePipeOverlay")} className="mt-0.5 text-[9px] px-1.5 py-0.5 rounded border text-amber-300 bg-amber-950/40 border-amber-800/40 hover:text-red-300 hover:border-red-800/50 transition-colors">
+                                    Override · reset
+                                </button>
+                            )}
+                        </div>
+                        {effectiveOpts.useImmediatePipeOverlay && (
                             <div>
                                 <FieldLabel>Base video</FieldLabel>
                                 <BrowseInput value={item.overlayVideoPath || ""} onChange={handleOverlayPathChange}
@@ -1721,9 +1821,12 @@ function BatchItemPanel({ item, index, mainOpts, allItems, onChange, onRemove, o
                     {/* ── Canvas editor (when pipe mode + video set) ─────────────── */}
                     {effectiveOpts.useImmediatePipeOverlay && !!effectiveOpts.overlayVideoPath && (
                         <div className="px-4 pb-3 pt-2 border-t border-neutral-800/50">
-                            <p className="text-[10px] text-neutral-600 mb-2">
-                                Canvas editor — overlays inherited from shared settings. Changes here create per-item overrides.
-                            </p>
+                            <div className="flex items-center justify-between gap-3 mb-2">
+                                <p className="text-[10px] text-neutral-600">
+                                    Item canvas · geometry and styles come from the template until you change them here.
+                                </p>
+                                <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded border border-violet-800/40 bg-violet-950/30 text-violet-300">base video: item</span>
+                            </div>
                             {videoLoading ? (
                                 <div className="w-full h-28 rounded-lg bg-neutral-900/60 border border-neutral-700/50 flex flex-col items-center justify-center gap-2 text-neutral-500">
                                     <span className="w-4 h-4 border-2 border-neutral-700 border-t-indigo-500 rounded-full animate-spin" />
@@ -1864,6 +1967,12 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
 
     const [mode, setMode] = useState<"single" | "batch">("single");
     const [batchItems, setBatchItems] = useState<BatchItem[]>(() => [makeBatchItem()]);
+    const [batchOutputDirectory, setBatchOutputDirectoryState] = useState("");
+    const [batchPattern, setBatchPattern] = useState("*-cut*");
+    const [batchMatchMode, setBatchMatchMode] = useState<BatchMatchMode>("glob");
+    const [batchImportError, setBatchImportError] = useState<string | null>(null);
+    const [batchImportNotice, setBatchImportNotice] = useState<string | null>(null);
+    const [batchImporting, setBatchImporting] = useState(false);
 
     const addBatchItem = useCallback(() => setBatchItems((prev) => [...prev, makeBatchItem()]), []);
 
@@ -1882,11 +1991,98 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
         setBatchItems((prev) => {
             const src = prev[sourceIndex];
             if (!src) return prev;
-            // Resolve against current opts inside the setter so we don't close over stale opts
+            // Resolve against current opts inside the setter so we don't close over stale opts.
             const copyable = extractCopyableSettings(resolveItemOpts(opts, src));
             return prev.map((it) => it.id === targetId ? { ...it, overrides: { ...it.overrides, ...copyable } } : it);
         });
     }, [opts]);
+
+    const setBatchOutputDirectory = useCallback((directory: string) => {
+        setBatchOutputDirectoryState(directory);
+        setBatchItems((prev) => prev.map((item) => item.outputPathOverridden
+            ? item
+            : { ...item, outputPath: deriveBatchOutputPath(directory, item.jsonFilePath) }
+        ));
+    }, []);
+
+    const appendImportedPairs = useCallback((pairs: BatchPair[]) => {
+        if (pairs.length === 0) return;
+        const destination = batchOutputDirectory || getPathDirectory(pairs[0].jsonFilePath);
+        setBatchItems((prev) => {
+            const blankOnly = prev.length === 1 && !prev[0].jsonFilePath;
+            const base = blankOnly ? [] : prev;
+            return [
+                ...base,
+                ...pairs.map((pair) => ({
+                    ...makeBatchItem(),
+                    jsonFilePath: pair.jsonFilePath,
+                    overlayVideoPath: pair.videoFilePath,
+                    outputPath: deriveBatchOutputPath(destination, pair.jsonFilePath),
+                })),
+            ];
+        });
+
+        if (!batchOutputDirectory) setBatchOutputDirectoryState(destination);
+        setBatchImportNotice(`Imported ${pairs.length} JSONL + MP4 pair${pairs.length === 1 ? "" : "s"}.`);
+        setBatchImportError(null);
+    }, [batchOutputDirectory]);
+
+    const scanSelectedBatchFiles = useCallback(async () => {
+        setBatchImporting(true);
+        setBatchImportError(null);
+        setBatchImportNotice(null);
+        try {
+            const selection = await open({
+                multiple: true,
+                filters: [{ name: "Batch files", extensions: ["jsonl", "mp4"] }],
+            });
+            const paths = Array.isArray(selection) ? selection : (typeof selection === "string" ? [selection] : []);
+            const pairs = pairBatchFiles(paths, batchPattern, batchMatchMode);
+            if (pairs.length === 0) {
+                throw new Error("No matching JSONL + MP4 pairs were found. Check the pattern and select both files for each cut.");
+            }
+            appendImportedPairs(pairs);
+        } catch (e) {
+            if (e instanceof Error && e.message.includes("No matching")) setBatchImportError(e.message);
+            else if (e) setBatchImportError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBatchImporting(false);
+        }
+    }, [appendImportedPairs, batchMatchMode, batchPattern]);
+
+    const scanBatchFolder = useCallback(async () => {
+        setBatchImporting(true);
+        setBatchImportError(null);
+        setBatchImportNotice(null);
+        try {
+            const selection = await open({ multiple: false, directory: true });
+            if (typeof selection !== "string") return;
+            setBatchOutputDirectory(selection);
+
+            // Folder enumeration lives in the native layer because the browser sandbox
+            // cannot reliably turn a selected Tauri directory into absolute file paths.
+            // The frontend accepts the result as either string paths or { path } entries.
+            const entries = await invoke<unknown[]>("read_directory_files", { path: selection });
+            const paths = entries.flatMap((entry) => {
+                if (typeof entry === "string") return [entry];
+                if (entry && typeof entry === "object" && "path" in entry && typeof (entry as { path?: unknown }).path === "string") return [(entry as { path: string }).path];
+                return [];
+            });
+            const pairs = pairBatchFiles(paths, batchPattern, batchMatchMode);
+            if (pairs.length === 0) {
+                throw new Error("The selected folder contains no matching JSONL + MP4 pairs for the current pattern.");
+            }
+            appendImportedPairs(pairs);
+        } catch (e) {
+            setBatchImportError(
+                e instanceof Error
+                    ? `${e.message} — group-of-files import is available as a fallback if your backend does not expose folder enumeration yet.`
+                    : String(e),
+            );
+        } finally {
+            setBatchImporting(false);
+        }
+    }, [appendImportedPairs, batchMatchMode, batchPattern, setBatchOutputDirectory]);
 
     const setOpt = useCallback(<K extends keyof RenderVideoArgs>(key: K, value: RenderVideoArgs[K]) => {
         onUpdate({ renderOptions: { ...opts, [key]: value } });
@@ -1948,8 +2144,8 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
     const [batchDispatchError, setBatchDispatchError] = useState<string | null>(null);
 
     const readyBatchItems = useMemo(
-        () => batchItems.filter((it) => it.jsonFilePath && it.outputPath),
-        [batchItems],
+        () => batchItems.filter((it) => it.jsonFilePath && (it.outputPath || deriveBatchOutputPath(batchOutputDirectory, it.jsonFilePath))),
+        [batchItems, batchOutputDirectory],
     );
 
     const handleBatchDispatch = useCallback(async () => {
@@ -1962,7 +2158,10 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
             const batchPayload = readyBatchItems.map((item) => ({
                 id: crypto.randomUUID(),
                 jsonFilePath: item.jsonFilePath,
-                options: resolveItemOpts(opts, item),
+                options: resolveItemOpts(opts, {
+                    ...item,
+                    outputPath: item.outputPath || deriveBatchOutputPath(batchOutputDirectory, item.jsonFilePath),
+                }),
             }));
 
             // Single invoke — backend handles semaphore throttling and ordering.
@@ -1998,7 +2197,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
         } finally {
             setBatchDispatching(false);
         }
-    }, [readyBatchItems, batchDispatching, opts, tab, navigate, onUpdate, registerTaskSnapshot]);
+    }, [readyBatchItems, batchDispatching, opts, tab, navigate, onUpdate, registerTaskSnapshot, batchOutputDirectory]);
 
     return (
         <div className="space-y-5 pb-4">
@@ -2070,68 +2269,132 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
             {mode === "batch" && (
                 <>
                     {/* ═══════════════════════════════════════════════════════════════
-                        ZONE 1 — SHARED TEMPLATE
-                        Anything you set here applies to EVERY item by default.
-                        Items only need a source file + output path.
+                        ZONE 1 — SHARED TEMPLATE + FAST IMPORT
                     ═══════════════════════════════════════════════════════════════ */}
-                    <div className="rounded-xl border-2 border-violet-700/40 overflow-hidden shadow-lg shadow-violet-900/10">
-                        {/* Unmissable zone header */}
-                        <div className="flex items-center gap-3 px-4 py-2.5 bg-violet-950/40 border-b border-violet-800/40">
-                            <div className="flex items-center gap-2 flex-1 min-w-0">
-                                <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-violet-600 text-white text-[10px] font-bold tracking-wider uppercase shrink-0">
-                                    <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor">
-                                        <circle cx="4" cy="4" r="3" />
-                                    </svg>
-                                    Shared template
-                                </span>
-                                <span className="text-[10px] text-violet-300/60">
-                                    Applies to every item below unless overridden per-item
-                                </span>
+                    <div className="rounded-2xl border border-violet-700/50 overflow-hidden shadow-xl shadow-violet-950/10 bg-neutral-950/50">
+                        <div className="flex items-center gap-3 px-4 py-3 bg-linear-to-r from-violet-950/60 via-violet-950/30 to-neutral-950 border-b border-violet-800/40">
+                            <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-violet-600/20 border border-violet-500/30 text-violet-300 shrink-0">
+                                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                                    <rect x="2" y="2" width="12" height="12" rx="2" />
+                                    <path d="M5 2v12M11 2v12M2 6h12M2 10h12" opacity=".45" />
+                                </svg>
                             </div>
-                            <span className="text-[9px] text-violet-500 font-mono shrink-0">
-                                {batchItems.length} item{batchItems.length !== 1 ? "s" : ""} inherit this
-                            </span>
+                            <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-[11px] font-bold uppercase tracking-[0.12em] text-violet-200">Batch template</span>
+                                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-600 text-white font-bold">shared</span>
+                                </div>
+                                <p className="text-[10px] text-violet-300/55 mt-0.5">Geometry, styling, Direct Pipe behavior and every non-source render option live here first.</p>
+                            </div>
+                            <span className="text-[9px] text-violet-400/60 font-mono shrink-0">{batchItems.length} item{batchItems.length !== 1 ? "s" : ""}</span>
                         </div>
-                        {/* Settings body */}
-                        <div className="px-4 py-4 bg-neutral-950/20">
+
+                        <div className="px-4 py-4 space-y-4">
+                            {/* Shared output destination */}
+                            <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
+                                <div>
+                                    <div className="flex items-center gap-2 mb-1">
+                                        <FieldLabel>Template output folder</FieldLabel>
+                                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300 border border-violet-800/40">all items inherit</span>
+                                    </div>
+                                    <BrowseInput value={batchOutputDirectory} onChange={setBatchOutputDirectory}
+                                                 onBrowse={async () => {
+                                                     try {
+                                                         const sel = await open({ multiple: false, directory: true });
+                                                         if (typeof sel === "string") setBatchOutputDirectory(sel);
+                                                     } catch {}
+                                                 }}
+                                                 onClear={() => setBatchOutputDirectory("")}
+                                                 placeholder="Choose one destination for the whole batch" browseLabel="Select folder" />
+                                    {!batchOutputDirectory && (
+                                        <p className="text-[9px] text-neutral-700 mt-1.5">Until a folder is selected, imported items fall back to the source folder.</p>
+                                    )}
+                                </div>
+                                <div className="flex items-center justify-end gap-1.5">
+                                    <button type="button" onClick={() => setBatchOutputDirectory(getPathDirectory(opts.outputPath || ""))} disabled={!getPathDirectory(opts.outputPath || "")}
+                                            className="px-2.5 py-1.5 rounded-md border border-neutral-800 bg-neutral-900 text-[10px] text-neutral-500 hover:text-neutral-300 hover:border-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed">
+                                        Use current output folder
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Fast JSONL + MP4 pair importer */}
+                            <div className="rounded-xl border border-neutral-800 bg-neutral-900/55 overflow-hidden">
+                                <div className="px-3.5 py-3 border-b border-neutral-800/80 flex items-center gap-2.5">
+                                    <div className="w-7 h-7 rounded-md bg-emerald-950/60 border border-emerald-800/50 flex items-center justify-center text-emerald-400">
+                                        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                                            <path d="M3 5h10M3 8h6M3 11h8" />
+                                            <path d="M12 7v6M9 10l3 3 3-3" />
+                                        </svg>
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-neutral-300">Auto-pair chat logs + cut videos</div>
+                                        <div className="text-[9px] text-neutral-600 mt-0.5">Matches identical filename stems, so both <span className="font-mono">cut1</span> and <span className="font-mono">cut01</span> work automatically.</div>
+                                    </div>
+                                </div>
+                                <div className="p-3.5 space-y-3">
+                                    <div className="grid grid-cols-1 sm:grid-cols-[auto_auto_minmax(0,1fr)] gap-2 items-end">
+                                        <div>
+                                            <FieldLabel>Match mode</FieldLabel>
+                                            <PillTabs options={[{ value: "glob" as BatchMatchMode, label: "Glob" }, { value: "regex" as BatchMatchMode, label: "Regex" }]} value={batchMatchMode} onChange={setBatchMatchMode} />
+                                        </div>
+                                        <div className="sm:col-span-2">
+                                            <div className="flex items-center mb-1"><FieldLabel>{batchMatchMode === "glob" ? "Filename stem pattern" : "Stem regex"}</FieldLabel><span className="text-[9px] text-neutral-700 ml-2">example: <span className="font-mono">*-cut*</span></span></div>
+                                            <TextInput value={batchPattern} onChange={setBatchPattern} placeholder="*-cut*" mono />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                                        <button type="button" onClick={scanSelectedBatchFiles} disabled={batchImporting}
+                                                className="flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-bold disabled:opacity-40 transition-all">
+                                            {batchImporting ? "Scanning…" : "Select files"}
+                                        </button>
+                                        <button type="button" onClick={scanBatchFolder} disabled={batchImporting}
+                                                className="flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-200 text-[10px] font-bold disabled:opacity-40 transition-all">
+                                            Select folder
+                                        </button>
+                                        <button type="button" onClick={addBatchItem}
+                                                className="flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-dashed border-neutral-700 text-neutral-500 hover:text-neutral-300 text-[10px] font-semibold transition-all">
+                                            + Manual item
+                                        </button>
+                                    </div>
+                                    <div className="flex flex-wrap items-center gap-2 text-[9px] text-neutral-700">
+                                        <span className="font-mono">name123-cut01.jsonl</span><span>↔</span><span className="font-mono">name123-cut01.mp4</span>
+                                        <span className="ml-auto">Pairs are case-insensitive and sorted naturally.</span>
+                                    </div>
+                                    {batchImportNotice && (
+                                        <div className="px-3 py-2 rounded-lg bg-emerald-950/30 border border-emerald-800/40 text-[10px] text-emerald-400">{batchImportNotice}</div>
+                                    )}
+                                    {batchImportError && (
+                                        <div className="px-3 py-2 rounded-lg bg-red-950/30 border border-red-800/40 text-[10px] text-red-400">{batchImportError}</div>
+                                    )}
+                                </div>
+                            </div>
+
                             <SettingsPanel
                                 opts={opts} setOpt={setOpt} setOpts={setOpts}
                                 isBatchItem={false}
+                                showTemplateCanvas
                             />
                         </div>
                     </div>
 
                     {/* ═══════════════════════════════════════════════════════════════
                         ZONE 2 — RENDER ITEMS
-                        Each item = one output file. Set its source (.jsonl) and
-                        output path. All other settings come from the template above
-                        unless you explicitly override them inside the item.
                     ═══════════════════════════════════════════════════════════════ */}
                     <div className="space-y-2.5">
-                        {/* Zone header */}
-                        <div className="flex items-center justify-between">
+                        <div className="flex items-center justify-between gap-2">
                             <div className="flex items-center gap-2">
                                 <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-bold tracking-wider uppercase">
-                                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                                        <rect x="1" y="1" width="6" height="6" rx="1" />
-                                    </svg>
+                                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><rect x="1" y="1" width="6" height="6" rx="1" /></svg>
                                     Render items
                                 </span>
                                 <span className="text-[10px] text-neutral-600">
-                                    {batchItems.length} total
-                                    {readyBatchItems.length > 0 && (
-                                        <> · <span className="text-emerald-500 font-medium">{readyBatchItems.length} ready</span></>
-                                    )}
+                                    {batchItems.length} total{readyBatchItems.length > 0 && <> · <span className="text-emerald-500 font-medium">{readyBatchItems.length} ready</span></>}
                                 </span>
                             </div>
-                            {batchItems.length > 1 && (
-                                <span className="text-[9px] text-neutral-700">
-                                    Run order: top → bottom (backend-throttled)
-                                </span>
-                            )}
+                            <span className="text-[9px] text-neutral-700 hidden sm:block">collapsed by default · explicit changes become overrides</span>
                         </div>
 
-                        {/* Item cards */}
                         <div className="space-y-2">
                             {batchItems.map((item, index) => (
                                 <BatchItemPanel
@@ -2140,24 +2403,18 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                     index={index}
                                     mainOpts={opts}
                                     allItems={batchItems}
+                                    sharedOutputDirectory={batchOutputDirectory}
                                     onChange={(updated) => updateBatchItem(item.id, updated)}
                                     onRemove={() => removeBatchItem(item.id)}
                                     onCopyFrom={(si) => copySettingsFromItem(item.id, si)}
                                 />
                             ))}
 
-                            {/* Add item */}
                             <button type="button" onClick={addBatchItem}
                                     className="w-full py-3 border border-dashed border-neutral-800 hover:border-violet-600/50 rounded-xl text-xs text-neutral-600 hover:text-violet-400 transition-all flex items-center justify-center gap-2 group">
-                                <span className="w-5 h-5 rounded-full border border-dashed border-current flex items-center justify-center">
-                                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-                                        <path d="M4 1v6M1 4h6" />
-                                    </svg>
-                                </span>
+                                <span className="w-5 h-5 rounded-full border border-dashed border-current flex items-center justify-center"><svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M4 1v6M1 4h6" /></svg></span>
                                 Add render item
-                                <span className="text-[9px] text-neutral-700 group-hover:text-violet-600/60 transition-colors">
-                                    — inherits shared template
-                                </span>
+                                <span className="text-[9px] text-neutral-700 group-hover:text-violet-600/60 transition-colors">— inherits the template</span>
                             </button>
                         </div>
                     </div>
@@ -2166,55 +2423,36 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                     <div className="space-y-2">
                         {batchDispatchError && (
                             <div className="flex items-start gap-2 px-3 py-2.5 bg-red-950/40 border border-red-800/50 rounded-lg text-xs text-red-400">
-                                <svg className="shrink-0 mt-0.5" width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-                                    <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4h1.5v5h-1.5V5zm0 6h1.5v1.5h-1.5V11z" />
-                                </svg>
+                                <svg className="shrink-0 mt-0.5" width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4h1.5v5h-1.5V5zm0 6h1.5v1.5h-1.5V11z" /></svg>
                                 <span><strong className="font-semibold">Batch dispatch failed: </strong>{batchDispatchError}</span>
                             </div>
                         )}
 
-                        {/* Summary + queue button */}
                         {batchItems.length > 0 && (
-                            <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/60 border border-neutral-800 rounded-lg text-[10px]">
+                            <div className="flex flex-wrap items-center gap-2 px-3 py-2.5 bg-neutral-900/60 border border-neutral-800 rounded-lg text-[10px]">
                                 <span className={`flex items-center gap-1.5 font-medium ${readyBatchItems.length > 0 ? "text-emerald-400" : "text-neutral-600"}`}>
                                     <span className={`w-1.5 h-1.5 rounded-full ${readyBatchItems.length > 0 ? "bg-emerald-400" : "bg-neutral-700"}`} />
                                     {readyBatchItems.length} ready
                                 </span>
                                 {batchItems.length - readyBatchItems.length > 0 && (
-                                    <span className="flex items-center gap-1.5 text-neutral-600">
-                                        <span className="w-1.5 h-1.5 rounded-full bg-neutral-700" />
-                                        {batchItems.length - readyBatchItems.length} need source + output
-                                    </span>
+                                    <span className="flex items-center gap-1.5 text-neutral-600"><span className="w-1.5 h-1.5 rounded-full bg-neutral-700" />{batchItems.length - readyBatchItems.length} incomplete</span>
                                 )}
-                                <span className="ml-auto text-neutral-700">
-                                    Renders throttled by backend · max 1–2 simultaneous
-                                </span>
+                                <span className="ml-auto text-neutral-700">Template geometry shared · base videos item-specific</span>
                             </div>
                         )}
 
-                        <button
-                            type="button"
-                            onClick={handleBatchDispatch}
-                            disabled={readyBatchItems.length === 0 || batchDispatching}
-                            className={`w-full py-3 text-sm font-bold rounded-xl transition-all tracking-wide ${
-                                readyBatchItems.length > 0 && !batchDispatching
-                                    ? "bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-900/40 active:scale-[0.99]"
-                                    : "bg-neutral-800 text-neutral-600 cursor-not-allowed"
-                            }`}>
+                        <button type="button" onClick={handleBatchDispatch} disabled={readyBatchItems.length === 0 || batchDispatching}
+                                className={`w-full py-3 text-sm font-bold rounded-xl transition-all tracking-wide ${
+                                    readyBatchItems.length > 0 && !batchDispatching
+                                        ? "bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-900/40 active:scale-[0.99]"
+                                        : "bg-neutral-800 text-neutral-600 cursor-not-allowed"
+                                }`}>
                             {batchDispatching ? (
-                                <span className="flex items-center justify-center gap-2">
-                                    <span className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-white/80 rounded-full animate-spin" />
-                                    Sending {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""} to backend…
-                                </span>
+                                <span className="flex items-center justify-center gap-2"><span className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-white/80 rounded-full animate-spin" />Sending {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""} to backend…</span>
                             ) : readyBatchItems.length === 0 ? (
-                                "Set a source + output on at least one item"
+                                "Import or add a JSONL + MP4 item to begin"
                             ) : (
-                                <span className="flex items-center justify-center gap-2">
-                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M3 8h10M8 3l5 5-5 5" />
-                                    </svg>
-                                    Queue {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""}
-                                </span>
+                                <span className="flex items-center justify-center gap-2"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8h10M8 3l5 5-5 5" /></svg>Queue {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""}</span>
                             )}
                         </button>
                     </div>

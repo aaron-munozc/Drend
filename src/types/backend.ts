@@ -201,6 +201,12 @@ export interface NormalizedFormat {
 	hasAudio: boolean;
 	sizeBytes: number | null;
 	bitrate: number | null;
+
+	// Player context (new)
+	protocol?: string;
+	language?: string;
+	dynamicRange?: string;
+
 	uiLabel: string;
 	url: string;
 }
@@ -213,6 +219,14 @@ export interface Chapter {
 
 export interface Metadata {
 	id: string;
+
+	// --- UNIFIED FIELDS FOR FRONTEND ---
+	displayTitle: string;
+	displayCreator: string;
+	mediaType: string;
+	seriesContext?: string;
+
+	// --- RAW FIELDS ---
 	title: string;
 	description?: string;
 	duration?: number;

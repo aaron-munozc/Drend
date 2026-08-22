@@ -4200,6 +4200,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4863,7 +4864,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stream_extractor"
 version = "0.1.0"
-source = "git+https://github.com/aaron-munozc/Stream-Extractor.git?branch=main#ddd661e56fd83389b8459c21843c768ab4f02a25"
+source = "git+https://github.com/aaron-munozc/Stream-Extractor.git?branch=main#0b61439d6b6a7d94b2aa6a05276b12c0c36aa3f2"
 dependencies = [
  "chrono",
  "dirs",

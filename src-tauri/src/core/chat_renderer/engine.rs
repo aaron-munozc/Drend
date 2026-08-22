@@ -748,7 +748,6 @@ fn layout_message_blocking(
                     blob,
                     x: x_cursor,
                     y: baseline,
-                    width: prefix_w,
                 });
             }
             x_cursor += prefix_w;
@@ -763,7 +762,6 @@ fn layout_message_blocking(
                             blob,
                             x: x_cursor,
                             y: baseline,
-                            width: w,
                         });
                     }
                     x_cursor += w;
@@ -845,9 +843,7 @@ fn layout_message_blocking(
 
         measured_max_w = measured_max_w.max(x_cursor - bubble_pad);
         layout_lines.push(LayoutLine {
-            tokens: layout_tokens,
-            line_height: lh,
-            total_width: x_cursor - bubble_pad,
+            tokens: layout_tokens
         });
         y_cursor += lh;
     }
@@ -1761,10 +1757,6 @@ pub async fn process_chat_render(
     let mut emote_ids: FxHashSet<i32> = FxHashSet::default();
     let mut image_urls: FxHashSet<String> = FxHashSet::default();
 
-    // Pre-seed image URLs from the emote map (provider-filtered).
-    for url in emote_map.all_urls_filtered(&args.emote_providers) {
-        image_urls.insert(url.to_string());
-    }
 
     let skip_users_set: FxHashSet<String> = args.skip_users.iter().cloned().collect();
 
@@ -1848,13 +1840,40 @@ pub async fn process_chat_render(
             // still expire at the right moment.
             if do_prefill && offset < 0.0 {
                 let age_secs = -offset;
+
                 if age_secs <= prefill_window_secs as f64 {
-                    // Compute how many frames old this message already is at frame 0.
                     let age_offset_frames =
                         (age_secs * scan_args.fps as f64).round() as u32;
-                    let _ = prefill_tx.send((msg, false /* never grouped for prefill */, age_offset_frames));
+
+                    // Discover assets used by prefill messages too.
+                    for tok in tokenise(&msg.content, map_opt) {
+                        match tok {
+                            MessageToken::KickEmote { id } => {
+                                if flags.kick {
+                                    if let Ok(i) = id.parse::<i32>() {
+                                        emote_ids.insert(i);
+                                    }
+                                }
+                            }
+                            MessageToken::ProviderEmote(e) => {
+                                image_urls.insert(e.url.to_string());
+                            }
+                            MessageToken::ImageUrl(url) => {
+                                if flags.image_urls {
+                                    image_urls.insert(url.to_string());
+                                }
+                            }
+                            MessageToken::Text(_) => {}
+                        }
+                    }
+
+                    let _ = prefill_tx.send((
+                        msg,
+                        false,
+                        age_offset_frames,
+                    ));
                 }
-                // Collect emote IDs for prefill messages too.
+
                 continue;
             }
 

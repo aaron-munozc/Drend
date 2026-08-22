@@ -58,15 +58,76 @@ struct FfzEmote {
     name: String,
 }
 
-// --- Twitch Global ---
+// --- Twitch ---
+//
+// Both the global and channel endpoints return the same response envelope.
+// We parse `format` and `theme_mode` to pick the best CDN variant:
+//   - Prefer "animated" format over "static" when the emote supports it.
+//   - Prefer "dark" theme (most stream overlays use dark backgrounds).
+// When the preferred variant is absent we fall back to the static CDN URL
+// built from the emote ID, which is always available.
 #[derive(Deserialize)]
-struct TwitchGlobalResponse {
+struct TwitchEmoteResponse {
     data: Vec<TwitchEmote>,
 }
+
 #[derive(Deserialize)]
 struct TwitchEmote {
     id: String,
     name: String,
+    /// e.g. ["static", "animated"]
+    #[serde(default)]
+    format: Vec<String>,
+    /// e.g. ["light", "dark"]
+    #[serde(default)]
+    theme_mode: Vec<String>,
+    /// e.g. ["1.0", "2.0", "3.0"]
+    #[serde(default)]
+    scale: Vec<String>,
+}
+
+impl TwitchEmote {
+    /// Build the best CDN URL for this emote.
+    ///
+    /// Twitch's CDN template is:
+    ///   https://static-cdn.jtvnw.net/emoticons/v2/<id>/<format>/<theme>/<scale>
+    ///
+    /// We always target 2× resolution (scale "2.0") for crisp rendering on
+    /// HiDPI displays. Animated GIFs are preferred when available because they
+    /// keep chat lively; static PNG is the safe fallback.
+    fn cdn_url(&self) -> String {
+        let format = if self.format.iter().any(|f| f == "animated") {
+            "animated"
+        } else {
+            "static"
+        };
+
+        let theme = if self.theme_mode.iter().any(|t| t == "dark") {
+            "dark"
+        } else {
+            "light"
+        };
+
+        // Pick 2.0 if advertised, else whatever Twitch says is available, else
+        // hard-code "2.0" anyway (it exists for every emote in practice).
+        let scale = if self.scale.iter().any(|s| s == "2.0") {
+            "2.0"
+        } else {
+            self.scale.first().map(|s| s.as_str()).unwrap_or("2.0")
+        };
+
+        format!(
+            "https://static-cdn.jtvnw.net/emoticons/v2/{}/{}/{}/{}",
+            self.id, format, theme, scale
+        )
+    }
+
+    /// Returns true when this is an animated emote. Used to mark the resolved
+    /// emote so the cache can handle GIF vs PNG decode paths correctly.
+    #[allow(dead_code)]
+    fn is_animated(&self) -> bool {
+        self.format.iter().any(|f| f == "animated")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,14 +148,29 @@ pub struct ResolvedEmote {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Which CDN/network a named emote originates from.
+///
 /// Stored alongside each `ResolvedEmote` so provider flags can filter at
 /// lookup time without a second map lookup.
+///
+/// # Provider priority (insertion order into `EmoteNameMap`)
+///
+/// When two providers define the same emote name the *last writer wins* in the
+/// flat `FxHashMap`. The `build_emote_map` method inserts in this order:
+///
+///   7TV → BTTV → FFZ → TwitchGlobal → TwitchChannel
+///
+/// So channel-specific emotes (TwitchChannel, then 7TV/BTTV/FFZ which are
+/// always channel-scoped) shadow global ones. Reverse the insertion order if
+/// you prefer global emotes to take precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmoteProvider {
     SevenTv,
     Bttv,
     Ffz,
+    /// Twitch built-in global emotes (Kappa, LUL, PogChamp, …).
     TwitchGlobal,
+    /// Broadcaster-specific Twitch subscriber / Bits / follower emotes.
+    TwitchChannel,
 }
 
 #[derive(Debug, Clone)]
@@ -110,8 +186,10 @@ struct EmoteEntry {
 #[derive(Default, Clone)]
 pub struct EmoteNameMap {
     /// Flat map: emote name → (resolved emote, provider tag).
-    /// FxHashMap: non-cryptographic hasher ~2× faster than std HashMap for
-    /// short string keys, which is the dominant case for emote names.
+    ///
+    /// `FxHashMap` uses a non-cryptographic hasher that is ~2× faster than the
+    /// standard library's `SipHash` for the short string keys that dominate
+    /// emote name lookups (most emote names are 4–12 characters).
     map: FxHashMap<String, EmoteEntry>,
 }
 
@@ -120,17 +198,27 @@ impl EmoteNameMap {
         Self::default()
     }
 
-    /// Fetches all requested emotes concurrently.
-    /// Requires a shared `reqwest::Client`.
+    /// Fetches all requested emotes concurrently and builds the name map.
+    ///
+    /// All network requests are dispatched simultaneously via `tokio::join!`.
+    /// Individual provider failures are logged and produce an empty result
+    /// rather than propagating an error, so a single unreachable CDN doesn't
+    /// abort the entire render.
+    ///
+    /// `twitch_token` and `twitch_client_id` are only required when
+    /// `flags.twitch_global` is true. Pass empty strings (or `None` via a
+    /// wrapper) when Twitch is disabled — the Twitch future short-circuits
+    /// before making any network calls.
     pub async fn build_emote_map(
         client: &reqwest::Client,
         flags: &EmoteProviderFlags,
         channel_id: &str,
-        // twitch_auth: &crate::auth::TwitchAuthManager, // Uncomment when ready
+        twitch_token: &str,
+        twitch_client_id: &str,
     ) -> AppResult<Self> {
         let mut map = EmoteNameMap::new();
 
-        // Spawn async futures for each enabled provider.
+        // ── 7TV ──────────────────────────────────────────────────────────────
         let seven_tv_fut = async {
             if !flags.seven_tv {
                 return vec![];
@@ -138,11 +226,12 @@ impl EmoteNameMap {
             Self::fetch_7tv(client, channel_id)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("7TV Fetch Error: {}", e);
+                    eprintln!("[emotes] 7TV fetch error: {}", e);
                     vec![]
                 })
         };
 
+        // ── BTTV ─────────────────────────────────────────────────────────────
         let bttv_fut = async {
             if !flags.bttv {
                 return vec![];
@@ -150,11 +239,12 @@ impl EmoteNameMap {
             Self::fetch_bttv(client, channel_id)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("BTTV Fetch Error: {}", e);
+                    eprintln!("[emotes] BTTV fetch error: {}", e);
                     vec![]
                 })
         };
 
+        // ── FFZ ──────────────────────────────────────────────────────────────
         let ffz_fut = async {
             if !flags.ffz {
                 return vec![];
@@ -162,28 +252,54 @@ impl EmoteNameMap {
             Self::fetch_ffz(client, channel_id)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("FFZ Fetch Error: {}", e);
+                    eprintln!("[emotes] FFZ fetch error: {}", e);
                     vec![]
                 })
         };
 
+        // ── Twitch (global + channel) ─────────────────────────────────────────
+        //
+        // Both endpoints require a Bearer token and a Client-Id header.
+        // The caller is responsible for obtaining and refreshing the token;
+        // this function only uses whatever it is handed.
+        //
+        // If twitch_global is disabled the future returns two empty vecs
+        // without touching the network, so stale/empty credentials are safe.
         let twitch_fut = async {
             if !flags.twitch_global {
-                return vec![];
+                return (Vec::new(), Vec::new());
             }
-            // Uncomment the lines below when TwitchAuthManager is hooked up:
-            // Self::fetch_twitch_global(client, twitch_auth).await.unwrap_or_else(|e| {
-            //    eprintln!("Twitch Fetch Error: {}", e);
-            //    vec![]
-            // })
-            vec![] // Placeholder
+
+            if twitch_token.is_empty() || twitch_client_id.is_empty() {
+                eprintln!("[emotes] Twitch is enabled but token/client_id are empty — skipping");
+                return (Vec::new(), Vec::new());
+            }
+
+            // Run global and channel fetches in parallel — they hit different
+            // endpoints and neither depends on the other's result.
+            let (global_result, channel_result) = tokio::join!(
+                Self::fetch_twitch_global(client, twitch_token, twitch_client_id),
+                Self::fetch_twitch_channel(client, twitch_token, twitch_client_id, channel_id),
+            );
+
+            let global = global_result.unwrap_or_else(|e| {
+                eprintln!("[emotes] Twitch global emote fetch error: {}", e);
+                Vec::new()
+            });
+
+            let channel = channel_result.unwrap_or_else(|e| {
+                eprintln!("[emotes] Twitch channel emote fetch error: {}", e);
+                Vec::new()
+            });
+
+            (global, channel)
         };
 
-        // Run all network requests simultaneously
-        let (seven_tv_emotes, bttv_emotes, ffz_emotes, twitch_emotes) =
+        // ── Dispatch all providers concurrently ───────────────────────────────
+        let (seven_tv_emotes, bttv_emotes, ffz_emotes, (twitch_global, twitch_channel)) =
             tokio::join!(seven_tv_fut, bttv_fut, ffz_fut, twitch_fut);
 
-        // Populate the map
+        // ── Populate map (insertion order determines shadowing priority) ───────
         if !seven_tv_emotes.is_empty() {
             map.add_7tv(&seven_tv_emotes);
         }
@@ -193,8 +309,13 @@ impl EmoteNameMap {
         if !ffz_emotes.is_empty() {
             map.add_ffz(&ffz_emotes);
         }
-        if !twitch_emotes.is_empty() {
-            map.add_twitch_global(&twitch_emotes);
+        if !twitch_global.is_empty() {
+            map.add_twitch(&twitch_global, EmoteProvider::TwitchGlobal);
+        }
+        // Channel emotes inserted last — they shadow global emotes of the
+        // same name (e.g. a channel's custom "LUL" variant overrides global LUL).
+        if !twitch_channel.is_empty() {
+            map.add_twitch(&twitch_channel, EmoteProvider::TwitchChannel);
         }
 
         Ok(map)
@@ -205,9 +326,9 @@ impl EmoteNameMap {
         self.map.is_empty()
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     // Internal API Fetchers
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
 
     async fn fetch_7tv(
         client: &reqwest::Client,
@@ -227,8 +348,9 @@ impl EmoteNameMap {
             .emotes
             .into_iter()
             .map(|e| {
-                // 7TV zero-width flags typically involve bitwise checks on `e.data.flags`
-                // Usually, bit 8 (256) indicates zero-width.
+                // Bit 256 (0x100) in the flags field marks a zero-width emote.
+                // Zero-width emotes are composited over the preceding token
+                // without advancing the layout cursor.
                 let is_zero_width = (e.data.flags & 256) != 0;
                 (e.name, e.id, is_zero_width)
             })
@@ -253,15 +375,15 @@ impl EmoteNameMap {
             .json()
             .await?;
 
-        let mut emotes = Vec::new();
-        // BTTV doesn't expose zero-width nicely via this endpoint, defaulting to false
-        for e in res
+        // BTTV doesn't expose zero-width information via this endpoint.
+        // There is no official zero-width flag in the v3 API response, so all
+        // BTTV emotes are treated as normal (non-stacking) emotes.
+        let emotes = res
             .channel_emotes
             .into_iter()
-            .chain(res.shared_emotes.into_iter())
-        {
-            emotes.push((e.code, e.id, false));
-        }
+            .chain(res.shared_emotes)
+            .map(|e| (e.code, e.id, false))
+            .collect();
 
         Ok(emotes)
     }
@@ -279,34 +401,70 @@ impl EmoteNameMap {
             .json()
             .await?;
 
-        let mut emotes = Vec::new();
-        for (_, set) in res.sets {
-            for e in set.emoticons {
-                emotes.push((e.name, e.id.to_string()));
-            }
-        }
+        let emotes = res
+            .sets
+            .into_values()
+            .flat_map(|set| set.emoticons)
+            .map(|e| (e.name, e.id.to_string()))
+            .collect();
 
         Ok(emotes)
     }
 
-    /*
-    async fn fetch_twitch_global(client: &reqwest::Client, auth: &crate::auth::TwitchAuthManager) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
-        let token = auth.get_token().await?;
-        let url = "https://api.twitch.tv/helix/chat/emotes/global";
+    /// Fetch Twitch **global** emotes (Kappa, LUL, PogChamp, etc.).
+    ///
+    /// Endpoint: `GET https://api.twitch.tv/helix/chat/emotes/global`
+    ///
+    /// Returns `TwitchEmote` records with `format`, `theme_mode`, and `scale`
+    /// populated so `TwitchEmote::cdn_url()` can pick the best CDN variant.
+    async fn fetch_twitch_global(
+        client: &reqwest::Client,
+        access_token: &str,
+        client_id: &str,
+    ) -> Result<Vec<TwitchEmote>, reqwest::Error> {
+        let res: TwitchEmoteResponse = client
+            .get("https://api.twitch.tv/helix/chat/emotes/global")
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Client-Id", client_id)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
 
-        let res: TwitchGlobalResponse = client.get(url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Client-Id", &auth.client_id)
-            .send().await?.error_for_status()?.json().await?;
-
-        let emotes = res.data.into_iter().map(|e| (e.name, e.id)).collect();
-        Ok(emotes)
+        Ok(res.data)
     }
-    */
 
-    // ─────────────────────────────────────────────────────────────────────────────
+    /// Fetch **channel-specific** Twitch emotes (subscriber, Bits, follower).
+    ///
+    /// Endpoint: `GET https://api.twitch.tv/helix/chat/emotes?broadcaster_id=<id>`
+    ///
+    /// These emotes are recognised by name (e.g. `xqcW`, `forsenE`) the same
+    /// way as global emotes — Twitch doesn't embed structured tags into chat
+    /// messages for either category. Recognition is purely word-based.
+    async fn fetch_twitch_channel(
+        client: &reqwest::Client,
+        access_token: &str,
+        client_id: &str,
+        channel_id: &str,
+    ) -> Result<Vec<TwitchEmote>, reqwest::Error> {
+        let res: TwitchEmoteResponse = client
+            .get("https://api.twitch.tv/helix/chat/emotes")
+            .query(&[("broadcaster_id", channel_id)])
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Client-Id", client_id)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(res.data)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Map Ingestion Handlers
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
 
     pub fn add_7tv(&mut self, entries: &[(String, String, bool)]) {
         self.map.reserve(entries.len());
@@ -351,6 +509,7 @@ impl EmoteNameMap {
                 name.clone(),
                 EmoteEntry {
                     emote: ResolvedEmote {
+                        // FFZ serves PNG only. "2" is the 2× (56px) scale tier.
                         url: Arc::from(
                             format!("https://cdn.frankerfacez.com/emoticon/{}/2", id).as_str(),
                         ),
@@ -362,31 +521,46 @@ impl EmoteNameMap {
         }
     }
 
-    pub fn add_twitch_global(&mut self, entries: &[(String, String)]) {
+    /// Ingest a slice of raw `TwitchEmote` records produced by either
+    /// `fetch_twitch_global` or `fetch_twitch_channel`.
+    ///
+    /// The `provider` argument lets the caller tag entries with the correct
+    /// variant (`TwitchGlobal` vs `TwitchChannel`) so the flag filter in
+    /// `lookup` can distinguish them if needed in the future. For now both
+    /// variants share the `twitch_global` flag — see `EmoteProviderFlags`.
+    ///
+    /// # CDN URL selection
+    ///
+    /// `TwitchEmote::cdn_url()` inspects the `format`, `theme_mode`, and
+    /// `scale` arrays from the API response to pick the best variant:
+    ///
+    /// - **Format** — "animated" (GIF) is preferred over "static" (PNG) so
+    ///   emotes like PogChamp animate in the overlay.
+    /// - **Theme** — "dark" is preferred because stream overlays almost always
+    ///   sit on a dark or transparent background.
+    /// - **Scale** — "2.0" (56 px) is preferred; falls back to whatever the
+    ///   API reports, then hard-codes "2.0" as a last resort (it exists for
+    ///   every emote in practice).
+    pub fn add_twitch(&mut self, entries: &[TwitchEmote], provider: EmoteProvider) {
         self.map.reserve(entries.len());
-        for (name, id) in entries {
+        for emote in entries {
             self.map.insert(
-                name.clone(),
+                emote.name.clone(),
                 EmoteEntry {
                     emote: ResolvedEmote {
-                        url: Arc::from(
-                            format!(
-                                "https://static-cdn.jtvnaw.net/emoticons/v2/{}/default/dark/2.0",
-                                id
-                            )
-                                .as_str(),
-                        ),
+                        url: Arc::from(emote.cdn_url().as_str()),
+                        // Twitch has no zero-width emote concept.
                         zero_width: false,
                     },
-                    provider: EmoteProvider::TwitchGlobal,
+                    provider,
                 },
             );
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     // Querying
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
 
     /// Look up a word against the emote map, respecting the active provider
     /// flags. Returns `None` if the word is not an emote or its provider is
@@ -398,7 +572,10 @@ impl EmoteNameMap {
             EmoteProvider::SevenTv => flags.seven_tv,
             EmoteProvider::Bttv => flags.bttv,
             EmoteProvider::Ffz => flags.ffz,
-            EmoteProvider::TwitchGlobal => flags.twitch_global,
+            // Both Twitch variants are gated by the same flag for now.
+            // Add a dedicated `twitch_channel` flag to `EmoteProviderFlags`
+            // if you ever need to enable/disable them independently.
+            EmoteProvider::TwitchGlobal | EmoteProvider::TwitchChannel => flags.twitch_global,
         };
         if allowed {
             Some(entry.emote.clone())
@@ -408,6 +585,7 @@ impl EmoteNameMap {
     }
 
     /// Iterate over all resolved emote URLs that pass the given provider flags.
+    ///
     /// Used during the metadata scan pass to pre-warm the image cache for every
     /// provider emote that could appear in the log.
     pub fn all_urls_filtered<'a>(
@@ -419,7 +597,7 @@ impl EmoteNameMap {
                 EmoteProvider::SevenTv => flags.seven_tv,
                 EmoteProvider::Bttv => flags.bttv,
                 EmoteProvider::Ffz => flags.ffz,
-                EmoteProvider::TwitchGlobal => flags.twitch_global,
+                EmoteProvider::TwitchGlobal | EmoteProvider::TwitchChannel => flags.twitch_global,
             };
             if allowed {
                 Some(e.emote.url.as_ref())
@@ -442,15 +620,21 @@ impl EmoteNameMap {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Zero-copy token produced during the metadata scan pass.
+///
 /// All variants borrow from the original message string so no heap allocation
 /// is needed in the hot scan loop.
 #[derive(Debug, Clone)]
 pub enum MessageToken<'a> {
     Text(&'a str),
-    /// Kick platform emote — `id` is the numeric string from the tag.
+    /// Kick platform emote — `id` is the numeric string from the `[emote:id:name]` tag.
     KickEmote {
         id: &'a str,
     },
+    /// A resolved third-party emote (7TV / BTTV / FFZ / Twitch).
+    ///
+    /// Twitch emotes land here too: the tokeniser matches them by plain word
+    /// (e.g. "LUL", "KEKW", "xqcW") rather than by a structured tag, because
+    /// Twitch chat embeds no per-message emote metadata in VOD logs.
     ProviderEmote(ResolvedEmote),
     ImageUrl(&'a str),
 }
@@ -460,8 +644,10 @@ pub enum MessageToken<'a> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Owned counterpart of [`MessageToken`] used for layout where the original
-/// string slice is no longer available. Text variants stores a `Box<str>`
-/// instead of `String` to avoid the 3-word overhead on the heap.
+/// string slice is no longer available.
+///
+/// `Text` stores a `Box<str>` instead of `String` to avoid the 3-word overhead
+/// of `String`'s unused capacity field on the heap.
 #[derive(Debug, Clone)]
 pub enum OwnedMessageToken {
     Text(Box<str>),
@@ -497,16 +683,29 @@ pub fn clear_token_cache() {}
 
 /// Tokenise `text` into a flat list of [`MessageToken`]s.
 ///
-/// `emote_map` / `flags` should be `Some(…)` when the map is non-empty and
-/// name-based providers are enabled. Passing `None` silently skips text-based
-/// emote resolution and is correct during the first metadata scan where you
-/// only want raw token kinds, not resolved URLs.
+/// # Emote detection strategies by platform
+///
+/// **Kick** — Emotes are embedded as structured tags: `[emote:123:KEKW]`.
+/// The EMOTE_REGEX captures the numeric ID. No word-map lookup is needed;
+/// the Kick CDN URL is constructed from the ID at render time.
+///
+/// **Twitch / 7TV / BTTV / FFZ** — These providers have no structured tag in
+/// VOD chat logs. Emotes appear as plain words (e.g. `LUL`, `KEKW`, `xqcW`,
+/// `PauseChamp`). Every whitespace-delimited word is checked against the
+/// `EmoteNameMap`. This is case-sensitive and exact-match only — "lul" ≠ "LUL".
+///
+/// # Parameters
+///
+/// - `emote_map` — pass `Some((map, flags))` to enable word-based emote lookup.
+///   Pass `None` during the first metadata scan to skip resolution and return
+///   raw token kinds only.
+///
+/// # Performance notes
 ///
 /// Two cheap `contains` scans gate the regex paths so plain-text messages pay
-/// only for whitespace splitting.
-///
-/// Provider flags are checked per-word so that disabling a provider costs only
-/// a single branch in the hot path instead of a pre-filter pass over the map.
+/// only for whitespace splitting. Provider flags are checked per-word so that
+/// disabling a provider costs a single branch rather than a pre-filter pass
+/// over the map.
 pub fn tokenise<'a>(
     text: &'a str,
     emote_map: Option<(&EmoteNameMap, &EmoteProviderFlags)>,
@@ -516,7 +715,7 @@ pub fn tokenise<'a>(
     let flags_url = emote_map.map(|(_, f)| f.image_urls).unwrap_or(true);
     let has_url = flags_url && text.contains("http");
 
-    // Fast path: no structured tokens; only word-split for emote lookup.
+    // Fast path: no structured tokens — word-split only for emote lookup.
     if !has_kick && !has_url {
         let mut tokens = Vec::with_capacity(8);
         push_text_segment(text, emote_map, &mut tokens);
@@ -587,7 +786,10 @@ pub fn tokenise<'a>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Split `seg` on whitespace and push each part as a [`MessageToken`].
-/// Emote-map lookup is attempted for every non-whitespace word.
+///
+/// Emote-map lookup is attempted for every non-whitespace word. Single space
+/// characters are preserved as `Text(" ")` tokens so the layout pass can
+/// measure them without re-splitting. Other whitespace sequences are collapsed.
 fn push_text_segment<'a>(
     seg: &'a str,
     map_flags: Option<(&EmoteNameMap, &EmoteProviderFlags)>,
@@ -619,6 +821,11 @@ fn push_text_segment<'a>(
     }
 }
 
+/// Attempt an emote-map lookup for a single word.
+///
+/// If the word resolves to an emote it becomes a `ProviderEmote` token;
+/// otherwise it becomes a `Text` token. This is the hot path for Twitch /
+/// 7TV / BTTV / FFZ emote recognition — no regex, just a hash-map probe.
 #[inline(always)]
 fn push_word<'a>(
     word: &'a str,

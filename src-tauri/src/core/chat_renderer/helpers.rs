@@ -356,7 +356,6 @@ fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<E
 
     Ok(EmoteData::Animated {
         frames: Arc::from(skia_frames),
-        durations_ms: Arc::from(durations_ms),
         cum_durations: Arc::from(cum_durations),
         total_ms: current_cum,
         w: final_w as i32,

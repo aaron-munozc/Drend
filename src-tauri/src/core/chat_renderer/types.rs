@@ -28,9 +28,7 @@ pub struct ImageMetaSidecar {
 /// Pre-measured layout line for efficient draw loop mapping
 #[derive(Clone)]
 pub struct LayoutLine {
-    pub tokens: Vec<LayoutToken>,
-    pub line_height: f32,
-    pub total_width: f32,
+    pub tokens: Vec<LayoutToken>
 }
 #[derive(Clone)]
 pub enum LayoutToken {
@@ -38,7 +36,6 @@ pub enum LayoutToken {
         blob: TextBlob,
         x: f32,
         y: f32,
-        width: f32,
     },
     Emote {
         data: Arc<EmoteData>,
@@ -60,7 +57,6 @@ pub enum EmoteData {
     /// For a 56-px, 20-frame emote that's ~250 KB per unique GIF emote.
     Animated {
         frames: Arc<[Image]>,
-        durations_ms: Arc<[u32]>,
         cum_durations: Arc<[u32]>,
         total_ms: u32,
         w: i32,
@@ -317,15 +313,15 @@ impl EmoteCache {
                 };
 
                 if let Some(rx) = rx_opt {
-                    match rx.await {
+                    return match rx.await {
                         Ok(Ok(arc)) => {
                             let mut m = ec.mem.lock();
                             m.put(id, arc);
-                            return Ok(());
+                            Ok(())
                         }
-                        Ok(Err(err)) => return Err(AppError::EmoteCache(err)),
+                        Ok(Err(err)) => Err(AppError::EmoteCache(err)),
                         Err(_) => {
-                            return Err(AppError::InternalError("inflight leader dropped".into()))
+                            Err(AppError::InternalError("inflight leader dropped".into()))
                         }
                     }
                 }
@@ -500,10 +496,6 @@ impl ImageCache {
         self.base.join(format!("{}.{}", stem, ext))
     }
 
-    fn disk_path_for(&self, url: &str, ext: &str) -> PathBuf {
-        self.disk_path_for_hash(self.hash_url(url), ext)
-    }
-
     #[inline]
     fn remember_missing_disk(&self, hash: u64) {
         let mut miss = self.missing_disk.lock();
@@ -546,25 +538,6 @@ impl ImageCache {
         m.get(&key).cloned()
     }
 
-    pub(crate) fn peek_dimensions(&self, url: &str) -> Option<(i32, i32)> {
-        let key = self.hash_url(url);
-        {
-            let mut meta = self.meta.lock();
-            if let Some(v) = meta.get(&key) {
-                return Some((v.w, v.h));
-            }
-        }
-
-        let sidecar_stem = Self::hash_to_stem(key);
-        let sidecar = self.base.join(format!("{}.meta.json", sidecar_stem));
-        let bytes = std::fs::read(sidecar).ok()?;
-        let parsed: ImageMetaSidecar = serde_json::from_slice(&bytes).ok()?;
-        {
-            let mut meta = self.meta.lock();
-            meta.put(key, parsed);
-        }
-        Some((parsed.w, parsed.h))
-    }
 
     fn store_sidecar_blocking(&self, hash: u64, w: i32, h: i32) {
         let sidecar_stem = Self::hash_to_stem(hash);
@@ -631,15 +604,15 @@ impl ImageCache {
                 };
 
                 if let Some(rx) = rx_opt {
-                    match rx.await {
+                    return match rx.await {
                         Ok(Ok(arc)) => {
                             let mut m = ec.mem.lock();
                             m.put(key, arc);
-                            return Ok(());
+                            Ok(())
                         }
-                        Ok(Err(err)) => return Err(AppError::EmoteCache(err)),
+                        Ok(Err(err)) => Err(AppError::EmoteCache(err)),
                         Err(_) => {
-                            return Err(AppError::InternalError("inflight leader dropped".into()))
+                            Err(AppError::InternalError("inflight leader dropped".into()))
                         }
                     }
                 }

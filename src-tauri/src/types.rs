@@ -22,11 +22,19 @@ pub struct YtDlpFormat {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<f64>,
-    pub tbr: Option<f64>,
+    pub tbr: Option<f64>, // Total bitrate
+    pub vbr: Option<f64>, // Video bitrate
+    pub abr: Option<f64>, // Audio bitrate
+    pub asr: Option<u32>, // Audio sample rate (Hz)
+    pub audio_channels: Option<u8>,
     pub filesize: Option<u64>,
     pub filesize_approx: Option<u64>,
     pub resolution: Option<String>,
     pub url: Option<String>,
+    pub manifest_url: Option<String>,
+    pub protocol: Option<String>,
+    pub language: Option<String>,
+    pub dynamic_range: Option<String>,
     pub http_headers: Option<HashMap<String, String>>,
 }
 
@@ -41,6 +49,15 @@ pub struct NormalizedFormat {
     pub has_audio: bool,
     pub size_bytes: Option<u64>,
     pub bitrate: Option<f64>,
+
+    // Player context
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_range: Option<String>,
+
     pub ui_label: String,
     pub url: String,
 }
@@ -61,6 +78,7 @@ pub struct YtDlpMetadata {
     pub description: Option<String>,
     pub duration: Option<f64>,
 
+    // Standard Creators
     pub uploader: Option<String>,
     pub uploader_id: Option<String>,
     pub uploader_url: Option<String>,
@@ -68,11 +86,29 @@ pub struct YtDlpMetadata {
     pub channel_id: Option<String>,
     pub channel_url: Option<String>,
 
+    // Music Specific
+    pub track: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub release_year: Option<u32>,
+    pub genre: Option<String>,
+
+    // Episodic / TV Specific
+    pub series: Option<String>,
+    pub season_number: Option<u32>,
+    pub episode: Option<String>,
+    pub episode_number: Option<u32>,
+
+    // Playlist Context
+    pub playlist: Option<String>,
+    pub playlist_index: Option<u32>,
+
     pub thumbnail: Option<String>,
     pub view_count: Option<u64>,
     pub concurrent_view_count: Option<u64>,
     pub like_count: Option<u64>,
     pub comment_count: Option<u64>,
+    pub repost_count: Option<u64>, // Social media
 
     pub timestamp: Option<f64>,
     pub upload_date: Option<String>,
@@ -88,9 +124,7 @@ pub struct YtDlpMetadata {
     pub automatic_captions: Option<HashMap<String, serde_json::Value>>,
 
     pub availability: Option<String>,
-
     pub formats: Option<Vec<YtDlpFormat>>,
-
     pub webpage_url: Option<String>,
     pub extractor: Option<String>,
 }
@@ -99,6 +133,16 @@ pub struct YtDlpMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedMetadata {
     pub id: String,
+
+    // --- UNIFIED FIELDS FOR FRONTEND ---
+    pub display_title: String,
+    pub display_creator: String,
+    pub media_type: String, // "Music", "Episode", "Live Stream", "Video"
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_context: Option<String>,
+
+    // --- RAW FIELDS ---
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -130,7 +174,6 @@ pub struct NormalizedMetadata {
     pub was_live: bool,
     pub is_upcoming: bool,
     pub age_limit: u8,
-
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<String>,
