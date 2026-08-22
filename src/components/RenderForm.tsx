@@ -87,7 +87,8 @@ type BatchMatchMode = "glob" | "regex";
 interface BatchPair {
     key: string;
     jsonFilePath: string;
-    videoFilePath: string;
+    /** Optional item-specific base video. Required only when that item uses Direct Pipe mode. */
+    videoFilePath?: string;
 }
 
 function makeBatchItem(): BatchItem {
@@ -137,18 +138,26 @@ function matchesBatchPattern(stem: string, pattern: string, mode: BatchMatchMode
 function pairBatchFiles(paths: string[], pattern: string, mode: BatchMatchMode): BatchPair[] {
     const jsonByStem = new Map<string, string>();
     const videoByStem = new Map<string, string>();
+
     for (const path of paths) {
         const ext = getPathFileName(path).split(".").pop()?.toLowerCase();
         const stem = getPathStem(path);
         if (!stem || !matchesBatchPattern(stem, pattern, mode)) continue;
+
         const key = stem.toLowerCase();
         if (ext === "jsonl" && !jsonByStem.has(key)) jsonByStem.set(key, path);
-        if (ext === "mp4" && !videoByStem.has(key)) videoByStem.set(key, path);
+        if (["mp4", "mkv", "mov", "avi", "webm"].includes(ext ?? "") && !videoByStem.has(key)) {
+            videoByStem.set(key, path);
+        }
     }
+
     return Array.from(jsonByStem.entries())
-        .filter(([key]) => videoByStem.has(key))
         .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
-        .map(([key, jsonFilePath]) => ({ key, jsonFilePath, videoFilePath: videoByStem.get(key)! }));
+        .map(([key, jsonFilePath]) => ({
+            key,
+            jsonFilePath,
+            videoFilePath: videoByStem.get(key),
+        }));
 }
 
 function deriveBatchOutputPath(directory: string, jsonPath: string) {
@@ -169,7 +178,7 @@ function resolveItemOpts(main: RenderVideoArgs, item: BatchItem): RenderVideoArg
 function extractCopyableSettings(opts: RenderVideoArgs) {
     const result: Partial<RenderVideoArgs> = { ...opts };
     for (const key of BATCH_ITEM_EXCLUSIVE_KEYS) {
-        delete (result as Record<string, unknown>)[key];
+        Reflect.deleteProperty(result, key);
     }
     return result;
 }
@@ -529,6 +538,7 @@ function CanvasEditor({
                           onShapeAdd, onShapeRemove, onImageAdd, onImageRemove, onImageBrowse,
                       }: CanvasEditorProps) {
     const containerRef = useRef<HTMLDivElement>(null);
+    const stageRef = useRef<HTMLDivElement>(null);
     const videoRef = useRef<HTMLVideoElement>(null);
     const animRef = useRef<number>(0);
 
@@ -648,9 +658,9 @@ function CanvasEditor({
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 
         let sw = 1; let sh = 1;
-        if (containerRef.current) {
-            const r = containerRef.current.getBoundingClientRect();
-            sw = r.width; sh = r.height;
+        if (stageRef.current) {
+            const r = stageRef.current.getBoundingClientRect();
+            sw = Math.max(1, r.width); sh = Math.max(1, r.height);
         }
 
         dragRef.current = {
@@ -724,13 +734,13 @@ function CanvasEditor({
     // Stable container-level pointer-down handler
     const handleContainerPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
         const target = e.target as HTMLElement;
-        const isBackground = target === containerRef.current || target.classList.contains("bg-checkerboard");
+        const isBackground = target === stageRef.current || target.classList.contains("bg-checkerboard");
         if (editMode === "video" && videoMeta && isBackground) {
             e.preventDefault();
             let sw = 1; let sh = 1;
-            if (containerRef.current) {
-                const r = containerRef.current.getBoundingClientRect();
-                sw = r.width; sh = r.height;
+            if (stageRef.current) {
+                const r = stageRef.current.getBoundingClientRect();
+                sw = Math.max(1, r.width); sh = Math.max(1, r.height);
             }
             dragRef.current = {
                 kind: "scrub", startX: e.clientX, startY: e.clientY, edge: null,
@@ -744,10 +754,36 @@ function CanvasEditor({
     }, [editMode, videoMeta, currentTime, bgWidth, bgHeight]);
 
     const containerStyle: React.CSSProperties = useMemo(() => ({
-        aspectRatio: `${bgWidth} / ${bgHeight}`,
+        // Keep the editor in a normal streamer/OBS-style 16:9 viewport.
+        // The logical render canvas is fitted inside this viewport so its native
+        // coordinates stay intact even when a reference video is portrait/tall.
+        aspectRatio: "16 / 9",
         cursor: isDragging ? "grabbing" : (editMode === "video" ? "ew-resize" : "default"),
         touchAction: "none",
-    }), [bgWidth, bgHeight, isDragging, editMode]);
+    }), [isDragging, editMode]);
+
+    const stageStyle = useMemo<React.CSSProperties>(() => {
+        const outerRatio = 16 / 9;
+        const logicalRatio = bgWidth / Math.max(1, bgHeight);
+        if (logicalRatio >= outerRatio) {
+            return {
+                position: "absolute",
+                left: 0,
+                right: 0,
+                top: "50%",
+                height: `${(outerRatio / logicalRatio) * 100}%`,
+                transform: "translateY(-50%)",
+            };
+        }
+        return {
+            position: "absolute",
+            top: 0,
+            bottom: 0,
+            left: "50%",
+            width: `${(logicalRatio / outerRatio) * 100}%`,
+            transform: "translateX(-50%)",
+        };
+    }, [bgWidth, bgHeight]);
 
     return (
         <div className="space-y-3">
@@ -758,180 +794,186 @@ function CanvasEditor({
                 style={containerStyle}
                 onPointerDown={handleContainerPointerDown}
             >
-                {/* Top Canvas Toolbar */}
-                <div className="absolute top-2 left-1/2 -translate-x-1/2 flex items-center bg-neutral-950/90 backdrop-blur-sm border border-neutral-700/80 p-1 rounded-lg z-50 shadow-xl gap-0.5" style={{ whiteSpace: "nowrap" }}>
-                    {isOverlayMode && videoMeta && (
-                        <button type="button" onClick={(e) => { e.stopPropagation(); handleModeChange("video"); }}
-                                title="Drag canvas left/right to scrub video"
-                                className={`flex items-center gap-1 px-2.5 py-1.5 text-[9px] uppercase tracking-wider font-bold rounded-md transition-colors ${editMode === "video" ? "bg-indigo-600 text-white shadow-sm" : "text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800"}`}>
-                            <svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><path d="M1 5h8M6 2l3 3-3 3M4 2 1 5l3 3"/></svg>
-                            Scrub
+                <div
+                    ref={stageRef}
+                    className="absolute overflow-visible"
+                    style={stageStyle}
+                >
+                    {/* Top Canvas Toolbar */}
+                    <div className="absolute top-2 left-1/2 -translate-x-1/2 flex items-center bg-neutral-950/90 backdrop-blur-sm border border-neutral-700/80 p-1 rounded-lg z-50 shadow-xl gap-0.5" style={{ whiteSpace: "nowrap" }}>
+                        {isOverlayMode && videoMeta && (
+                            <button type="button" onClick={(e) => { e.stopPropagation(); handleModeChange("video"); }}
+                                    title="Drag canvas left/right to scrub video"
+                                    className={`flex items-center gap-1 px-2.5 py-1.5 text-[9px] uppercase tracking-wider font-bold rounded-md transition-colors ${editMode === "video" ? "bg-indigo-600 text-white shadow-sm" : "text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800"}`}>
+                                <svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><path d="M1 5h8M6 2l3 3-3 3M4 2 1 5l3 3"/></svg>
+                                Scrub
+                            </button>
+                        )}
+                        <button type="button" onClick={(e) => { e.stopPropagation(); handleModeChange("chat"); }}
+                                title="Move and resize the chat overlay region"
+                                className={`flex items-center gap-1 px-2.5 py-1.5 text-[9px] uppercase tracking-wider font-bold rounded-md transition-colors ${editMode === "chat" ? "bg-violet-600 text-white shadow-sm" : "text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800"}`}>
+                            <svg width="8" height="8" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="1" y="1" width="8" height="8" rx="1"/></svg>
+                            Chat
                         </button>
+                        <button type="button" onClick={(e) => { e.stopPropagation(); handleModeChange("shapes"); }}
+                                title="Select, move and resize shape and image overlays"
+                                className={`flex items-center gap-1 px-2.5 py-1.5 text-[9px] uppercase tracking-wider font-bold rounded-md transition-colors ${editMode === "shapes" ? "bg-emerald-600 text-white shadow-sm" : "text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800"}`}>
+                            <svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><circle cx="5" cy="5" r="3"/></svg>
+                            Shapes
+                        </button>
+                    </div>
+
+                    {/* Background — only show video preview when Direct Pipe Mode is ON */}
+                    {isOverlayMode && videoMeta ? (
+                        <video
+                            ref={videoRef}
+                            src={videoMeta.videoSrc}
+                            poster={videoMeta.posterDataUrl}
+                            className="absolute inset-0 w-full h-full object-contain pointer-events-none"
+                            style={{ opacity: 0.6 }}
+                            muted
+                            playsInline
+                            onLoadedMetadata={handleVideoMetadata}
+                            onEnded={handleVideoEnded}
+                        />
+                    ) : (
+                        <div className="absolute inset-0 pointer-events-none bg-checkerboard" style={CHECKERBOARD_STYLE} />
                     )}
-                    <button type="button" onClick={(e) => { e.stopPropagation(); handleModeChange("chat"); }}
-                            title="Move and resize the chat overlay region"
-                            className={`flex items-center gap-1 px-2.5 py-1.5 text-[9px] uppercase tracking-wider font-bold rounded-md transition-colors ${editMode === "chat" ? "bg-violet-600 text-white shadow-sm" : "text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800"}`}>
-                        <svg width="8" height="8" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="1" y="1" width="8" height="8" rx="1"/></svg>
-                        Chat
-                    </button>
-                    <button type="button" onClick={(e) => { e.stopPropagation(); handleModeChange("shapes"); }}
-                            title="Select, move and resize shape and image overlays"
-                            className={`flex items-center gap-1 px-2.5 py-1.5 text-[9px] uppercase tracking-wider font-bold rounded-md transition-colors ${editMode === "shapes" ? "bg-emerald-600 text-white shadow-sm" : "text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800"}`}>
-                        <svg width="8" height="8" viewBox="0 0 10 10" fill="currentColor"><circle cx="5" cy="5" r="3"/></svg>
-                        Shapes
-                    </button>
-                </div>
 
-                {/* Background — only show video preview when Direct Pipe Mode is ON */}
-                {isOverlayMode && videoMeta ? (
-                    <video
-                        ref={videoRef}
-                        src={videoMeta.videoSrc}
-                        poster={videoMeta.posterDataUrl}
-                        className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-                        style={{ opacity: 0.6 }}
-                        muted
-                        playsInline
-                        onLoadedMetadata={handleVideoMetadata}
-                        onEnded={handleVideoEnded}
-                    />
-                ) : (
-                    <div className="absolute inset-0 pointer-events-none bg-checkerboard" style={CHECKERBOARD_STYLE} />
-                )}
-
-                {/* Shape overlays */}
-                {shapeOverlays.map((s, i) => {
-                    const isSel = selKind === "shape" && selIdx === i;
-                    const rect = { x: s.x, y: s.y, width: s.width, height: s.height };
-                    return (
-                        <div key={`shape-${i}`}
-                             style={{
-                                 position: "absolute",
-                                 left: pct(s.x, bgWidth), top: pct(s.y, bgHeight),
-                                 width: pct(s.width, bgWidth), height: pct(s.height, bgHeight),
-                                 backgroundColor: `rgba(${s.color.red},${s.color.green},${s.color.blue},${s.color.alpha / 255})`,
-                                 borderRadius: s.cornerRadius > 0 ? `${(s.cornerRadius / Math.min(s.width, s.height)) * 50}%` : 0,
-                                 border: isSel ? "1.5px solid rgba(99,102,241,0.9)" : "1.5px dashed rgba(99,102,241,0.5)",
-                                 cursor: "move", zIndex: 10, boxSizing: "border-box", userSelect: "none",
-                                 pointerEvents: editMode === "shapes" ? "auto" : "none",
-                                 touchAction: "none",
-                             }}
-                             onPointerDown={(e) => { onPointerDown(e, "shape", i, rect); }}
-                        >
+                    {/* Shape overlays */}
+                    {shapeOverlays.map((s, i) => {
+                        const isSel = selKind === "shape" && selIdx === i;
+                        const rect = { x: s.x, y: s.y, width: s.width, height: s.height };
+                        return (
+                            <div key={`shape-${i}`}
+                                 style={{
+                                     position: "absolute",
+                                     left: pct(s.x, bgWidth), top: pct(s.y, bgHeight),
+                                     width: pct(s.width, bgWidth), height: pct(s.height, bgHeight),
+                                     backgroundColor: `rgba(${s.color.red},${s.color.green},${s.color.blue},${s.color.alpha / 255})`,
+                                     borderRadius: s.cornerRadius > 0 ? `${(s.cornerRadius / Math.min(s.width, s.height)) * 50}%` : 0,
+                                     border: isSel ? "1.5px solid rgba(99,102,241,0.9)" : "1.5px dashed rgba(99,102,241,0.5)",
+                                     cursor: "move", zIndex: 10, boxSizing: "border-box", userSelect: "none",
+                                     pointerEvents: editMode === "shapes" ? "auto" : "none",
+                                     touchAction: "none",
+                                 }}
+                                 onPointerDown={(e) => { onPointerDown(e, "shape", i, rect); }}
+                            >
                             <span style={{ position: "absolute", top: 2, left: 4, fontSize: 8, fontWeight: 700, color: "rgba(165,180,252,0.7)", pointerEvents: "none", userSelect: "none", lineHeight: 1 }}>
                                 S{i + 1}
                             </span>
-                            {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="shape" index={i} onPointerDown={onPointerDown} />)}
-                        </div>
-                    );
-                })}
+                                {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="shape" index={i} onPointerDown={onPointerDown} />)}
+                            </div>
+                        );
+                    })}
 
-                {/* Image overlays */}
-                {imageOverlays.map((ov, i) => {
-                    const isSel = selKind === "image" && selIdx === i;
-                    const w = ov.width ?? 200; const h = ov.height ?? 150;
-                    const rect = { x: ov.x, y: ov.y, width: w, height: h };
-                    // convertFileSrc in render is fine here — it's synchronous and cheap
-                    const bgImage = ov.assetPath ? `url(${convertFileSrc(ov.assetPath)})` : undefined;
-                    return (
-                        <div key={`image-${i}`}
-                             style={{
-                                 position: "absolute",
-                                 left: pct(ov.x, bgWidth), top: pct(ov.y, bgHeight),
-                                 width: pct(w, bgWidth), height: pct(h, bgHeight),
-                                 opacity: ov.alpha,
-                                 backgroundImage: bgImage,
-                                 backgroundSize: "cover", backgroundPosition: "center",
-                                 backgroundColor: ov.assetPath ? undefined : "rgba(52,211,153,0.1)",
-                                 border: isSel ? "1.5px solid rgba(52,211,153,0.9)" : "1.5px dashed rgba(52,211,153,0.5)",
-                                 cursor: "move", zIndex: 11, boxSizing: "border-box", userSelect: "none",
-                                 pointerEvents: editMode === "shapes" ? "auto" : "none",
-                                 touchAction: "none",
-                             }}
-                             onPointerDown={(e) => { onPointerDown(e, "image", i, rect); }}
-                        >
-                            {!ov.assetPath && (
-                                <span style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: "rgba(52,211,153,0.6)", pointerEvents: "none", userSelect: "none" }}>
+                    {/* Image overlays */}
+                    {imageOverlays.map((ov, i) => {
+                        const isSel = selKind === "image" && selIdx === i;
+                        const w = ov.width ?? 200; const h = ov.height ?? 150;
+                        const rect = { x: ov.x, y: ov.y, width: w, height: h };
+                        // convertFileSrc in render is fine here — it's synchronous and cheap
+                        const bgImage = ov.assetPath ? `url(${convertFileSrc(ov.assetPath)})` : undefined;
+                        return (
+                            <div key={`image-${i}`}
+                                 style={{
+                                     position: "absolute",
+                                     left: pct(ov.x, bgWidth), top: pct(ov.y, bgHeight),
+                                     width: pct(w, bgWidth), height: pct(h, bgHeight),
+                                     opacity: ov.alpha,
+                                     backgroundImage: bgImage,
+                                     backgroundSize: "cover", backgroundPosition: "center",
+                                     backgroundColor: ov.assetPath ? undefined : "rgba(52,211,153,0.1)",
+                                     border: isSel ? "1.5px solid rgba(52,211,153,0.9)" : "1.5px dashed rgba(52,211,153,0.5)",
+                                     cursor: "move", zIndex: 11, boxSizing: "border-box", userSelect: "none",
+                                     pointerEvents: editMode === "shapes" ? "auto" : "none",
+                                     touchAction: "none",
+                                 }}
+                                 onPointerDown={(e) => { onPointerDown(e, "image", i, rect); }}
+                            >
+                                {!ov.assetPath && (
+                                    <span style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: "rgba(52,211,153,0.6)", pointerEvents: "none", userSelect: "none" }}>
                                     IMG {i + 1}
                                 </span>
-                            )}
-                            {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="image" index={i} onPointerDown={onPointerDown} />)}
-                        </div>
-                    );
-                })}
-
-                {/* Chat overlay box */}
-                {(() => {
-                    const isSel = selKind === "chat";
-                    const isActiveMode = editMode === "chat";
-                    const rect = { x: chatX, y: chatY, width: chatW, height: chatH };
-                    return (
-                        <div
-                            style={{
-                                position: "absolute",
-                                left: pct(chatX, bgWidth), top: pct(chatY, bgHeight),
-                                width: pct(chatW, bgWidth), height: pct(chatH, bgHeight),
-                                backgroundColor: isSel ? "rgba(109,40,217,0.22)" : "rgba(109,40,217,0.12)",
-                                border: isSel
-                                    ? "2px solid rgba(139,92,246,0.95)"
-                                    : isActiveMode ? "2px dashed rgba(139,92,246,0.6)" : "2px dashed rgba(139,92,246,0.2)",
-                                cursor: isActiveMode ? "move" : "default",
-                                zIndex: 20,
-                                display: "flex", alignItems: "center", justifyContent: "center",
-                                boxSizing: "border-box", userSelect: "none",
-                                pointerEvents: isActiveMode ? "auto" : "none",
-                                touchAction: "none",
-                                transition: "border-color 0.15s, background-color 0.15s",
-                            }}
-                            onPointerDown={(e) => { onPointerDown(e, "chat", undefined, rect); }}
-                        >
-                            <div style={{ pointerEvents: "none", userSelect: "none", textAlign: "center" }}>
-                                <div style={{
-                                    fontSize: 9, fontWeight: 700,
-                                    color: isActiveMode ? "rgba(221,214,254,0.95)" : "rgba(167,139,250,0.4)",
-                                    background: isActiveMode ? "rgba(109,40,217,0.75)" : "rgba(109,40,217,0.3)",
-                                    padding: "2px 6px", borderRadius: 3, lineHeight: 1.5,
-                                    display: "flex", alignItems: "center", gap: 4,
-                                }}>
-                                    {isActiveMode && (
-                                        <svg width="7" height="7" viewBox="0 0 10 10" fill="currentColor" style={{ opacity: 0.8 }}>
-                                            <path d="M1 1h3v3H1zM6 1h3v3H6zM1 6h3v3H1zM6 6h3v3H6z"/>
-                                        </svg>
-                                    )}
-                                    CHAT OVERLAY
-                                </div>
-                                {isSel && <div style={{ fontSize: 8, color: "rgba(196,181,253,0.6)", fontFamily: "monospace", marginTop: 2 }}>{chatW}×{chatH} · drag to move</div>}
+                                )}
+                                {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="image" index={i} onPointerDown={onPointerDown} />)}
                             </div>
-                            {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="chat" onPointerDown={onPointerDown} />)}
+                        );
+                    })}
+
+                    {/* Chat overlay box */}
+                    {(() => {
+                        const isSel = selKind === "chat";
+                        const isActiveMode = editMode === "chat";
+                        const rect = { x: chatX, y: chatY, width: chatW, height: chatH };
+                        return (
+                            <div
+                                style={{
+                                    position: "absolute",
+                                    left: pct(chatX, bgWidth), top: pct(chatY, bgHeight),
+                                    width: pct(chatW, bgWidth), height: pct(chatH, bgHeight),
+                                    backgroundColor: isSel ? "rgba(109,40,217,0.22)" : "rgba(109,40,217,0.12)",
+                                    border: isSel
+                                        ? "2px solid rgba(139,92,246,0.95)"
+                                        : isActiveMode ? "2px dashed rgba(139,92,246,0.6)" : "2px dashed rgba(139,92,246,0.2)",
+                                    cursor: isActiveMode ? "move" : "default",
+                                    zIndex: 20,
+                                    display: "flex", alignItems: "center", justifyContent: "center",
+                                    boxSizing: "border-box", userSelect: "none",
+                                    pointerEvents: isActiveMode ? "auto" : "none",
+                                    touchAction: "none",
+                                    transition: "border-color 0.15s, background-color 0.15s",
+                                }}
+                                onPointerDown={(e) => { onPointerDown(e, "chat", undefined, rect); }}
+                            >
+                                <div style={{ pointerEvents: "none", userSelect: "none", textAlign: "center" }}>
+                                    <div style={{
+                                        fontSize: 9, fontWeight: 700,
+                                        color: isActiveMode ? "rgba(221,214,254,0.95)" : "rgba(167,139,250,0.4)",
+                                        background: isActiveMode ? "rgba(109,40,217,0.75)" : "rgba(109,40,217,0.3)",
+                                        padding: "2px 6px", borderRadius: 3, lineHeight: 1.5,
+                                        display: "flex", alignItems: "center", gap: 4,
+                                    }}>
+                                        {isActiveMode && (
+                                            <svg width="7" height="7" viewBox="0 0 10 10" fill="currentColor" style={{ opacity: 0.8 }}>
+                                                <path d="M1 1h3v3H1zM6 1h3v3H6zM1 6h3v3H1zM6 6h3v3H6z"/>
+                                            </svg>
+                                        )}
+                                        CHAT OVERLAY
+                                    </div>
+                                    {isSel && <div style={{ fontSize: 8, color: "rgba(196,181,253,0.6)", fontFamily: "monospace", marginTop: 2 }}>{chatW}×{chatH} · drag to move</div>}
+                                </div>
+                                {isSel && EDGES.map((edge) => <OverlayHandle key={edge} edge={edge} rect={rect} kind="chat" onPointerDown={onPointerDown} />)}
+                            </div>
+                        );
+                    })()}
+
+                    {/* Mode hint overlays */}
+                    {editMode === "video" && (
+                        <div style={{ position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: "rgba(255,255,255,0.9)", background: "rgba(10,10,10,0.7)", padding: "2px 8px", borderRadius: 4, pointerEvents: "none", userSelect: "none", whiteSpace: "nowrap" }}>
+                            Drag horizontally to scrub video
                         </div>
-                    );
-                })()}
+                    )}
+                    {editMode === "chat" && (
+                        <div style={{ position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: "rgba(196,181,253,0.9)", background: "rgba(10,10,10,0.7)", padding: "2px 8px", borderRadius: 4, pointerEvents: "none", userSelect: "none", whiteSpace: "nowrap" }}>
+                            Drag chat box · grab handles to resize
+                        </div>
+                    )}
+                    {editMode === "shapes" && (
+                        <div style={{ position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: "rgba(110,231,183,0.9)", background: "rgba(10,10,10,0.7)", padding: "2px 8px", borderRadius: 4, pointerEvents: "none", userSelect: "none", whiteSpace: "nowrap" }}>
+                            Click a shape or image to select · drag to move · grab handles to resize
+                        </div>
+                    )}
+                    {!isOverlayMode && (
+                        <div style={{ position: "absolute", top: 36, right: 6, fontSize: 8, color: "rgba(115,115,115,0.7)", background: "rgba(10,10,10,0.6)", padding: "1px 6px", borderRadius: 3, pointerEvents: "none", userSelect: "none" }}>
+                            Preview: standalone canvas
+                        </div>
+                    )}
 
-                {/* Mode hint overlays */}
-                {editMode === "video" && (
-                    <div style={{ position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: "rgba(255,255,255,0.9)", background: "rgba(10,10,10,0.7)", padding: "2px 8px", borderRadius: 4, pointerEvents: "none", userSelect: "none", whiteSpace: "nowrap" }}>
-                        Drag horizontally to scrub video
+                    <div style={{ position: "absolute", top: 6, left: 6, fontSize: 9, fontFamily: "monospace", color: "rgba(115,115,115,0.9)", background: "rgba(10,10,10,0.7)", padding: "1px 5px", borderRadius: 4, pointerEvents: "none", userSelect: "none" }}>
+                        {bgWidth}×{bgHeight}
+                        {videoMeta && videoMeta.width !== bgWidth && ` · vid ${videoMeta.width}×${videoMeta.height}`}
                     </div>
-                )}
-                {editMode === "chat" && (
-                    <div style={{ position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: "rgba(196,181,253,0.9)", background: "rgba(10,10,10,0.7)", padding: "2px 8px", borderRadius: 4, pointerEvents: "none", userSelect: "none", whiteSpace: "nowrap" }}>
-                        Drag chat box · grab handles to resize
-                    </div>
-                )}
-                {editMode === "shapes" && (
-                    <div style={{ position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: "rgba(110,231,183,0.9)", background: "rgba(10,10,10,0.7)", padding: "2px 8px", borderRadius: 4, pointerEvents: "none", userSelect: "none", whiteSpace: "nowrap" }}>
-                        Click a shape or image to select · drag to move · grab handles to resize
-                    </div>
-                )}
-                {!isOverlayMode && (
-                    <div style={{ position: "absolute", top: 36, right: 6, fontSize: 8, color: "rgba(115,115,115,0.7)", background: "rgba(10,10,10,0.6)", padding: "1px 6px", borderRadius: 3, pointerEvents: "none", userSelect: "none" }}>
-                        Preview: standalone canvas
-                    </div>
-                )}
-
-                <div style={{ position: "absolute", top: 6, left: 6, fontSize: 9, fontFamily: "monospace", color: "rgba(115,115,115,0.9)", background: "rgba(10,10,10,0.7)", padding: "1px 5px", borderRadius: 4, pointerEvents: "none", userSelect: "none" }}>
-                    {bgWidth}×{bgHeight}
-                    {videoMeta && videoMeta.width !== bgWidth && ` · vid ${videoMeta.width}×${videoMeta.height}`}
                 </div>
             </div>
 
@@ -1117,6 +1159,8 @@ interface SettingsPanelProps {
     onSetOverlayVideoPath?: (v: string) => void;
     /** Batch shared-template mode: show a canvas even without a shared base video. */
     showTemplateCanvas?: boolean;
+    /** In batch template mode this video is reference-only and is never sent to the renderer. */
+    previewOnlyBaseVideo?: boolean;
 }
 
 function SettingsPanel({
@@ -1124,7 +1168,7 @@ function SettingsPanel({
                            overriddenKeys, onResetKey,
                            isBatchItem = false,
                            overlayVideoPath, onSelectOverlayVideo, videoMeta, videoLoading, videoError, onSetOverlayVideoPath,
-                           showTemplateCanvas = false,
+                           showTemplateCanvas = false, previewOnlyBaseVideo = false,
                        }: SettingsPanelProps) {
     const [pinnedRaw, setPinnedRaw] = useState(() => opts.pinnedUsers.join(", "));
     const [skipRaw, setSkipRaw] = useState(() => opts.skipUsers.join(", "));
@@ -1194,8 +1238,9 @@ function SettingsPanel({
     const chatH = opts.overlayHeight ?? opts.height;
 
     const isOverlayMode = opts.useImmediatePipeOverlay;
-    const bgWidth = (isOverlayMode && videoMeta) ? videoMeta.width : opts.width;
-    const bgHeight = (isOverlayMode && videoMeta) ? videoMeta.height : opts.height;
+    const previewVideoMeta = videoMeta;
+    const bgWidth = (isOverlayMode && previewVideoMeta) ? previewVideoMeta.width : opts.width;
+    const bgHeight = (isOverlayMode && previewVideoMeta) ? previewVideoMeta.height : opts.height;
 
     return (
         <>
@@ -1222,10 +1267,13 @@ function SettingsPanel({
 
                     {isOverlayMode && onSelectOverlayVideo && onSetOverlayVideoPath && (
                         <div>
-                            <FieldLabel>Base video for overlay</FieldLabel>
+                            <FieldLabel>{previewOnlyBaseVideo ? "Reference base video (preview only)" : "Base video for overlay"}</FieldLabel>
                             <BrowseInput value={overlayVideoPath ?? ""} onChange={onSetOverlayVideoPath}
                                          onBrowse={onSelectOverlayVideo} onClear={handleClearOverlayVideo}
-                                         placeholder="/path/to/stream.mp4" browseLabel="Browse" />
+                                         placeholder={previewOnlyBaseVideo ? "/optional/reference/stream.mp4" : "/path/to/stream.mp4"} browseLabel="Browse" />
+                            {previewOnlyBaseVideo && (
+                                <p className="text-[9px] text-neutral-700 mt-1.5">Reference only: item videos are still used for the actual batch renders.</p>
+                            )}
                         </div>
                     )}
 
@@ -1258,13 +1306,13 @@ function SettingsPanel({
                         {showTemplateCanvas && !overlayVideoPath && (
                             <div className="mb-2 flex items-center gap-2 px-3 py-2 rounded-lg bg-violet-950/25 border border-violet-800/40 text-[10px] text-violet-300/80">
                                 <span className="w-1.5 h-1.5 rounded-full bg-violet-400 shrink-0" />
-                                Template canvas · base video is selected per render item. Overlay geometry and styling are shared here.
+                                Template preview · reference video is optional and never rendered; each item supplies its own base video.
                             </div>
                         )}
                         <CanvasEditor
                             bgWidth={bgWidth}
                             bgHeight={bgHeight}
-                            videoMeta={videoMeta ?? null}
+                            videoMeta={previewVideoMeta ?? null}
                             isOverlayMode={isOverlayMode}
                             shapeOverlays={opts.shapeOverlays}
                             imageOverlays={opts.imageOverlays}
@@ -1509,7 +1557,10 @@ function BatchItemPanel({ item, index, mainOpts, allItems, sharedOutputDirectory
     const handlePipeModeToggle = useCallback((v: boolean) => setOverride("useImmediatePipeOverlay", v), [setOverride]);
 
     const hasOverrides = overriddenKeys.size > 0;
-    const canDispatch = Boolean(item.jsonFilePath) && Boolean(item.outputPath || deriveBatchOutputPath(sharedOutputDirectory, item.jsonFilePath));
+    const missingPipeVideo = effectiveOpts.useImmediatePipeOverlay && !item.overlayVideoPath;
+    const canDispatch = Boolean(item.jsonFilePath)
+        && Boolean(item.outputPath || deriveBatchOutputPath(sharedOutputDirectory, item.jsonFilePath))
+        && !missingPipeVideo;
 
     // Copy targets: "Main settings" first, then sibling items
     const copyTargets = useMemo(() => {
@@ -1653,8 +1704,8 @@ function BatchItemPanel({ item, index, mainOpts, allItems, sharedOutputDirectory
                                 ready
                             </span>
                         ) : (
-                            <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-full bg-neutral-800 text-neutral-600 border border-neutral-700/50">
-                                incomplete
+                            <span className={`flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-full border ${missingPipeVideo ? "bg-orange-950/40 text-orange-400 border-orange-800/50" : "bg-neutral-800 text-neutral-600 border-neutral-700/50"}`}>
+                                {missingPipeVideo ? "needs base video" : "incomplete"}
                             </span>
                         )}
                         {outputUsesTemplate ? (
@@ -1860,37 +1911,32 @@ function BatchItemPanel({ item, index, mainOpts, allItems, sharedOutputDirectory
 
                     {/* ── Render settings override zone ────────────────────────────── */}
                     <div className="border-t border-neutral-800/50">
-                        <button type="button" onClick={() => setShowOverrides((v) => !v)}
-                                className="w-full flex items-center gap-2 px-4 py-2.5 group hover:bg-neutral-900/40 transition-colors">
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
-                                 className={`text-neutral-600 group-hover:text-neutral-400 transition-transform duration-150 shrink-0 ${showOverrides ? "rotate-0" : "-rotate-90"}`}>
-                                <path d="M2 3.5l3 3 3-3" />
-                            </svg>
-
-                            {/* Context badge — always visible, always unambiguous */}
-                            {!hasOverrides ? (
-                                <span className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-neutral-600">
-                                    <span className="px-1.5 py-0.5 rounded bg-violet-950/60 text-violet-400/70 border border-violet-800/40">
-                                        Template
+                        <div className="w-full flex items-center gap-2 px-4 py-2.5 hover:bg-neutral-900/40 transition-colors">
+                            <button type="button" onClick={() => setShowOverrides((v) => !v)}
+                                    className="min-w-0 flex-1 flex items-center gap-2 text-left group">
+                                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                                     className={`text-neutral-600 group-hover:text-neutral-400 transition-transform duration-150 shrink-0 ${showOverrides ? "rotate-0" : "-rotate-90"}`}>
+                                    <path d="M2 3.5l3 3 3-3" />
+                                </svg>
+                                {!hasOverrides ? (
+                                    <span className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-neutral-600">
+                                        <span className="px-1.5 py-0.5 rounded bg-violet-950/60 text-violet-400/70 border border-violet-800/40">Template</span>
+                                        Render settings — all from shared template
                                     </span>
-                                    Render settings — all from shared template
-                                </span>
-                            ) : (
-                                <span className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-amber-400">
-                                    <span className="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-400">
-                                        Item {index + 1}
+                                ) : (
+                                    <span className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-amber-400">
+                                        <span className="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-400">Item {index + 1}</span>
+                                        {overriddenKeys.size} override{overriddenKeys.size !== 1 ? "s" : ""} — rest from template
                                     </span>
-                                    {overriddenKeys.size} override{overriddenKeys.size !== 1 ? "s" : ""} — rest from template
-                                </span>
-                            )}
-
+                                )}
+                            </button>
                             {hasOverrides && (
                                 <button type="button" onClick={resetAllOverrides}
-                                        className="ml-auto text-[9px] text-neutral-600 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded hover:bg-red-950/20 shrink-0 font-normal normal-case tracking-normal">
+                                        className="shrink-0 text-[9px] text-neutral-600 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded hover:bg-red-950/20 font-normal normal-case tracking-normal">
                                     ↺ Reset all to template
                                 </button>
                             )}
-                        </button>
+                        </div>
 
                         {/* Collapsed: show override pills */}
                         {!showOverrides && hasOverrides && (
@@ -1973,6 +2019,9 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
     const [batchImportError, setBatchImportError] = useState<string | null>(null);
     const [batchImportNotice, setBatchImportNotice] = useState<string | null>(null);
     const [batchImporting, setBatchImporting] = useState(false);
+    // Batch template reference video is UI-only. It deliberately never enters
+    // RenderVideoArgs or the backend payload; each item owns its actual base video.
+    const [templatePreviewVideoPath, setTemplatePreviewVideoPath] = useState("");
 
     const addBatchItem = useCallback(() => setBatchItems((prev) => [...prev, makeBatchItem()]), []);
 
@@ -1993,7 +2042,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
             if (!src) return prev;
             // Resolve against current opts inside the setter so we don't close over stale opts.
             const copyable = extractCopyableSettings(resolveItemOpts(opts, src));
-            return prev.map((it) => it.id === targetId ? { ...it, overrides: { ...it.overrides, ...copyable } } : it);
+            return prev.map((it) => it.id === targetId ? { ...it, overrides: copyable } : it);
         });
     }, [opts]);
 
@@ -2007,23 +2056,27 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
 
     const appendImportedPairs = useCallback((pairs: BatchPair[]) => {
         if (pairs.length === 0) return;
-        const destination = batchOutputDirectory || getPathDirectory(pairs[0].jsonFilePath);
+        const destination = batchOutputDirectory;
         setBatchItems((prev) => {
             const blankOnly = prev.length === 1 && !prev[0].jsonFilePath;
             const base = blankOnly ? [] : prev;
-            return [
-                ...base,
-                ...pairs.map((pair) => ({
+            const existingJson = new Set(base.map((item) => item.jsonFilePath.toLowerCase()));
+            const imported = pairs
+                .filter((pair) => !existingJson.has(pair.jsonFilePath.toLowerCase()))
+                .map((pair) => ({
                     ...makeBatchItem(),
                     jsonFilePath: pair.jsonFilePath,
-                    overlayVideoPath: pair.videoFilePath,
+                    overlayVideoPath: pair.videoFilePath ?? "",
                     outputPath: deriveBatchOutputPath(destination, pair.jsonFilePath),
-                })),
-            ];
+                }));
+            return [...base, ...imported];
         });
 
-        if (!batchOutputDirectory) setBatchOutputDirectoryState(destination);
-        setBatchImportNotice(`Imported ${pairs.length} JSONL + MP4 pair${pairs.length === 1 ? "" : "s"}.`);
+        if (!batchOutputDirectory && pairs[0]?.jsonFilePath) {
+            // Keep the template folder blank; each imported item derives its own source-folder output.
+            setBatchOutputDirectoryState("");
+        }
+        setBatchImportNotice(`Imported ${pairs.length} JSONL item${pairs.length === 1 ? "" : "s"}${pairs.some((p) => p.videoFilePath) ? " with matching video references" : ""}.`);
         setBatchImportError(null);
     }, [batchOutputDirectory]);
 
@@ -2034,12 +2087,12 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
         try {
             const selection = await open({
                 multiple: true,
-                filters: [{ name: "Batch files", extensions: ["jsonl", "mp4"] }],
+                filters: [{ name: "Batch files", extensions: ["jsonl", "mp4", "mkv", "mov", "avi", "webm"] }],
             });
             const paths = Array.isArray(selection) ? selection : (typeof selection === "string" ? [selection] : []);
             const pairs = pairBatchFiles(paths, batchPattern, batchMatchMode);
             if (pairs.length === 0) {
-                throw new Error("No matching JSONL + MP4 pairs were found. Check the pattern and select both files for each cut.");
+                throw new Error("No matching JSONL files were found. Add the matching video files too when Direct Pipe mode needs per-item base videos.");
             }
             appendImportedPairs(pairs);
         } catch (e) {
@@ -2070,7 +2123,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
             });
             const pairs = pairBatchFiles(paths, batchPattern, batchMatchMode);
             if (pairs.length === 0) {
-                throw new Error("The selected folder contains no matching JSONL + MP4 pairs for the current pattern.");
+                throw new Error("The selected folder contains no matching JSONL files for the current pattern.");
             }
             appendImportedPairs(pairs);
         } catch (e) {
@@ -2093,6 +2146,8 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
     }, [onUpdate, opts]);
 
     const { meta: videoMeta, loading: videoLoading, error: videoError } = useVideoMeta(opts.useImmediatePipeOverlay ? opts.overlayVideoPath : undefined);
+    const { meta: templatePreviewVideoMeta, loading: templatePreviewVideoLoading, error: templatePreviewVideoError } =
+        useVideoMeta(opts.useImmediatePipeOverlay ? (templatePreviewVideoPath || undefined) : undefined);
 
     const [isDispatching, setIsDispatching] = useState(false);
     const [dispatchError, setDispatchError] = useState<string | null>(null);
@@ -2125,6 +2180,13 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
 
     const handleSetOverlayVideoPath = useCallback((v: string) => setOpt("overlayVideoPath", v || undefined), [setOpt]);
 
+    const handleSelectTemplatePreviewVideo = useCallback(async () => {
+        try {
+            const sel = await open({ multiple: false, filters: [{ name: "Video", extensions: ["mp4", "mkv", "mov", "avi", "webm"] }] });
+            if (typeof sel === "string") setTemplatePreviewVideoPath(sel);
+        } catch {}
+    }, []);
+
     const handleDispatch = useCallback(async () => {
         if (!tab.jsonFilePath || !opts.outputPath || isDispatching) return;
         setIsDispatching(true); setDispatchError(null);
@@ -2138,14 +2200,27 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
         finally { setIsDispatching(false); }
     }, [tab, opts, isDispatching, navigate, onUpdate, registerTaskSnapshot]);
 
-    const canDispatch = Boolean(tab.jsonFilePath) && Boolean(opts.outputPath) && !isDispatching;
+    const missingSinglePipeVideo = opts.useImmediatePipeOverlay && !opts.overlayVideoPath;
+    const canDispatch = Boolean(tab.jsonFilePath) && Boolean(opts.outputPath) && !missingSinglePipeVideo && !isDispatching;
 
     const [batchDispatching, setBatchDispatching] = useState(false);
     const [batchDispatchError, setBatchDispatchError] = useState<string | null>(null);
 
+    const getBatchItemReadiness = useCallback((item: BatchItem) => {
+        if (!item.jsonFilePath) return { ready: false, reason: "Missing JSONL source" };
+        const outputPath = item.outputPath || deriveBatchOutputPath(batchOutputDirectory, item.jsonFilePath);
+        if (!outputPath) return { ready: false, reason: "Missing output path" };
+
+        const effective = resolveItemOpts(opts, item);
+        if (effective.useImmediatePipeOverlay && !item.overlayVideoPath) {
+            return { ready: false, reason: "Direct Pipe requires an item base video" };
+        }
+        return { ready: true, reason: "Ready" };
+    }, [batchOutputDirectory, opts]);
+
     const readyBatchItems = useMemo(
-        () => batchItems.filter((it) => it.jsonFilePath && (it.outputPath || deriveBatchOutputPath(batchOutputDirectory, it.jsonFilePath))),
-        [batchItems, batchOutputDirectory],
+        () => batchItems.filter((it) => getBatchItemReadiness(it).ready),
+        [batchItems, getBatchItemReadiness],
     );
 
     const handleBatchDispatch = useCallback(async () => {
@@ -2169,6 +2244,9 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
             const taskIds = await invoke<string[]>("queue_batch_chat_render", {
                 items: batchPayload,
             });
+            if (!Array.isArray(taskIds) || taskIds.length !== batchPayload.length || taskIds.some((id) => !id)) {
+                throw new Error(`Batch queue returned ${Array.isArray(taskIds) ? taskIds.length : 0} task IDs for ${batchPayload.length} requested renders.`);
+            }
 
             // Register snapshots so "Return to workspace" works from QueueRow.
             taskIds.forEach((taskId, i) => {
@@ -2240,6 +2318,15 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                         videoLoading={videoLoading}
                         videoError={videoError}
                     />
+
+                    {missingSinglePipeVideo && (
+                        <div className="flex items-start gap-2 px-3 py-2.5 bg-orange-950/30 border border-orange-800/40 rounded-lg text-xs text-orange-300">
+                            <svg className="shrink-0 mt-0.5" width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                                <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4h1.5v5h-1.5V5zm0 6h1.5v1.5h-1.5V11z" />
+                            </svg>
+                            <span><strong className="font-semibold">Direct Pipe needs a base video. </strong>Select one above before queueing this render.</span>
+                        </div>
+                    )}
 
                     {dispatchError && (
                         <div className="flex items-start gap-2 px-3 py-2.5 bg-red-950/40 border border-red-800/50 rounded-lg text-xs text-red-400">
@@ -2318,7 +2405,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                 </div>
                             </div>
 
-                            {/* Fast JSONL + MP4 pair importer */}
+                            {/* Fast JSONL + optional matching video importer */}
                             <div className="rounded-xl border border-neutral-800 bg-neutral-900/55 overflow-hidden">
                                 <div className="px-3.5 py-3 border-b border-neutral-800/80 flex items-center gap-2.5">
                                     <div className="w-7 h-7 rounded-md bg-emerald-950/60 border border-emerald-800/50 flex items-center justify-center text-emerald-400">
@@ -2328,8 +2415,8 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                         </svg>
                                     </div>
                                     <div className="flex-1 min-w-0">
-                                        <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-neutral-300">Auto-pair chat logs + cut videos</div>
-                                        <div className="text-[9px] text-neutral-600 mt-0.5">Matches identical filename stems, so both <span className="font-mono">cut1</span> and <span className="font-mono">cut01</span> work automatically.</div>
+                                        <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-neutral-300">Import chat logs + optional cut videos</div>
+                                        <div className="text-[9px] text-neutral-600 mt-0.5">Matches identical filename stems. Matching videos are attached automatically; they are only required for items using Direct Pipe mode.</div>
                                     </div>
                                 </div>
                                 <div className="p-3.5 space-y-3">
@@ -2359,7 +2446,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                     </div>
                                     <div className="flex flex-wrap items-center gap-2 text-[9px] text-neutral-700">
                                         <span className="font-mono">name123-cut01.jsonl</span><span>↔</span><span className="font-mono">name123-cut01.mp4</span>
-                                        <span className="ml-auto">Pairs are case-insensitive and sorted naturally.</span>
+                                        <span className="ml-auto">JSONL-only imports are valid; matching videos are auto-attached when present.</span>
                                     </div>
                                     {batchImportNotice && (
                                         <div className="px-3 py-2 rounded-lg bg-emerald-950/30 border border-emerald-800/40 text-[10px] text-emerald-400">{batchImportNotice}</div>
@@ -2374,6 +2461,13 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                                 opts={opts} setOpt={setOpt} setOpts={setOpts}
                                 isBatchItem={false}
                                 showTemplateCanvas
+                                overlayVideoPath={templatePreviewVideoPath}
+                                onSelectOverlayVideo={handleSelectTemplatePreviewVideo}
+                                videoMeta={templatePreviewVideoMeta}
+                                videoLoading={templatePreviewVideoLoading}
+                                videoError={templatePreviewVideoError}
+                                onSetOverlayVideoPath={setTemplatePreviewVideoPath}
+                                previewOnlyBaseVideo
                             />
                         </div>
                     </div>
@@ -2450,7 +2544,7 @@ export function RenderForm({ tab, onUpdate }: RenderFormProps) {
                             {batchDispatching ? (
                                 <span className="flex items-center justify-center gap-2"><span className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-white/80 rounded-full animate-spin" />Sending {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""} to backend…</span>
                             ) : readyBatchItems.length === 0 ? (
-                                "Import or add a JSONL + MP4 item to begin"
+                                "Add a JSONL item to begin (and a base video for Direct Pipe items)"
                             ) : (
                                 <span className="flex items-center justify-center gap-2"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8h10M8 3l5 5-5 5" /></svg>Queue {readyBatchItems.length} render{readyBatchItems.length !== 1 ? "s" : ""}</span>
                             )}

@@ -35,7 +35,8 @@ pub struct YtDlpFormat {
     pub protocol: Option<String>,
     pub language: Option<String>,
     pub dynamic_range: Option<String>,
-    pub http_headers: Option<HashMap<String, String>>,
+    // http_headers intentionally omitted — internal yt-dlp transport detail,
+    // never forwarded to the frontend.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,12 +44,20 @@ pub struct YtDlpFormat {
 pub struct NormalizedFormat {
     pub format_id: String,
     pub resolution_label: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     pub fps: Option<f64>,
     pub extension: String,
     pub has_video: bool,
     pub has_audio: bool,
     pub size_bytes: Option<u64>,
     pub bitrate: Option<f64>,
+
+    // Audio details (useful for audio-only formats)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_sample_rate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_channels: Option<u8>,
 
     // Player context
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,7 +117,9 @@ pub struct YtDlpMetadata {
     pub concurrent_view_count: Option<u64>,
     pub like_count: Option<u64>,
     pub comment_count: Option<u64>,
-    pub repost_count: Option<u64>, // Social media
+    // repost_count intentionally omitted — too platform-specific (Twitter/X,
+    // SoundCloud) and not meaningful enough across yt-dlp's extractor surface
+    // to expose to the frontend.
 
     pub timestamp: Option<f64>,
     pub upload_date: Option<String>,
@@ -177,6 +188,14 @@ pub struct NormalizedMetadata {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<String>,
+
+    // Music metadata — present for Bandcamp, SoundCloud, YouTube Music, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_year: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
 
     pub tags: Vec<String>,
     pub categories: Vec<String>,

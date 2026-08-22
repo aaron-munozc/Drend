@@ -189,12 +189,16 @@ export const RENDER_DEFAULTS: RenderVideoArgs = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Download / VOD / chat types (unchanged)
+// Download / VOD / chat types
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface NormalizedFormat {
 	formatId: string;
 	resolutionLabel: string;
+	/** Pixel width; null for audio-only formats. */
+	width: number | null;
+	/** Pixel height; null for audio-only formats. */
+	height: number | null;
 	fps: number | null;
 	extension: string;
 	hasVideo: boolean;
@@ -202,7 +206,13 @@ export interface NormalizedFormat {
 	sizeBytes: number | null;
 	bitrate: number | null;
 
-	// Player context (new)
+	// Audio details — present for audio-only or muxed formats
+	/** Sample rate in Hz (e.g. 44100, 48000); null when unknown. */
+	audioSampleRate?: number | null;
+	/** Channel count (1 = mono, 2 = stereo); null when unknown. */
+	audioChannels?: number | null;
+
+	// Player context
 	protocol?: string;
 	language?: string;
 	dynamicRange?: string;
@@ -223,6 +233,7 @@ export interface Metadata {
 	// --- UNIFIED FIELDS FOR FRONTEND ---
 	displayTitle: string;
 	displayCreator: string;
+	/** "Music" | "Episode" | "Live Stream" | "Video" */
 	mediaType: string;
 	seriesContext?: string;
 
@@ -248,6 +259,12 @@ export interface Metadata {
 	ageLimit: number;
 
 	availability?: string;
+
+	// Music metadata — populated for Bandcamp, SoundCloud, YouTube Music, etc.
+	album?: string;
+	releaseYear?: number;
+	genre?: string;
+
 	tags: string[];
 	categories: string[];
 	chapters: Chapter[];
