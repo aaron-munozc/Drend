@@ -496,10 +496,20 @@ pub struct RenderVideoArgs {
 
     // ── CPU tuning ────────────────────────────────────────────────────────────
     /// Cap on the number of rayon worker threads used for frame rendering.
-    /// `None` → auto-detect (uses all logical CPUs, capped per quality preset).
-    /// Reduce to leave headroom for other processes or to limit RAM use
-    /// (each worker allocates its own Skia raster surface).
+    /// `None` uses a conservative background-rendering default that deliberately
+    /// leaves CPU headroom for FFmpeg, the OS, the browser and other apps.
     pub max_render_threads: Option<usize>,
+
+    /// Soft RAM budget for decoded/rendered pixel buffers, in MiB.
+    /// `None` uses 384 MiB. The renderer derives a buffer count from the actual
+    /// frame size, so 1080p / luma-matte jobs do not accidentally allocate
+    /// hundreds of large buffers just because the machine has many CPU cores.
+    pub render_memory_budget_mb: Option<usize>,
+
+    /// Number of rawvideo frames FFmpeg is allowed to queue from stdin.
+    /// `None` uses 16 frames. Keeping this small is intentional: raw BGRA frames
+    /// are large, so a huge queue can consume gigabytes of RAM.
+    pub ffmpeg_input_queue_frames: Option<usize>,
 
     /// Cap on simultaneous emote/image downloads during cache warm-up.
     /// Defaults to 8; reduce on metered connections.
@@ -590,8 +600,10 @@ impl Default for RenderVideoArgs {
             image_overlays: vec![],
             timeline_mismatch_strategy: TimelineMismatchStrategy::FreezeLastFrame,
 
-            // CPU tuning
+            // CPU / memory tuning
             max_render_threads: None,
+            render_memory_budget_mb: Some(384),
+            ffmpeg_input_queue_frames: Some(16),
             max_download_concurrency: None,
         }
     }

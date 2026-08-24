@@ -690,10 +690,18 @@ pub fn tokenise<'a>(
     let flags_url = emote_map.map(|(_, f)| f.image_urls).unwrap_or(true);
     let has_url = flags_url && text.contains("http");
 
+    // Emote spam often repeats one exact word many times. Keep the last resolution
+    // for this message so consecutive repeats avoid another hash-map lookup.
+    let mut last_word: Option<&'a str> = None;
+    let mut last_resolution: Option<Option<ResolvedEmote>> = None;
+    // Small per-message memo for non-consecutive repeated emote words. The key
+    // borrows the original message, so this adds no string allocations.
+    let mut word_cache: FxHashMap<&'a str, Option<ResolvedEmote>> = FxHashMap::default();
+
     // Fast path: no structured tokens — word-split only for emote lookup.
     if !has_kick && !has_url {
         let mut tokens = Vec::with_capacity(8);
-        push_text_segment(text, emote_map, &mut tokens);
+        push_text_segment(text, emote_map, &mut last_word, &mut last_resolution, &mut word_cache, &mut tokens);
         return tokens;
     }
 
@@ -740,7 +748,7 @@ pub fn tokenise<'a>(
 
     for span in spans {
         if span.start > pos {
-            push_text_segment(&text[pos..span.start], emote_map, &mut tokens);
+            push_text_segment(&text[pos..span.start], emote_map, &mut last_word, &mut last_resolution, &mut word_cache, &mut tokens);
         }
         match span.kind {
             SpanKind::KickEmote(id) => tokens.push(MessageToken::KickEmote { id }),
@@ -750,7 +758,7 @@ pub fn tokenise<'a>(
     }
 
     if pos < text.len() {
-        push_text_segment(&text[pos..], emote_map, &mut tokens);
+        push_text_segment(&text[pos..], emote_map, &mut last_word, &mut last_resolution, &mut word_cache, &mut tokens);
     }
 
     tokens
@@ -768,6 +776,9 @@ pub fn tokenise<'a>(
 fn push_text_segment<'a>(
     seg: &'a str,
     map_flags: Option<(&EmoteNameMap, &EmoteProviderFlags)>,
+    last_word: &mut Option<&'a str>,
+    last_resolution: &mut Option<Option<ResolvedEmote>>,
+    word_cache: &mut FxHashMap<&'a str, Option<ResolvedEmote>>,
     out: &mut Vec<MessageToken<'a>>,
 ) {
     let mut last_end = 0;
@@ -775,7 +786,7 @@ fn push_text_segment<'a>(
     for (start, part) in seg.match_indices(|c: char| c.is_whitespace()) {
         let word = &seg[last_end..start];
         if !word.is_empty() {
-            push_word(word, map_flags, out);
+            push_word_cached(word, map_flags, last_word, last_resolution, word_cache, out);
         }
         // Preserve single spaces as tokens so the layout pass can measure them
         // without re-splitting. Other whitespace (tabs, double-spaces, etc.) is
@@ -792,7 +803,7 @@ fn push_text_segment<'a>(
 
     let tail = &seg[last_end..];
     if !tail.is_empty() {
-        push_word(tail, map_flags, out);
+        push_word_cached(tail, map_flags, last_word, last_resolution, word_cache, out);
     }
 }
 
@@ -802,18 +813,36 @@ fn push_text_segment<'a>(
 /// otherwise it becomes a `Text` token. This is the hot path for Twitch /
 /// 7TV / BTTV / FFZ emote recognition — no regex, just a hash-map probe.
 #[inline(always)]
-fn push_word<'a>(
+fn push_word_cached<'a>(
     word: &'a str,
     map_flags: Option<(&EmoteNameMap, &EmoteProviderFlags)>,
+    last_word: &mut Option<&'a str>,
+    last_resolution: &mut Option<Option<ResolvedEmote>>,
+    word_cache: &mut FxHashMap<&'a str, Option<ResolvedEmote>>,
     out: &mut Vec<MessageToken<'a>>,
 ) {
-    match map_flags.and_then(|(m, f)| {
-        if f.any_name_provider_enabled() {
-            m.lookup(word, f)
-        } else {
-            None
-        }
-    }) {
+    let resolution = if last_word.as_deref() == Some(word) {
+        last_resolution.clone().unwrap_or(None)
+    } else if let Some(cached) = word_cache.get(word) {
+        let resolved = cached.clone();
+        *last_word = Some(word);
+        *last_resolution = Some(resolved.clone());
+        resolved
+    } else {
+        let resolved = map_flags.and_then(|(m, f)| {
+            if f.any_name_provider_enabled() {
+                m.lookup(word, f)
+            } else {
+                None
+            }
+        });
+        word_cache.insert(word, resolved.clone());
+        *last_word = Some(word);
+        *last_resolution = Some(resolved.clone());
+        resolved
+    };
+
+    match resolution {
         Some(emote) => out.push(MessageToken::ProviderEmote(emote)),
         None => out.push(MessageToken::Text(word)),
     }

@@ -54,15 +54,22 @@ const EMOTE_MARGIN: f32 = 6.0;
 /// work at a time, so this directly controls scheduling granularity.
 /// Larger values mean more duplicate-frame coalescing before the rayon call
 /// but longer latency before the first batch hits the IO thread.
-const CHUNK_SIZE_BASE: usize = 16;
+const CHUNK_SIZE_MIN: usize = 8;
+const CHUNK_SIZE_MAX: usize = 24;
 
-/// Bounded channel depth for the IO (FFmpeg) writer thread. A shallow channel
-/// keeps peak RAM bounded while still absorbing small encode jitter.
-const IO_CHANNEL_DEPTH: usize = 32;
+/// Bounded channel depth for the IO (FFmpeg) writer thread. Keep this small
+/// because every queued item owns or references a full raw BGRA frame.
+const IO_CHANNEL_DEPTH: usize = 16;
 
-/// Extra pool slots above `IO_CHANNEL_DEPTH` so in-flight rayon jobs can always
-/// acquire a buffer without blocking the render loop.
-const POOL_HEADROOM: usize = 8;
+/// Small cushion for concurrently rendered frames. The pixel pool is byte-budgeted,
+/// so this does not become a large hidden RAM multiplier at high resolutions.
+const POOL_HEADROOM: usize = 4;
+
+/// Conservative default RAM budget for retained rendered pixel buffers.
+const DEFAULT_PIXEL_POOL_BUDGET_MB: usize = 384;
+
+/// Hard ceiling for user-configurable rawvideo queue depth.
+const MAX_FFMPEG_RAW_QUEUE_FRAMES: usize = 64;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Thread-local state
@@ -71,6 +78,7 @@ const POOL_HEADROOM: usize = 8;
 const MEASURE_CACHE_MAX: usize = 32_768;
 type MeasureEntry = (f32, u32); // (width, generation)
 const USER_COLOR_CACHE_MAX: usize = 512;
+const TEXT_BLOB_CACHE_MAX: usize = 8_192;
 
 thread_local! {
     /// Per-thread Skia raster surface. Created lazily and reused across frames;
@@ -88,6 +96,18 @@ thread_local! {
     /// Per-thread username → Color cache to avoid repeated hex parsing.
     static USER_COLOR_CACHE: RefCell<FxHashMap<u64, Color>> =
         RefCell::new(FxHashMap::with_capacity_and_hasher(64, Default::default()));
+
+    /// Per-thread TextBlob cache. Repeated chat text (very common in spam-heavy
+    /// logs) can reuse Skia shaping results without sharing mutable state across
+    /// workers. This also helps different users posting the exact same message.
+    static TEXT_BLOB_CACHE: RefCell<FxHashMap<u64, TextBlob>> =
+        RefCell::new(FxHashMap::with_capacity_and_hasher(1024, Default::default()));
+
+    /// Per-thread cache for complete exact-message layouts. Kept small and
+    /// thread-local to avoid a contended global lock while still reusing work
+    /// across JSONL batches on the same Rayon worker.
+    static LAYOUT_CACHE: RefCell<FxHashMap<u64, CachedLayout>> =
+        RefCell::new(FxHashMap::with_capacity_and_hasher(512, Default::default()));
 
     // ── Pre-allocated Paint objects ──────────────────────────────────────────
     // Each Paint lives on the thread that draws frames. Reusing them across
@@ -224,6 +244,8 @@ struct ScheduledMessage {
     bg_color: Color,
     user_color: Color,
     is_grouped: bool,
+    /// Stable visual identity; avoids using Arc allocation addresses in frame hashes.
+    visual_key: u64,
     has_animated_emotes: bool,
     is_highlighted: bool,
     /// Shortest animated-emote period (ms) in this message, or `None` if static.
@@ -240,8 +262,9 @@ impl ScheduledMessage {
         user_color: Color,
         is_grouped: bool,
         is_highlighted: bool,
+        visual_key: u64,
     ) -> Self {
-        Self::new_inner(spawn_frame, 0, lines, bubble_w, bubble_h, bg_color, user_color, is_grouped, is_highlighted)
+        Self::new_inner(spawn_frame, 0, lines, bubble_w, bubble_h, bg_color, user_color, is_grouped, is_highlighted, visual_key)
     }
 
     /// Create a pre-filled message that is already mid-life at frame 0.
@@ -258,10 +281,11 @@ impl ScheduledMessage {
         user_color: Color,
         is_grouped: bool,
         is_highlighted: bool,
+        visual_key: u64,
     ) -> Self {
         // spawn_frame = 0: injected immediately at video start.
         // age_offset_frames carries the pre-existing age so timers work correctly.
-        Self::new_inner(0, age_offset_frames, lines, bubble_w, bubble_h, bg_color, user_color, is_grouped, is_highlighted)
+        Self::new_inner(0, age_offset_frames, lines, bubble_w, bubble_h, bg_color, user_color, is_grouped, is_highlighted, visual_key)
     }
 
     fn new_inner(
@@ -274,7 +298,11 @@ impl ScheduledMessage {
         user_color: Color,
         is_grouped: bool,
         is_highlighted: bool,
+        mut visual_key: u64,
     ) -> Self {
+        if is_highlighted {
+            visual_key ^= 0x9E37_79B9_7F4A_7C15;
+        }
         let mut has_animated_emotes = false;
         let mut anim_period_ms: Option<u32> = None;
 
@@ -301,6 +329,7 @@ impl ScheduledMessage {
             bg_color,
             user_color,
             is_grouped,
+            visual_key,
             has_animated_emotes,
             is_highlighted,
             anim_period_ms,
@@ -424,6 +453,31 @@ fn measure_cached(
     w
 }
 
+#[inline(always)]
+fn text_blob_key(s: &str, font_bits: u32) -> u64 {
+    measure_key(s, font_bits)
+}
+
+/// Return a cached TextBlob when available. TextBlob is an immutable Skia handle,
+/// so cloning the handle is cheap compared with repeating text shaping.
+#[inline(always)]
+fn text_blob_cached(s: &str, font: &Font, font_bits: u32) -> Option<TextBlob> {
+    let key = text_blob_key(s, font_bits);
+    TEXT_BLOB_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some(blob) = cache.get(&key) {
+            return Some(blob.clone());
+        }
+        let blob = TextBlob::from_str(s, font)?;
+        if cache.len() >= TEXT_BLOB_CACHE_MAX {
+            // A cheap whole-cache reset is preferable to an LRU on this hot path.
+            cache.clear();
+        }
+        cache.insert(key, blob.clone());
+        Some(blob)
+    })
+}
+
 /// Split `input` into substrings that each fit within `max_w` pixels.
 /// Uses binary search over character offsets to minimise `measure_str` calls.
 fn split_into_fragments<'a>(
@@ -491,6 +545,28 @@ fn split_into_fragments<'a>(
     }
 
     out
+}
+
+#[derive(Clone)]
+struct CachedLayout {
+    lines: Vec<LayoutLine>,
+    width: i32,
+    height: i32,
+    user_color: Color,
+}
+
+// Fast, allocation-free-ish key for exact-message layout deduplication. Includes every
+// input that can change the baked layout for this function.
+#[inline]
+fn message_layout_key(msg: &MessageSaved, is_grouped: bool) -> u64 {
+    let mut h = FxHasher::default();
+    h.write(msg.content.as_bytes());
+    h.write_u8(0xFF);
+    h.write(msg.sender.username.as_bytes());
+    h.write_u8(0xFE);
+    h.write(msg.sender.identity.color.as_bytes());
+    h.write_u8(is_grouped as u8);
+    h.finish()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -743,7 +819,7 @@ fn layout_message_blocking(
 
         // First line only: prefix glyph (unless grouped).
         if li == 0 && !is_grouped {
-            if let Some(blob) = TextBlob::from_str(prefix_str, username_font) {
+            if let Some(blob) = text_blob_cached(prefix_str, username_font, uf_bits) {
                 layout_tokens.push(LayoutToken::Glyph {
                     blob,
                     x: x_cursor,
@@ -757,7 +833,7 @@ fn layout_message_blocking(
             match token {
                 MessageToken::Text(s) => {
                     let w = measure_cached(message_font, mf_bits, s, measure_cache, gen);
-                    if let Some(blob) = TextBlob::from_str(s, message_font) {
+                    if let Some(blob) = text_blob_cached(s, message_font, mf_bits) {
                         layout_tokens.push(LayoutToken::Glyph {
                             blob,
                             x: x_cursor,
@@ -1145,6 +1221,9 @@ fn frame_signature_deque(
     let mut h = FxHasher::default();
     h.write_usize(bubbles.len());
     for b in bubbles {
+        // Stable visual identity lets independently allocated identical bubbles
+        // share a frame signature without collapsing their multiplicity/order.
+        h.write_u64(b.visual_key);
         h.write_u32(b.spawn_frame);
         h.write_u32(b.age_offset_frames);
         let age = b.effective_age(frame_id, fps_f32);
@@ -1227,12 +1306,46 @@ fn probe_video_frames(path: &str, fps: u32) -> Option<u32> {
 /// At 400×800 @ 24 fps the render + compositing phase dominates. If you need
 /// the absolute fastest encode, consider lowering `fps` or `quality_preset`
 /// rather than relying on NVENC.
+
+#[inline]
+fn ffmpeg_encode_threads(cpus: usize, worker_threads: usize, has_nvenc: bool) -> usize {
+    if has_nvenc {
+        1
+    } else {
+        cpus.saturating_sub(worker_threads).saturating_sub(1).clamp(1, 2)
+    }
+}
+
 fn probe_nvenc() -> bool {
     hidden_command("ffmpeg")
         .args(["-h", "encoder=h264_nvenc"])
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("h264_nvenc"))
         .unwrap_or(false)
+}
+
+/// Convert a byte budget into a bounded pixel-buffer count.
+/// A fixed buffer count is unsafe across resolutions because raw BGRA frame size
+/// grows linearly with pixel count.
+#[inline]
+fn pixel_pool_buffer_count(
+    frame_bytes: usize,
+    worker_threads: usize,
+    budget_mb: Option<usize>,
+) -> usize {
+    let budget = budget_mb
+        .unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB)
+        .clamp(64, 4096)
+        * 1024
+        * 1024;
+
+    if frame_bytes == 0 {
+        return worker_threads + IO_CHANNEL_DEPTH + POOL_HEADROOM;
+    }
+
+    let frame_capacity = (budget / frame_bytes).max(1);
+    let scheduling_floor = (worker_threads + POOL_HEADROOM).min(frame_capacity);
+    frame_capacity.max(scheduling_floor).min(128)
 }
 
 /// Build FFmpeg arguments for the overlay pipeline (base video + chat stream).
@@ -1263,6 +1376,7 @@ fn build_overlay_ffmpeg_args(
     is_luma: bool,
     has_nvenc: bool,
     ffmpeg_preset: &str,
+    encode_threads: usize,
 ) -> Vec<String> {
     let mut a = vec!["-y".to_string()];
 
@@ -1275,7 +1389,7 @@ fn build_overlay_ffmpeg_args(
     // Input 0: base video
     a.extend([
         "-thread_queue_size".into(),
-        "4096".into(),
+        "512".into(),
         "-i".into(),
         base_video.clone(),
     ]);
@@ -1283,7 +1397,10 @@ fn build_overlay_ffmpeg_args(
     // Input 1: raw BGRA chat frames from stdin
     a.extend([
         "-thread_queue_size".into(),
-        "4096".into(),
+        args.ffmpeg_input_queue_frames
+            .unwrap_or(16)
+            .clamp(4, MAX_FFMPEG_RAW_QUEUE_FRAMES)
+            .to_string(),
         "-f".into(),
         "rawvideo".into(),
         "-pix_fmt".into(),
@@ -1306,7 +1423,7 @@ fn build_overlay_ffmpeg_args(
     for ov in &args.image_overlays {
         a.extend([
             "-thread_queue_size".into(),
-            "512".into(),
+            "64".into(),
             "-loop".into(),
             "1".into(),        // loop static image for the full duration
             "-i".into(),
@@ -1503,6 +1620,8 @@ fn build_overlay_ffmpeg_args(
             "20".into(),
             "-pix_fmt".into(),
             "yuv420p".into(),
+            "-threads".into(),
+            encode_threads.to_string(),
         ]);
     }
 
@@ -1533,6 +1652,7 @@ fn build_standalone_ffmpeg_args(
     actual_width: i32,
     has_nvenc: bool,
     ffmpeg_preset: &str,
+    encode_threads: usize,
 ) -> Vec<String> {
     let mut a = vec!["-y".to_string()];
 
@@ -1550,7 +1670,10 @@ fn build_standalone_ffmpeg_args(
 
     a.extend([
         "-thread_queue_size".into(),
-        "1024".into(),
+        args.ffmpeg_input_queue_frames
+            .unwrap_or(16)
+            .clamp(4, MAX_FFMPEG_RAW_QUEUE_FRAMES)
+            .to_string(),
         "-f".into(),
         "rawvideo".into(),
         "-pix_fmt".into(),
@@ -1578,6 +1701,8 @@ fn build_standalone_ffmpeg_args(
             "20".into(),
             "-crf".into(),
             "20".into(),
+            "-threads".into(),
+            encode_threads.to_string(),
         ]);
     }
 
@@ -1661,45 +1786,60 @@ pub async fn process_chat_render(
     // Pipe mode uses fewer workers and smaller chunks to minimise frame latency
     // so the consuming FFmpeg process never stalls waiting for input.
     let max_threads = args.max_render_threads;
-    let (worker_threads, chunk_size, ffmpeg_preset) = if args.use_immediate_pipe_overlay {
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2)
-            .min(max_threads.unwrap_or(4));
-        let preset = if has_nvenc { "p1" } else { "ultrafast" };
-        (n, CHUNK_SIZE_BASE, preset)
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // This is a background renderer. By default leave two logical CPUs for
+    // FFmpeg/video work, the OS, the browser and other desktop applications.
+    let background_default = |cap: usize| cpus.saturating_sub(2).clamp(1, cap);
+
+    let (mut worker_threads, ffmpeg_preset) = if args.use_immediate_pipe_overlay {
+        (
+            max_threads.unwrap_or_else(|| background_default(4)),
+            if has_nvenc { "p1" } else { "ultrafast" },
+        )
     } else {
         match args.quality_preset {
             QualityPreset::Draft => (
                 max_threads.unwrap_or(1).max(1),
-                CHUNK_SIZE_BASE,
                 if has_nvenc { "p1" } else { "ultrafast" },
             ),
-            QualityPreset::Standard => {
-                let cpus = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                // Leave 1 core for IO + async. Cap at 6 to avoid surface RAM explosion.
-                let n = max_threads.unwrap_or_else(|| cpus.saturating_sub(1).clamp(1, 6));
-                (
-                    n,
-                    CHUNK_SIZE_BASE * n,
-                    if has_nvenc { "p3" } else { "veryfast" },
-                )
-            }
-            QualityPreset::High => {
-                let cpus = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let n = max_threads.unwrap_or_else(|| cpus.saturating_sub(1).clamp(1, 8));
-                (
-                    n,
-                    CHUNK_SIZE_BASE * n,
-                    if has_nvenc { "p5" } else { "fast" },
-                )
-            }
+            QualityPreset::Standard => (
+                max_threads.unwrap_or_else(|| background_default(6)),
+                if has_nvenc { "p3" } else { "ultrafast" },
+            ),
+            QualityPreset::High => (
+                max_threads.unwrap_or_else(|| background_default(8)),
+                if has_nvenc { "p5" } else { "veryfast" },
+            ),
         }
     };
+
+    // At large resolutions each worker needs both a Skia surface and an output
+    // buffer. Limit automatic worker count by the same RAM budget used by the
+    // pixel pool. Explicit max_render_threads remains authoritative.
+    let frame_bytes = (actual_width as usize)
+        .saturating_mul(args.height.max(1) as usize)
+        .saturating_mul(4);
+    let memory_budget_bytes = args
+        .render_memory_budget_mb
+        .unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB)
+        .clamp(64, 4096)
+        * 1024
+        * 1024;
+    if max_threads.is_none() && frame_bytes > 0 {
+        let by_memory = (memory_budget_bytes / frame_bytes / 2).clamp(1, worker_threads);
+        worker_threads = worker_threads.min(by_memory.max(1));
+    }
+
+    // Keep the default 24 fps path responsive: only ~2 frames of work per worker
+    // are batched, rather than one large chunk per worker multiplied by a fixed base.
+    let chunk_size = worker_threads
+        .saturating_mul(2)
+        .clamp(CHUNK_SIZE_MIN, CHUNK_SIZE_MAX);
+
+    let encode_threads = ffmpeg_encode_threads(cpus, worker_threads, has_nvenc);
 
     let render_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -1711,9 +1851,9 @@ pub async fn process_chat_render(
 
     // ── FFmpeg argument construction ──────────────────────────────────────────
     let ffmpeg_args = if args.overlay_video_path.is_some() {
-        build_overlay_ffmpeg_args(&args, actual_width, is_luma, has_nvenc, ffmpeg_preset)
+        build_overlay_ffmpeg_args(&args, actual_width, is_luma, has_nvenc, ffmpeg_preset, encode_threads)
     } else {
-        build_standalone_ffmpeg_args(&args, actual_width, has_nvenc, ffmpeg_preset)
+        build_standalone_ffmpeg_args(&args, actual_width, has_nvenc, ffmpeg_preset, encode_threads)
     };
 
     // ── Spawn FFmpeg ──────────────────────────────────────────────────────────
@@ -1805,12 +1945,21 @@ pub async fn process_chat_render(
             None
         };
 
-        for line in std::io::BufRead::lines(reader).flatten() {
+        let mut line = String::with_capacity(512);
+        loop {
+            line.clear();
+            let read = match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
             if scan_cancel.load(Ordering::Relaxed) {
                 break;
             }
 
-            let msg: MessageSaved = match serde_json::from_str(&line) {
+            let msg: MessageSaved = match serde_json::from_str(line.trim_end_matches(['\r', '\n'])) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -2057,6 +2206,7 @@ pub async fn process_chat_render(
                                                 uc,
                                                 false,
                                                 is_highlighted,
+                                                message_layout_key(&msg, false),
                                             ))
                                         }
                                         Err(_) => None,
@@ -2131,7 +2281,29 @@ pub async fn process_chat_render(
             let ma = metrics_ascent;
 
             pool.spawn(move || {
-                let results: BatchResult = msgs
+                // Exact duplicate messages are common in high-volume chat.
+                // Deduplicate the expensive layout operation within each batch,
+                // then expand the lightweight scheduled results back to their
+                // original order. This preserves chat semantics while eliminating
+                // repeated JSON->layout->TextBlob work for spam bursts.
+                let mut unique: Vec<(MessageSaved, bool)> = Vec::with_capacity(msgs.len());
+                let mut key_to_unique: FxHashMap<u64, usize> =
+                    FxHashMap::with_capacity_and_hasher(msgs.len(), Default::default());
+                let mut remap: Vec<usize> = Vec::with_capacity(msgs.len());
+
+                for (msg, is_grouped) in msgs {
+                    let key = message_layout_key(&msg, is_grouped);
+                    if let Some(&idx) = key_to_unique.get(&key) {
+                        remap.push(idx);
+                    } else {
+                        let idx = unique.len();
+                        key_to_unique.insert(key, idx);
+                        unique.push((msg, is_grouped));
+                        remap.push(idx);
+                    }
+                }
+
+                let unique_results: Vec<Option<(i64, ScheduledMessage)>> = unique
                     .into_par_iter()
                     .map(|(msg, is_grouped)| {
                         PRE_RENDER_MEASURE_CACHE.with(|cc| {
@@ -2145,44 +2317,61 @@ pub async fn process_chat_render(
                                     (offset_sec * args_c.fps as f64).round() as i64;
                                 let is_highlighted = hl.contains(&msg.sender.username);
 
-                                match layout_message_blocking(
-                                    &msg.content,
-                                    &msg.sender.username,
-                                    &msg.sender.identity.color,
-                                    &uf,
-                                    &mf,
-                                    (args_c.width - 2 * args_c.padding) as f32,
-                                    mh,
-                                    ma,
-                                    &ec,
-                                    &ic,
-                                    &args_c,
-                                    &em,
-                                    &mut mc,
-                                    gen,
-                                    is_grouped,
-                                ) {
-                                    Ok((lines, bubble_w, bubble_h, user_color)) => {
-                                        // Drop messages whose content was entirely
-                                        // filtered (e.g. emote-only messages when
-                                        // the kick provider flag is off). An empty
-                                        // layout still produces a valid bubble_h
-                                        // (just padding) that displaces other
-                                        // messages as a phantom black rectangle.
-                                        if lines.is_empty() || lines.iter().all(|l| l.tokens.is_empty()) {
+                                let layout_key = message_layout_key(&msg, is_grouped);
+                                let cached = LAYOUT_CACHE.with(|cell| cell.borrow().get(&layout_key).cloned());
+                                let layout = if let Some(cached) = cached {
+                                    Ok(cached)
+                                } else {
+                                    let result = layout_message_blocking(
+                                        &msg.content,
+                                        &msg.sender.username,
+                                        &msg.sender.identity.color,
+                                        &uf,
+                                        &mf,
+                                        (args_c.width - 2 * args_c.padding) as f32,
+                                        mh,
+                                        ma,
+                                        &ec,
+                                        &ic,
+                                        &args_c,
+                                        &em,
+                                        &mut mc,
+                                        gen,
+                                        is_grouped,
+                                    ).map(|(lines, width, height, user_color)| CachedLayout {
+                                        lines, width, height, user_color
+                                    });
+                                    if let Ok(ref c) = result {
+                                        if !c.lines.is_empty() && c.lines.iter().any(|l| !l.tokens.is_empty()) {
+                                            LAYOUT_CACHE.with(|cell| {
+                                                let mut cache = cell.borrow_mut();
+                                                if cache.len() >= 512 {
+                                                    cache.clear();
+                                                }
+                                                cache.insert(layout_key, c.clone());
+                                            });
+                                        }
+                                    }
+                                    result
+                                };
+
+                                match layout {
+                                    Ok(cached) => {
+                                        if cached.lines.is_empty() || cached.lines.iter().all(|l| l.tokens.is_empty()) {
                                             return None;
                                         }
                                         Some((
                                             base_frame,
                                             ScheduledMessage::new(
                                                 0,
-                                                lines,
-                                                bubble_w,
-                                                bubble_h,
+                                                cached.lines,
+                                                cached.width,
+                                                cached.height,
                                                 Color::from(&args_c.bubble_color),
-                                                user_color,
+                                                cached.user_color,
                                                 is_grouped,
                                                 is_highlighted,
+                                                layout_key,
                                             ),
                                         ))
                                     }
@@ -2191,6 +2380,11 @@ pub async fn process_chat_render(
                             })
                         })
                     })
+                    .collect();
+
+                let results: BatchResult = remap
+                    .into_iter()
+                    .map(|idx| unique_results[idx].clone())
                     .collect();
 
                 let _ = tx.send(results);
@@ -2209,11 +2403,11 @@ pub async fn process_chat_render(
             };
             let mut cursor = *last_frame;
             for (base_frame, mut sched) in results.into_iter().flatten() {
-                let assigned = if base_frame <= cursor {
-                    cursor + 2
-                } else {
-                    base_frame
-                };
+                // Preserve timestamp collisions. At 24 fps a burst can contain
+                // dozens of messages for the exact same frame. Artificially moving
+                // them forward by two frames changes chat timing and can make a
+                // message appear that would have been pushed off the visible stack.
+                let assigned = base_frame.max(cursor);
                 cursor = assigned;
                 sched.spawn_frame = assigned as u32;
                 if stamp.send((sched.spawn_frame, Arc::new(sched))).is_err() {
@@ -2332,9 +2526,11 @@ pub async fn process_chat_render(
     );
     let num_bytes = (actual_width * args.height * 4) as usize;
 
-    let pixel_pool = Arc::new(PixelBufferPool::new(
-        IO_CHANNEL_DEPTH + POOL_HEADROOM + chunk_size,
-    ));
+    let pixel_pool = Arc::new(PixelBufferPool::new(pixel_pool_buffer_count(
+        num_bytes,
+        worker_threads,
+        args.render_memory_budget_mb,
+    )));
 
     let mut active_bubbles: VecDeque<Arc<ScheduledMessage>> = VecDeque::new();
     let mut next_stamp: Option<(u32, Arc<ScheduledMessage>)> = None;
@@ -2351,10 +2547,10 @@ pub async fn process_chat_render(
     let canvas_max_h = args.height - args.padding;
 
     let mut last_sig: u64 = u64::MAX;
-    let mut prev_animating: bool = false;
     let mut last_buf: Option<Arc<ReusableBuffer>> = None;
 
     emit_progress(10.0, "Rendering frames...");
+    let mut last_progress_emit = std::time::Instant::now();
 
     'frame: for f_idx in 0..total_frames {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -2372,6 +2568,23 @@ pub async fn process_chat_render(
                 }
                 _ => break,
             }
+        }
+
+        // A pathological chat burst can enqueue thousands of messages for the
+        // same 24-fps frame. Only the newest bubbles can ever be visible in a
+        // push-only stack; older bubbles beyond this conservative lower-bound
+        // capacity are guaranteed to remain permanently off-screen. Drop them
+        // before hashing/signature work so burst size cannot turn into O(n) hot
+        // loop cost or unbounded active-bubble memory. The exact height trim below
+        // still handles taller emote-rich bubbles.
+        let min_bubble_height = (msg_line_h.ceil() as i32)
+            .saturating_add(args.bubble_padding.max(0).saturating_mul(2))
+            .saturating_add(args.message_spacing.max(0))
+            .max(1);
+        let guaranteed_visible_capacity = ((canvas_max_h.max(1) / min_bubble_height) as usize)
+            .saturating_add(3);
+        if active_bubbles.len() > guaranteed_visible_capacity {
+            active_bubbles.truncate(guaranteed_visible_capacity);
         }
 
         // Evict timed-out bubbles (Timed strategy only).
@@ -2398,15 +2611,15 @@ pub async fn process_chat_render(
         }
 
         // ── Per-frame dedup check ─────────────────────────────────────────────
-        // Compute the frame signature directly on &active_bubbles so we never
-        // clone the bubble list unless the frame is genuinely dirty.  At 30 fps
-        // with a message arriving once per second only ~1 in 30 frames is dirty;
-        // the old code cloned into a Vec<Arc<...>> for every frame regardless.
+        // The signature already contains every visual animation state that affects
+        // draw_frame (alpha, slide position and animated-emote frame). Do not force
+        // redraws merely because a bubble is generally "animating"; that defeats
+        // the whole point of dirty-frame coalescing.
         {
-            let (sig, is_animating) = if active_bubbles.is_empty() {
-                (0u64, false)
+            let sig = if active_bubbles.is_empty() {
+                0u64
             } else {
-                let s = frame_signature_deque(
+                frame_signature_deque(
                     &active_bubbles,
                     f_idx,
                     fps_f32,
@@ -2415,24 +2628,16 @@ pub async fn process_chat_render(
                     &eviction,
                     hold_secs,
                     fade_secs,
-                );
-                let anim = active_bubbles.iter().any(|b| {
-                    b.is_animating(f_idx, fps_f32, anim_slide, anim_fade, &eviction, hold_secs)
-                });
-                (s, anim)
+                )
             };
-
-            let dirty = sig != last_sig || prev_animating || last_buf.is_none();
+            let dirty = sig != last_sig || last_buf.is_none();
             if dirty {
-                // Only now pay for the clone — and only for the bubbles visible
-                // on this frame (already trimmed above).
                 let vis: Vec<Arc<ScheduledMessage>> = active_bubbles.iter().cloned().collect();
                 frame_chunk.push((f_idx, Some(vis)));
                 last_sig = sig;
             } else {
-                frame_chunk.push((f_idx, None)); // reuse last_buf
+                frame_chunk.push((f_idx, None));
             }
-            prev_animating = is_animating;
         }
 
         if frame_chunk.len() < chunk_size && f_idx < total_frames - 1 {
@@ -2561,8 +2766,13 @@ pub async fn process_chat_render(
 
         frame_chunk.clear();
 
-        let pct = 10.0 + ((f_idx as f32 / total_frames as f32) * 90.0);
-        emit_progress(pct, &format!("Rendering... ({:.1}%)", pct));
+        let pct = 10.0 + ((f_idx as f32 / total_frames.max(1) as f32) * 90.0);
+        if last_progress_emit.elapsed() >= std::time::Duration::from_millis(150)
+            || f_idx + 1 >= total_frames
+        {
+            emit_progress(pct, &format!("Rendering... ({:.1}%)", pct));
+            last_progress_emit = std::time::Instant::now();
+        }
     }
 
     // Signal the IO thread that no more frames are coming, then close stdin

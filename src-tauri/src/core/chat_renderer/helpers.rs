@@ -191,45 +191,52 @@ pub fn decode_emote_bytes_to_emote_data(
     decode_static(bytes, target_h, filter, alpha_type)
 }
 
-/// Build a `LazyGif` entry: retain compressed bytes, pre-compute timing only.
+/// Build a `LazyGif` entry: retain compressed bytes and timing metadata only.
 ///
-/// Timing metadata (cumulative durations, total_ms, dimensions) requires a
-/// full frame decode pass anyway — so we pay that cost here and throw away the
-/// pixel data, keeping only the byte array and the timing index. The pixel
-/// decode is deferred to the first `frame_at` call via `OnceLock`.
+/// The GIF frames still have to be walked once to obtain cumulative durations,
+/// but they are not collected into a `Vec`, so peak RAM stays close to the
+/// compressed asset size instead of retaining the whole decoded animation.
+/// Pixel decode is deferred to the first `frame_at` call via `OnceLock`.
 fn decode_gif_lazy(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<EmoteData> {
     use crate::core::chat_renderer::types::EmoteData;
 
     let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))?;
-    let frames = decoder.into_frames().collect_frames()?;
+    let mut frames = decoder.into_frames();
 
-    if frames.is_empty() {
-        return Err(AppError::EmoteCache("LazyGif: GIF decoded to zero frames".into()));
+    let first = frames
+        .next()
+        .ok_or_else(|| AppError::EmoteCache("LazyGif: GIF decoded to zero frames".into()))??;
+
+    // Do not collect all decoded frames just to discover timing metadata. The old
+    // path temporarily retained the full animation in RAM, defeating lazy decode.
+    let (src_w, src_h) = first.buffer().dimensions();
+    if src_w == 0 || src_h == 0 {
+        return Err(AppError::EmoteCache("LazyGif: zero-sized first frame".into()));
     }
 
-    // Compute timing and dimensions from the raw frame metadata.
-    // We resize one frame to get the final dimensions without decoding all pixels.
-    let (w, h) = {
-        let f0 = DynamicImage::ImageRgba8(frames[0].buffer().clone());
-        let resized = resize_dynamic_image_preserve_aspect(f0, target_h, FilterType::Nearest);
-        let (rw, rh) = resized.dimensions();
-        (rw as i32, rh as i32)
-    };
+    let scale = target_h as f32 / src_h as f32;
+    let w = ((src_w as f32 * scale) + 0.5) as i32;
+    let h = target_h as i32;
 
-    let mut cum_durations = Vec::with_capacity(frames.len());
-    let mut current_cum = 0u32;
-    for frame in &frames {
+    let mut cum_durations = Vec::with_capacity(16);
+    let mut current_cum = {
+        let (n, d) = first.delay().numer_denom_ms();
+        if d != 0 { (n / d).max(10) } else { n.max(10) }
+    };
+    cum_durations.push(current_cum);
+
+    for frame in frames {
+        let frame = frame?;
         let (n, d) = frame.delay().numer_denom_ms();
         let delay_ms = if d != 0 { (n / d).max(10) } else { n.max(10) };
         current_cum = current_cum.saturating_add(delay_ms);
         cum_durations.push(current_cum);
     }
-    let total_ms = current_cum;
 
     Ok(EmoteData::LazyGif {
         raw_bytes: Arc::from(bytes),
         cum_durations: Arc::from(cum_durations),
-        total_ms,
+        total_ms: current_cum,
         w,
         h,
         target_h,
