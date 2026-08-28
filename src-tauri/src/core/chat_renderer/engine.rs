@@ -1932,7 +1932,7 @@ pub async fn process_chat_render(
         };
         // 2 MiB read buffer: large enough to process multi-MB log files
         // without thrashing the OS page cache.
-        let reader = std::io::BufReader::with_capacity(2 << 20, f);
+        let mut reader = std::io::BufReader::with_capacity(2 << 20, f);
 
         let mut max_offset_sec: f64 = 0.0;
         let mut last_user = String::new();
