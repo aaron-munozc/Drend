@@ -127,6 +127,25 @@ fn skia_image_from_rgba(pixels: &[u8], w: u32, h: u32, alpha_type: AlphaType) ->
     images::raster_from_data(&info, &data, (w * 4) as usize)
 }
 
+/// Convert straight RGBA8 to premultiplied RGBA8 in-place.
+///
+/// Skia's `Premul` alpha type describes the actual stored pixels; merely tagging
+/// straight-alpha bytes as `Premul` produces incorrect edge colours for translucent
+/// GIF/PNG pixels. Decode-time conversion is paid once and then reused for every
+/// video frame.
+#[inline]
+fn premultiply_rgba_in_place(pixels: &mut [u8]) {
+    for px in pixels.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a >= 255 {
+            continue;
+        }
+        px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
+        px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
+        px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
+    }
+}
+
 /// Decode raw image bytes into [`EmoteData`].
 ///
 /// # GPU usage
@@ -276,7 +295,11 @@ pub fn decode_gif_to_skia_frames(
             let resized =
                 resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
             let (rw, rh) = resized.dimensions();
-            Some((rw, rh, resized.into_rgba8().into_raw()))
+            let mut raw = resized.into_rgba8().into_raw();
+            if alpha_type == AlphaType::Premul {
+                premultiply_rgba_in_place(&mut raw);
+            }
+            Some((rw, rh, raw))
         })
         .collect();
 
@@ -327,7 +350,11 @@ fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<E
             let resized =
                 resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
             let (rw, rh) = resized.dimensions();
-            Some((delay_ms, rw, rh, resized.into_rgba8().into_raw()))
+            let mut raw = resized.into_rgba8().into_raw();
+            if alpha_type == AlphaType::Premul {
+                premultiply_rgba_in_place(&mut raw);
+            }
+            Some((delay_ms, rw, rh, raw))
         })
         .collect();
 
@@ -399,7 +426,10 @@ fn decode_static(
     };
 
     let (rw, rh) = resized.dimensions();
-    let rgba = resized.into_rgba8();
+        let mut rgba = resized.into_rgba8();
+        if alpha_type == AlphaType::Premul {
+            premultiply_rgba_in_place(rgba.as_mut());
+        }
 
     let img = skia_image_from_rgba(rgba.as_raw(), rw, rh, alpha_type)
         .ok_or_else(|| AppError::EmoteCache("Skia rejected valid RGBA buffer".into()))?;

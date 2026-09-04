@@ -148,55 +148,48 @@ thread_local! {
 // Pixel buffer pool
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Lock-based pool of reusable pixel buffers. Avoids per-frame `malloc` /
-/// `free` on the hot render path. The pool is bounded so it can't grow without
-/// limit on high-core systems.
+/// Fixed-capacity pool of reusable pixel buffers. Avoids per-frame `malloc` /
+/// `free` on the hot render path and, unlike the old lazy vector pool, cannot
+/// allocate additional frame-sized buffers while workers are running.
 struct PixelBufferPool {
-    inner: Mutex<Vec<Vec<u8>>>,
-    max_buffers: usize,
+    // Fixed-capacity ownership pool. A buffer is either available here or owned
+    // by a worker / the FFmpeg queue; it is never freshly allocated on the hot path.
+    free: crossbeam_channel::Sender<Vec<u8>>,
+    available: crossbeam_channel::Receiver<Vec<u8>>,
+    frame_len: usize,
+    count: usize,
 }
 
 impl PixelBufferPool {
-    fn new(max_buffers: usize) -> Self {
-        Self {
-            inner: Mutex::new(Vec::with_capacity(max_buffers)),
-            max_buffers,
+    fn new(count: usize, frame_len: usize) -> Self {
+        assert!(count > 0, "pixel buffer pool must contain at least one buffer");
+        assert!(frame_len > 0, "pixel buffer pool frame length must be non-zero");
+
+        let (free, available) = crossbeam_channel::bounded::<Vec<u8>>(count);
+        for _ in 0..count {
+            let mut buf = Vec::with_capacity(frame_len);
+            // SAFETY: read_pixels overwrites every byte before the buffer is used.
+            unsafe { buf.set_len(frame_len) };
+            free.send(buf).expect("pixel pool initialization cannot fail");
         }
+
+        Self { free, available, frame_len, count }
     }
 
-    fn acquire(&self, min_len: usize) -> Vec<u8> {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(mut buf) = guard.pop() {
-            drop(guard);
-            // Only reallocate when the existing capacity is genuinely too small.
-            // The old code called buf.reserve(min_len - buf.len()) with len==0,
-            // which meant reserve(min_len) — triggering a realloc even when
-            // capacity was already >= min_len.
-            if buf.capacity() < min_len {
-                buf.reserve_exact(min_len - buf.capacity());
-            }
-            // SAFETY: caller overwrites every byte (Skia read_pixels fills the
-            // buffer completely). Content before set_len is don't-care.
-            unsafe { buf.set_len(min_len) };
-            return buf;
-        }
-        drop(guard);
-        // Fresh allocation: allocate exactly the needed capacity in one step.
-        let mut buf = Vec::with_capacity(min_len);
-        // SAFETY: same as above.
-        unsafe { buf.set_len(min_len) };
+    #[inline]
+    fn acquire(&self) -> Vec<u8> {
+        let buf = self.available.recv().expect("pixel buffer pool unexpectedly closed");
+        debug_assert_eq!(buf.len(), self.frame_len);
+        debug_assert!(self.available.len() < self.count);
         buf
     }
 
+    #[inline]
     fn release(&self, mut buf: Vec<u8>) {
-        // SAFETY: reset length to 0 so capacity is preserved but contents are
-        // considered uninitialised, matching the contract of `acquire`.
-        unsafe { buf.set_len(0) };
-        let mut g = self.inner.lock().unwrap();
-        if g.len() < self.max_buffers {
-            g.push(buf);
-        }
-        // Otherwise the buffer is simply dropped here.
+        debug_assert_eq!(buf.capacity(), self.frame_len);
+        debug_assert_eq!(buf.len(), self.frame_len);
+        unsafe { buf.set_len(self.frame_len) };
+        let _ = self.free.send(buf);
     }
 }
 
@@ -215,9 +208,10 @@ impl Drop for ReusableBuffer {
 }
 
 impl ReusableBuffer {
-    fn new(pool: Arc<PixelBufferPool>, len: usize) -> Self {
+    #[inline]
+    fn new(pool: Arc<PixelBufferPool>) -> Self {
         Self {
-            data: Some(pool.acquire(len)),
+            data: Some(pool.acquire()),
             pool,
         }
     }
@@ -487,25 +481,37 @@ fn split_into_fragments<'a>(
     max_w: f32,
     cache: &mut FxHashMap<u64, MeasureEntry>,
     gen: u32,
-) -> arrayvec::ArrayVec<&'a str, 32> {
-    let mut out = arrayvec::ArrayVec::new();
+) -> Vec<&'a str> {
+    // Do not use a fixed-capacity ArrayVec here. Stream/VOD chat can contain
+    // arbitrarily long unbroken tokens (URLs, repeated characters, spam), and
+    // each visual fragment is a valid output. A capacity overflow would panic
+    // inside the Rayon worker and abort the whole render. Start small so the
+    // normal path remains cheap, but allow Vec to grow safely for pathological
+    // messages.
+    let mut out = Vec::with_capacity(32);
     let mut start = 0usize;
 
     while start < input.len() {
         let remainder = &input[start..];
 
         if measure_cached(font, font_bits, remainder, cache, gen) <= max_w {
-            let _ = out.try_push(remainder);
+            out.push(remainder);
             break;
         }
 
         // Collect all char-boundary byte offsets once — O(n) — so the binary
         // search below can index them in O(1) instead of re-walking from the
         // start on every iteration (which made the whole thing O(n log n)).
-        let char_offsets: arrayvec::ArrayVec<usize, 256> = remainder
-            .char_indices()
-            .map(|(i, _)| i)
-            .collect();
+        // Avoid another fixed-capacity ArrayVec: a single oversized token can
+        // contain more than 256 Unicode scalar values. Vec grows as needed
+        // without turning valid input into a worker panic.
+        let mut char_offsets = Vec::with_capacity(
+            remainder.len().min(256),
+        );
+        char_offsets.extend(remainder.char_indices().map(|(i, _)| i));
+        if char_offsets.last().copied() != Some(remainder.len()) {
+            char_offsets.push(remainder.len());
+        }
         let char_count = char_offsets.len();
 
         if char_count == 0 {
@@ -536,10 +542,10 @@ fn split_into_fragments<'a>(
             // Even a single character doesn't fit — emit it to avoid an
             // infinite loop on very narrow canvases.
             let end = char_offsets.get(1).copied().unwrap_or(remainder.len());
-            let _ = out.try_push(&remainder[..end]);
+            out.push(&remainder[..end]);
             start += end;
         } else {
-            let _ = out.try_push(&remainder[..best_byte]);
+            out.push(&remainder[..best_byte]);
             start += best_byte;
         }
     }
@@ -1332,6 +1338,7 @@ fn pixel_pool_buffer_count(
     frame_bytes: usize,
     worker_threads: usize,
     budget_mb: Option<usize>,
+    io_depth: usize,
 ) -> usize {
     let budget = budget_mb
         .unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB)
@@ -1340,12 +1347,19 @@ fn pixel_pool_buffer_count(
         * 1024;
 
     if frame_bytes == 0 {
-        return worker_threads + IO_CHANNEL_DEPTH + POOL_HEADROOM;
+        return worker_threads
+            .saturating_add(io_depth)
+            .saturating_add(POOL_HEADROOM)
+            .max(1);
     }
 
-    let frame_capacity = (budget / frame_bytes).max(1);
-    let scheduling_floor = (worker_threads + POOL_HEADROOM).min(frame_capacity);
-    frame_capacity.max(scheduling_floor).min(128)
+    let budget_frames = budget / frame_bytes;
+    let max_pool_frames = budget_frames.saturating_sub(worker_threads).max(1);
+    let target = worker_threads.saturating_add(io_depth).saturating_add(POOL_HEADROOM);
+
+    // The budget is a ceiling, not a request to eagerly allocate every byte of
+    // it. Keep enough buffers to saturate workers + the asynchronous writer.
+    max_pool_frames.min(target).max(1)
 }
 
 /// Build FFmpeg arguments for the overlay pipeline (base video + chat stream).
@@ -1816,22 +1830,42 @@ pub async fn process_chat_render(
         }
     };
 
-    // At large resolutions each worker needs both a Skia surface and an output
-    // buffer. Limit automatic worker count by the same RAM budget used by the
-    // pixel pool. Explicit max_render_threads remains authoritative.
+    // Never create more workers than the machine has logical CPUs. An explicit
+    // max_render_threads remains a cap, but absurdly large values would otherwise
+    // create scheduler contention and defeat the point of the offline renderer.
+    worker_threads = worker_threads.min(cpus.max(1)).max(1);
+
+    // Queue depth participates in the same render-memory envelope as the output
+    // buffers. Resolve it before creating the Rayon pool so the worker count can
+    // be capped before any worker thread has a chance to allocate its Skia surface.
+    let io_depth = args
+        .ffmpeg_input_queue_frames
+        .unwrap_or(IO_CHANNEL_DEPTH)
+        .clamp(4, MAX_FFMPEG_RAW_QUEUE_FRAMES);
+
     let frame_bytes = (actual_width as usize)
         .saturating_mul(args.height.max(1) as usize)
         .saturating_mul(4);
-    let memory_budget_bytes = args
+    let budget_bytes = args
         .render_memory_budget_mb
         .unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB)
         .clamp(64, 4096)
         * 1024
         * 1024;
-    if max_threads.is_none() && frame_bytes > 0 {
-        let by_memory = (memory_budget_bytes / frame_bytes / 2).clamp(1, worker_threads);
-        worker_threads = worker_threads.min(by_memory.max(1));
+    let budget_frames = if frame_bytes == 0 { usize::MAX } else { budget_bytes / frame_bytes };
+
+    if budget_frames < 3 {
+        return Err(AppError::InternalError(format!(
+            "render_memory_budget_mb is too small for this frame size ({} frame-sized allocations available; at least 3 are required)",
+            budget_frames
+        )));
     }
+
+    // Reserve one frame-sized allocation per persistent worker surface and at
+    // least two more for asynchronous producer/consumer overlap. This turns the
+    // memory budget into a real concurrency limit instead of a post-hoc pool size.
+    let memory_worker_cap = ((budget_frames.saturating_sub(1)) / 2).max(1);
+    worker_threads = worker_threads.min(memory_worker_cap).max(1);
 
     // Keep the default 24 fps path responsive: only ~2 frames of work per worker
     // are batched, rather than one large chunk per worker multiplied by a fixed base.
@@ -1856,6 +1890,9 @@ pub async fn process_chat_render(
         build_standalone_ffmpeg_args(&args, actual_width, has_nvenc, ffmpeg_preset, encode_threads)
     };
 
+    // Immutable render configuration shared by all frame workers.
+    let render_args = Arc::new(args.clone());
+
     // ── Spawn FFmpeg ──────────────────────────────────────────────────────────
     let mut ffmpeg_child = hidden_command("ffmpeg")
         .args(&ffmpeg_args)
@@ -1871,24 +1908,25 @@ pub async fn process_chat_render(
 
     let ff_stdin = ffmpeg_child.stdin.take().unwrap();
 
-    // Bounded channel: backpressure from FFmpeg naturally throttles rendering.
-    let (io_tx, io_rx) = crossbeam_channel::bounded::<Arc<ReusableBuffer>>(IO_CHANNEL_DEPTH);
+    // Bounded channel: backpressure from FFmpeg naturally throttles rendering,
+    // but all blocking pipe writes happen on this dedicated thread.
+    let (io_tx, io_rx) = crossbeam_channel::bounded::<Arc<ReusableBuffer>>(io_depth);
+    let io_failed = Arc::new(AtomicBool::new(false));
+    let io_failed_thread = Arc::clone(&io_failed);
 
-    // IO writer thread: one dedicated thread drains the channel and writes
-    // raw pixel data into FFmpeg stdin. The large BufWriter amortises syscall
-    // overhead; 8 MiB is a good balance between RAM usage and write batching.
     let io_thread = std::thread::spawn(move || {
-        // 8 MiB write buffer — amortises small per-frame writes at high res / fps.
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, ff_stdin);
         while let Ok(frame) = io_rx.recv() {
             if let Some(data) = &frame.data {
                 if writer.write_all(data).is_err() {
+                    io_failed_thread.store(true, Ordering::Release);
                     break;
                 }
             }
         }
-        let _ = writer.flush();
-        // Drain the channel so senders can unblock and detect the closed pipe.
+        if writer.flush().is_err() {
+            io_failed_thread.store(true, Ordering::Release);
+        }
         drop(writer);
         for _ in io_rx {}
     });
@@ -1945,23 +1983,20 @@ pub async fn process_chat_render(
             None
         };
 
-        let mut line = String::with_capacity(512);
-        loop {
-            line.clear();
-            let read = match std::io::BufRead::read_line(&mut reader, &mut line) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if read == 0 {
-                break;
-            }
+        // Incremental JSON decoding: never materialise the whole chat log, and
+        // avoid allocating a new line String for every message.
+        let stream = serde_json::Deserializer::from_reader(reader).into_iter::<MessageSaved>();
+        for msg_result in stream {
             if scan_cancel.load(Ordering::Relaxed) {
                 break;
             }
 
-            let msg: MessageSaved = match serde_json::from_str(line.trim_end_matches(['\r', '\n'])) {
+            let msg: MessageSaved = match msg_result {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(err) => {
+                    log::warn!("[chat-render] malformed JSON value in stream log: {}", err);
+                    break;
+                }
             };
             if scan_skip.contains(&msg.sender.username) {
                 continue;
@@ -2526,11 +2561,13 @@ pub async fn process_chat_render(
     );
     let num_bytes = (actual_width * args.height * 4) as usize;
 
-    let pixel_pool = Arc::new(PixelBufferPool::new(pixel_pool_buffer_count(
+    let pool_count = pixel_pool_buffer_count(
         num_bytes,
         worker_threads,
         args.render_memory_budget_mb,
-    )));
+        io_depth,
+    );
+    let pixel_pool = Arc::new(PixelBufferPool::new(pool_count, num_bytes));
 
     let mut active_bubbles: VecDeque<Arc<ScheduledMessage>> = VecDeque::new();
     let mut next_stamp: Option<(u32, Arc<ScheduledMessage>)> = None;
@@ -2663,59 +2700,54 @@ pub async fn process_chat_render(
             }
         }
 
-        // ── Parallel render ───────────────────────────────────────────────────
+        // ── Parallel render + streaming dispatch ────────────────────────────────
+        // Workers publish completed frames as soon as they finish. The coordinator
+        // drains those completions in timeline order, so rendering and FFmpeg I/O
+        // overlap without changing frame order or chat timing.
         if !unique_jobs.is_empty() {
             let pool = Arc::clone(&pixel_pool);
-            let args_block = args.clone();
+            let args_block = Arc::clone(&render_args);
             let info_clone = info.clone();
+            let result_capacity = worker_threads.saturating_mul(2).max(2);
+            let (render_tx, render_rx) =
+                crossbeam_channel::bounded::<(usize, Arc<ReusableBuffer>)>(result_capacity);
 
-            let rendered_jobs: Vec<Arc<ReusableBuffer>> = render_pool.install(|| {
-                unique_jobs
-                    .into_par_iter()
-                    .map(|(frame_id, bubbles)| {
-                        let mut buf = ReusableBuffer::new(pool.clone(), num_bytes);
+            let expected_jobs = unique_jobs.len();
+            let mut ready: Vec<Option<Arc<ReusableBuffer>>> =
+                (0..expected_jobs).map(|_| None).collect();
+            let mut received = 0usize;
+            let mut next_sequence = 0usize;
+            let mut channel_closed = false;
 
+            render_pool.scope(|scope| {
+                let eviction = eviction.clone();
+                for (job_idx, (frame_id, bubbles)) in unique_jobs.into_iter().enumerate() {
+                    let tx = render_tx.clone();
+                    let pool = Arc::clone(&pool);
+                    let args_block = Arc::clone(&args_block);
+                    let info_clone = info_clone.clone();
+                    let eviction = eviction.clone();
+
+                    scope.spawn(move |_| {
+                        let mut buf = ReusableBuffer::new(pool);
                         SKIA_SURFACE.with(|surf_cell| {
                             let mut surf_opt = surf_cell.borrow_mut();
-
-                            // Lazily initialise or reallocate the per-thread surface.
-                            // In practice this branch is taken exactly once per thread.
                             if surf_opt.is_none()
                                 || surf_opt.as_ref().unwrap().width() != actual_width
                                 || surf_opt.as_ref().unwrap().height() != args_block.height
                             {
-                                // Create the surface with the same ImageInfo used for
-                                // read_pixels so the pixel format matches exactly on every
-                                // platform. raster_n32_premul uses the host-native byte order
-                                // (kN32) which is BGRA on little-endian x86 but diverges on
-                                // other targets; using surfaces::raster() with an explicit
-                                // BGRA8888 info guarantees a consistent layout that FFmpeg
-                                // can consume without channel-swapping.
                                 *surf_opt = Some(
                                     surfaces::raster(&info_clone, None, None)
-                                        .unwrap(),
+                                        .expect("valid Skia raster surface dimensions"),
                                 );
                             }
 
                             let surface = surf_opt.as_mut().unwrap();
                             let canvas = surface.canvas();
-
                             draw_frame(
-                                canvas,
-                                &bubbles,
-                                &args_block,
-                                bg_color,
-                                is_luma,
-                                frame_id,
-                                fps_f32,
-                                hold_secs,
-                                anim_slide,
-                                anim_fade,
-                                &eviction,
+                                canvas, &bubbles, &args_block, bg_color, is_luma, frame_id,
+                                fps_f32, hold_secs, anim_slide, anim_fade, &eviction,
                             );
-
-                            // Read pixels out into the pool buffer. The stride must
-                            // match `actual_width * 4` bytes exactly.
                             surface.read_pixels(
                                 &info_clone,
                                 buf.data.as_mut().unwrap().as_mut_slice(),
@@ -2724,38 +2756,78 @@ pub async fn process_chat_render(
                             );
                         });
 
-                        Arc::new(buf)
-                    })
-                    .collect()
+                        let _ = tx.send((job_idx, Arc::new(buf)));
+                    });
+                }
+                drop(render_tx);
+
+                while next_sequence < sequence.len() {
+                    if channel_closed || io_failed.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    match sequence[next_sequence] {
+                        Ok(job_idx) => {
+                            while ready[job_idx].is_none() {
+                                match render_rx.recv() {
+                                    Ok((idx, buf)) => {
+                                        received += 1;
+                                        ready[idx] = Some(buf);
+                                    }
+                                    Err(_) => {
+                                        channel_closed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if channel_closed {
+                                break;
+                            }
+
+                            let Some(buf) = ready[job_idx].take() else {
+                                channel_closed = true;
+                                break;
+                            };
+                            last_buf = Some(Arc::clone(&buf));
+                            if io_tx.send(buf).is_err() {
+                                channel_closed = true;
+                                break;
+                            }
+                        }
+                        Err(()) => {
+                            let Some(buf) = last_buf.as_ref() else {
+                                channel_closed = true;
+                                break;
+                            };
+                            if io_tx.send(Arc::clone(buf)).is_err() {
+                                channel_closed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    next_sequence += 1;
+                }
+
+                // Always drain completions so no Rayon worker can remain blocked on
+                // the bounded result channel during scope shutdown.
+                while received < expected_jobs {
+                    match render_rx.recv() {
+                        Ok((idx, buf)) => {
+                            received += 1;
+                            ready[idx] = Some(buf);
+                        }
+                        Err(_) => break,
+                    }
+                }
             });
 
-            // ── Dispatch to IO thread ─────────────────────────────────────────
-            let mut channel_closed = false;
-            let mut render_iter = rendered_jobs.into_iter();
-
-            for directive in &sequence {
-                let buf_to_send = match directive {
-                    Ok(_) => {
-                        let buf = render_iter.next().unwrap();
-                        last_buf = Some(Arc::clone(&buf));
-                        buf
-                    }
-                    // Repeat: clone the Arc (cheap) so the IO thread sees
-                    // a reference to the exact same pixel data.
-                    Err(()) => Arc::clone(last_buf.as_ref().unwrap()),
-                };
-
-                if io_tx.send(buf_to_send).is_err() {
-                    channel_closed = true;
-                    break;
-                }
-            }
-
-            if channel_closed {
+            if channel_closed || io_failed.load(Ordering::Acquire) {
                 break 'frame;
             }
+
+            debug_assert!(ready.iter().all(Option::is_none));
         } else if let Some(ref buf) = last_buf {
-            // Entire chunk was identical — blast the same buffer pointer N times.
             let buf = Arc::clone(buf);
             for _ in &sequence {
                 if io_tx.send(Arc::clone(&buf)).is_err() {
