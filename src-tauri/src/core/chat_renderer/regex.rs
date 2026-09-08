@@ -1,17 +1,27 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-/// Matches custom Kick emote tags in the format: [emote:123:KEKW]
+// ─────────────────────────────────────────────────────────────────────────────
+// Hot-path compile-time regexes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Matches Kick native emote tags: `[emote:123456:KEKW]`.
+///
+/// Groups:
+///   - `id`   — the numeric emote ID (parsed to i32 at tokenisation time)
+///   - `name` — the human-readable emote name (for logging / fallback text)
 pub static EMOTE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[emote:(?P<id>\d+):(?P<name>[^]]+)]").unwrap());
 
-/// Robust URL matcher mapped to word boundaries.
+// ─────────────────────────────────────────────────────────────────────────────
+// Fast pre-scan guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if `text` might contain a Kick emote tag.
 ///
-/// Intentionally anchored at the start with `\b` and at the end requires at
-/// least one path character after the extension so bare filenames typed in
-/// chat (e.g. "image.png") don't accidentally match. The `(?:[?#][^ ]*)?`
-/// tail captures query strings and fragment identifiers that are part of
-/// CDN-signed URLs.
-pub static IMAGE_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(?:https?://|www\.)[-A-Z0-9+&@#/%?=~_|!:,.;]*[-A-Z0-9+&@#/%=~_|]\.(?:png|jpg|jpeg|gif|webp)(?:[?#][^ ]*)?").unwrap()
-});
+/// A single `memchr`-accelerated byte scan. Used to gate `EMOTE_REGEX` so
+/// messages with no `[emote:` substring never pay the regex overhead.
+#[inline(always)]
+pub fn text_may_have_kick_emote(text: &str) -> bool {
+    text.contains("[emote:")
+}

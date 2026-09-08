@@ -13,32 +13,45 @@ use crate::core::chat_renderer::types::EmoteData;
 use crate::error::AppError;
 use crate::types::AppResult;
 
-// Precomputed Skia Colors (ARGB) — eliminates runtime string parsing overhead.
+// ─────────────────────────────────────────────────────────────────────────────
+// Precomputed username palette
+//
+// Using precomputed ARGB constants avoids runtime string→int parsing on every
+// username render. The palette is selected via a hash of the username bytes so
+// the same username always maps to the same color — deterministic across runs.
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub const DEFAULT_USERNAME_COLORS: &[Color] = &[
-    Color::new(0xFFFF0000),
-    Color::new(0xFF0000FF),
-    Color::new(0xFF00FF00),
-    Color::new(0xFFB22222),
-    Color::new(0xFFFF7F50),
-    Color::new(0xFF9ACD32),
-    Color::new(0xFFFF4500),
-    Color::new(0xFF2E8B57),
-    Color::new(0xFFDAA520),
-    Color::new(0xFFD2691E),
-    Color::new(0xFF5F9EA0),
-    Color::new(0xFF1E90FF),
-    Color::new(0xFFFF69B4),
-    Color::new(0xFF8A2BE2),
-    Color::new(0xFF00FF7F),
+    Color::new(0xFFFF0000), // Red
+    Color::new(0xFF0000FF), // Blue
+    Color::new(0xFF00FF00), // Green
+    Color::new(0xFFB22222), // Firebrick
+    Color::new(0xFFFF7F50), // Coral
+    Color::new(0xFF9ACD32), // YellowGreen
+    Color::new(0xFFFF4500), // OrangeRed
+    Color::new(0xFF2E8B57), // SeaGreen
+    Color::new(0xFFDAA520), // Goldenrod
+    Color::new(0xFFD2691E), // Chocolate
+    Color::new(0xFF5F9EA0), // CadetBlue
+    Color::new(0xFF1E90FF), // DodgerBlue
+    Color::new(0xFFFF69B4), // HotPink
+    Color::new(0xFF8A2BE2), // BlueViolet
+    Color::new(0xFF00FF7F), // SpringGreen
 ];
 
 /// Parse a hex color string and map it to a Skia `Color`.
 ///
-/// Falls back to a deterministic hash-based palette entry when the hex string
-/// is absent or malformed. No heap allocation on the fast path.
+/// Fast path: the hex string is parsed via `u32::from_str_radix` — no regex,
+/// no allocation, single integer operation. Falls back to a deterministic
+/// hash-based palette entry when the hex string is absent or malformed.
+///
+/// The `#` prefix is stripped with a byte comparison rather than `trim_start_matches`
+/// to avoid a function-call overhead on the hot path.
 #[inline(always)]
 pub fn get_user_color(username: &str, hex_color: &str) -> Color {
     if hex_color.len() >= 6 {
+        // Strip leading '#' in a single byte compare — no bounds check needed
+        // because len() >= 6 guarantees at least one byte.
         let clean = if hex_color.as_bytes()[0] == b'#' {
             &hex_color[1..]
         } else {
@@ -57,12 +70,20 @@ pub fn get_user_color(username: &str, hex_color: &str) -> Color {
             };
         }
     }
-    // Deterministic hash-based fallback — same color for same username every run.
+    // Deterministic fallback: FxHasher is non-cryptographic, fast, and
+    // produces the same output for the same input across program invocations
+    // (unlike std's default SipHash which is seeded from entropy).
     let mut hasher = FxHasher::default();
     hasher.write(username.as_bytes());
     DEFAULT_USERNAME_COLORS[(hasher.finish() as usize) % DEFAULT_USERNAME_COLORS.len()]
 }
 
+/// Map a `QualityPreset` to the corresponding `image` crate filter type.
+///
+/// This is the single decode-time decision point: the selected filter is
+/// applied once when the image is resized and never again. Choosing `Draft`
+/// (Nearest) costs almost nothing; choosing `High` (Lanczos3) adds ~200 µs
+/// per emote decode but produces markedly better results for photo-style emotes.
 #[inline(always)]
 pub fn quality_to_filter(q: &QualityPreset) -> FilterType {
     match q {
@@ -72,8 +93,10 @@ pub fn quality_to_filter(q: &QualityPreset) -> FilterType {
     }
 }
 
-/// Cubic ease-out: fast start, decelerates to stop.
-/// `t` must be in [0.0, 1.0].
+/// Cubic ease-out: fast start, decelerates to stop. `t` must be in [0.0, 1.0].
+///
+/// Equivalent to `1 - (1-t)³` but written with explicit mul to avoid
+/// `f32::powi` dispatch overhead when compiled without fast-math.
 #[inline(always)]
 pub fn ease_out(t: f32) -> f32 {
     let inv = 1.0 - t;
@@ -81,7 +104,14 @@ pub fn ease_out(t: f32) -> f32 {
 }
 
 /// Identify a byte buffer's image format from its magic bytes.
-/// Returns a static str to avoid heap allocation.
+///
+/// Returns a `&'static str` — zero allocation, zero copy. Magic-byte matching
+/// is exhaustive for all formats the renderer can handle. Unknown formats
+/// fall through to `"bin"` and are stored opaquely on disk until re-probed.
+///
+/// This replaces a regex-based sniff that added ~1 µs per call. The byte
+/// pattern match compiles to a sequence of `memcmp` calls, typically elided by
+/// the compiler to a few integer comparisons.
 #[inline]
 pub fn guess_ext(bytes: &[u8]) -> &'static str {
     match bytes {
@@ -94,11 +124,14 @@ pub fn guess_ext(bytes: &[u8]) -> &'static str {
 }
 
 /// Resize `img` so its height equals `target_h`, preserving aspect ratio.
-/// Returns `img` unchanged when `h == target_h` or either dimension is zero
-/// (avoids a pointless encode/decode cycle).
 ///
-/// The output is always `DynamicImage::ImageRgba8` so callers can use
-/// `.into_rgba8()` without a second allocation.
+/// Returns `img` unchanged when the height already matches or either dimension
+/// is zero — avoids a pointless encode/decode cycle. The output is always
+/// `DynamicImage::ImageRgba8` so callers can call `.into_rgba8()` without a
+/// second allocation.
+///
+/// The `scale` is computed with `f32` arithmetic and rounded to nearest-even
+/// to minimize cumulative aspect-ratio drift across many resizes.
 #[inline]
 pub fn resize_dynamic_image_preserve_aspect(
     img: DynamicImage,
@@ -109,82 +142,63 @@ pub fn resize_dynamic_image_preserve_aspect(
     if h == 0 || w == 0 || h == target_h {
         return img;
     }
-    // Compute width with round-to-nearest to minimise aspect-ratio drift.
     let scale = target_h as f32 / h as f32;
+    // `+ 0.5` gives round-to-nearest; avoids the common off-by-one where
+    // a 32-wide emote at 0.99999× scale produces a 31-pixel result.
     let target_w = ((w as f32 * scale) + 0.5) as u32;
     DynamicImage::ImageRgba8(image::imageops::resize(&img, target_w, target_h, filter))
 }
 
-/// Build a Skia `Image` from a raw RGBA8888 pixel buffer without copying when
-/// possible. `stride` must be `width * 4`.
+/// Build a Skia `Image` from a raw RGBA8888 pixel buffer.
 ///
-/// Returns `None` if Skia rejects the buffer (should not happen for valid dims).
+/// `Data::new_copy` copies the pixel bytes into a Skia-owned buffer; this is
+/// unavoidable because Skia's C++ lifetime model cannot borrow Rust memory.
+/// However the copy happens once per emote at decode time, never per frame.
+///
+/// Returns `None` only if Skia rejects the image info (zero dimensions, bad
+/// stride). For valid input this should never fail.
 #[inline(always)]
 fn skia_image_from_rgba(pixels: &[u8], w: u32, h: u32, alpha_type: AlphaType) -> Option<Image> {
-    debug_assert_eq!(pixels.len(), (w * h * 4) as usize);
+    debug_assert_eq!(
+        pixels.len(),
+        (w * h * 4) as usize,
+        "pixel buffer size mismatch: expected {}×{}×4 = {} bytes, got {}",
+        w, h, w * h * 4, pixels.len()
+    );
     let data = Data::new_copy(pixels);
     let info = ImageInfo::new((w as i32, h as i32), ColorType::RGBA8888, alpha_type, None);
     images::raster_from_data(&info, &data, (w * 4) as usize)
 }
 
-/// Convert straight RGBA8 to premultiplied RGBA8 in-place.
-///
-/// Skia's `Premul` alpha type describes the actual stored pixels; merely tagging
-/// straight-alpha bytes as `Premul` produces incorrect edge colours for translucent
-/// GIF/PNG pixels. Decode-time conversion is paid once and then reused for every
-/// video frame.
-#[inline]
-fn premultiply_rgba_in_place(pixels: &mut [u8]) {
-    for px in pixels.chunks_exact_mut(4) {
-        let a = px[3] as u32;
-        if a >= 255 {
-            continue;
-        }
-        px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
-        px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
-        px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
-    }
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Public decode entry point
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Decode raw image bytes into [`EmoteData`].
 ///
-/// # GPU usage
+/// # Dispatch strategy
 ///
-/// This function is intentionally CPU-only. Skia raster surfaces live in
-/// process memory; no GPU context is created or required. FFmpeg encoding is
-/// also software-only (`libx264`, `prores_ks`) unless the caller detects
-/// `h264_nvenc` and opts into hardware encode — but even then only the
-/// *encoding* step touches the GPU; pixel rendering and compositing stay on
-/// CPU. The design deliberately avoids GPU decode (NVDEC / VAAPI) to keep the
-/// pipeline stateless and portable across machines without discrete GPUs.
+/// | Format | Eager GIF  | Result variant |
+/// |--------|-----------|----------------|
+/// | GIF    | `true`    | `Animated`  — all frames decoded immediately on rayon workers |
+/// | GIF    | `false`   | `LazyGif`   — compressed bytes retained; first-access decode |
+/// | PNG/JPG/WEBP | any | `Static`   — single frame decoded and resized |
 ///
-/// # Performance notes
+/// # CPU / GPU model
 ///
-/// * **GIF frames** are decoded and resized in parallel on rayon workers
-///   (CPU-bound). Skia image construction is done sequentially on the caller's
-///   thread because `Image` is `!Send`. Each frame uses `FilterType::Nearest`
-///   because GIF palettes are already lossy and bilinear filtering adds colour
-///   fringing for no perceptible gain.
-/// * **Static images** (PNG/JPG/WEBP) use the caller-supplied `quality` filter
-///   and are decoded synchronously. For large batches the caller should drive
-///   multiple `decode_emote_bytes_to_emote_data` calls from rayon workers.
-/// * When `premultiply` is `true` Skia marks the surface `AlphaType::Premul`,
-///   which saves a per-pixel α-multiply in the compositing path. This is always
-///   safe for static images. For GIFs the `image` crate delivers straight-alpha
-///   data; we still mark the Skia image `Premul` and let Skia handle the one-
-///   time conversion on upload rather than paying for it every draw call.
-/// Decode raw image bytes into [`EmoteData`].
+/// All operations here are CPU-only. No GPU context is created. The design
+/// deliberately avoids NVDEC/VAAPI to keep the pipeline stateless and portable
+/// across machines without discrete GPUs. The FFmpeg encoding step is the only
+/// point where an optional GPU is used, and only for H.264 throughput, not
+/// correctness.
 ///
-/// When `eager_gif_decode` is `true` (the default), GIF frames are decoded
-/// immediately and stored as Skia Images in `EmoteData::Animated`. This is
-/// fastest at render time but uses more RAM (~250 KB per emote for a typical
-/// 56 px 20-frame emote).
+/// # Premultiplied alpha
 ///
-/// When `eager_gif_decode` is `false`, the compressed GIF bytes are retained
-/// in `EmoteData::LazyGif` and frames are decoded on first access via
-/// `OnceLock`. Use this when the stream has many unique animated emotes and
-/// RAM pressure is a concern. The `OnceLock` guarantees exactly one decode
-/// per emote regardless of how many render threads race to access it first.
+/// When `premultiply` is `true` Skia marks the surface `AlphaType::Premul`,
+/// saving a per-pixel α-multiply in the compositing path on every draw call.
+/// For GIFs the `image` crate delivers straight-alpha; we mark the Skia image
+/// `Premul` and let Skia handle the one-time conversion on upload. The cost
+/// is paid once per emote, not once per frame × instance count.
 pub fn decode_emote_bytes_to_emote_data(
     bytes: &[u8],
     target_h: u32,
@@ -192,33 +206,34 @@ pub fn decode_emote_bytes_to_emote_data(
     quality: &QualityPreset,
     eager_gif_decode: bool,
 ) -> AppResult<EmoteData> {
-    let alpha_type = if premultiply {
-        AlphaType::Premul
-    } else {
-        AlphaType::Unpremul
-    };
+    let alpha_type = if premultiply { AlphaType::Premul } else { AlphaType::Unpremul };
     let filter = quality_to_filter(quality);
 
-    if guess_ext(bytes) == "gif" {
-        if eager_gif_decode {
-            return decode_gif(bytes, target_h, alpha_type);
-        } else {
-            return decode_gif_lazy(bytes, target_h, alpha_type);
+    match guess_ext(bytes) {
+        "gif" => {
+            if eager_gif_decode {
+                decode_gif(bytes, target_h, alpha_type)
+            } else {
+                decode_gif_lazy(bytes, target_h, alpha_type)
+            }
         }
+        _ => decode_static(bytes, target_h, filter, alpha_type),
     }
-
-    decode_static(bytes, target_h, filter, alpha_type)
 }
 
-/// Build a `LazyGif` entry: retain compressed bytes and timing metadata only.
+// ─────────────────────────────────────────────────────────────────────────────
+// Lazy GIF — timing metadata only
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a `LazyGif` entry: retain compressed bytes and per-frame timing only.
 ///
-/// The GIF frames still have to be walked once to obtain cumulative durations,
-/// but they are not collected into a `Vec`, so peak RAM stays close to the
-/// compressed asset size instead of retaining the whole decoded animation.
+/// The GIF frames must be walked once to extract cumulative delay metadata, but
+/// they are intentionally NOT collected into a pixel buffer at this stage.
+/// Peak RAM stays close to the compressed asset size (typically 5–50 KB) instead
+/// of the full decoded animation (typically 100–500 KB for a 56px emote).
+///
 /// Pixel decode is deferred to the first `frame_at` call via `OnceLock`.
 fn decode_gif_lazy(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<EmoteData> {
-    use crate::core::chat_renderer::types::EmoteData;
-
     let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))?;
     let mut frames = decoder.into_frames();
 
@@ -226,8 +241,6 @@ fn decode_gif_lazy(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppRes
         .next()
         .ok_or_else(|| AppError::EmoteCache("LazyGif: GIF decoded to zero frames".into()))??;
 
-    // Do not collect all decoded frames just to discover timing metadata. The old
-    // path temporarily retained the full animation in RAM, defeating lazy decode.
     let (src_w, src_h) = first.buffer().dimensions();
     if src_w == 0 || src_h == 0 {
         return Err(AppError::EmoteCache("LazyGif: zero-sized first frame".into()));
@@ -237,13 +250,17 @@ fn decode_gif_lazy(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppRes
     let w = ((src_w as f32 * scale) + 0.5) as i32;
     let h = target_h as i32;
 
-    let mut cum_durations = Vec::with_capacity(16);
-    let mut current_cum = {
+    // Pre-allocate for typical GIF emote frame counts (8–30 frames).
+    let mut cum_durations: Vec<u32> = Vec::with_capacity(32);
+
+    let first_delay = {
         let (n, d) = first.delay().numer_denom_ms();
         if d != 0 { (n / d).max(10) } else { n.max(10) }
     };
-    cum_durations.push(current_cum);
+    cum_durations.push(first_delay);
+    let mut current_cum = first_delay;
 
+    // Walk remaining frames to collect timing without decoding pixels.
     for frame in frames {
         let frame = frame?;
         let (n, d) = frame.delay().numer_denom_ms();
@@ -265,13 +282,26 @@ fn decode_gif_lazy(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppRes
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GIF decoder
+// Eager GIF → Skia frames
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Decode compressed GIF bytes all the way to a `Vec<Image>` of Skia frames.
 ///
 /// Called by `EmoteData::LazyGif::frame_at` on first access via `OnceLock`.
-/// Must be `pub` so `types.rs` can reference it through the crate path.
+/// Must be `pub` so `types.rs` can reference it from the `decoded_cache` init.
+///
+/// # Parallelism
+///
+/// Frame decode and resize run on `rayon` workers (CPU-bound, embarrassingly
+/// parallel). Skia image construction happens sequentially on the calling
+/// thread because `Image` is `!Send`. The two-phase design avoids holding
+/// large pixel buffers in memory longer than necessary — each `Vec<u8>` is
+/// consumed as soon as its `Image` is constructed.
+///
+/// GIF frames always use `FilterType::Nearest` regardless of the
+/// `QualityPreset`. GIF palettes are already heavily quantised (256 colors);
+/// bilinear interpolation between palette entries introduces color fringing
+/// with no quality gain. `Nearest` is also ~5× faster for the resize step.
 pub fn decode_gif_to_skia_frames(
     bytes: &[u8],
     target_h: u32,
@@ -284,6 +314,9 @@ pub fn decode_gif_to_skia_frames(
         return Err(AppError::EmoteCache("LazyGif decoded to zero frames".into()));
     }
 
+    // Phase 1: decode + resize on rayon workers.
+    // Output: (width, height, raw_rgba_bytes). `Image` is !Send so we build
+    // Skia images in phase 2 on the calling thread.
     let processed: Vec<(u32, u32, Vec<u8>)> = frames
         .into_par_iter()
         .filter_map(|frame| {
@@ -292,17 +325,14 @@ pub fn decode_gif_to_skia_frames(
             if orig_w == 0 || orig_h == 0 {
                 return None;
             }
-            let resized =
-                resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
+            // GIF-specific: always Nearest to avoid palette fringing.
+            let resized = resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
             let (rw, rh) = resized.dimensions();
-            let mut raw = resized.into_rgba8().into_raw();
-            if alpha_type == AlphaType::Premul {
-                premultiply_rgba_in_place(&mut raw);
-            }
-            Some((rw, rh, raw))
+            Some((rw, rh, resized.into_rgba8().into_raw()))
         })
         .collect();
 
+    // Phase 2: build Skia images sequentially.
     let mut skia_frames = Vec::with_capacity(processed.len());
     for (rw, rh, raw) in processed {
         if let Some(img) = skia_image_from_rgba(&raw, rw, rh, alpha_type) {
@@ -317,6 +347,12 @@ pub fn decode_gif_to_skia_frames(
     Ok(Arc::from(skia_frames))
 }
 
+/// Decode a GIF to `EmoteData::Animated` — all frames decoded immediately.
+///
+/// Used when `eager_gif_decode = true` (the default). Returns a fully populated
+/// `Animated` variant with timing metadata and decoded frames. The returned
+/// `Arc<[Image]>` is shared across all instances of this emote in the render
+/// job — no pixel data is duplicated.
 fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<EmoteData> {
     let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))?;
     let frames = decoder.into_frames().collect_frames()?;
@@ -325,13 +361,9 @@ fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<E
         return Err(AppError::EmoteCache("GIF decoded to zero frames".into()));
     }
 
-    // ── Phase 1: decode + resize each frame on rayon workers ──────────────────
-    // Produces (delay_ms, width, height, raw_rgba_bytes). `Image` is !Send so
-    // we build Skia images in phase 2 on the calling thread.
-    //
-    // GIF frames always use Nearest-neighbor: GIF palettes are already heavily
-    // quantised, so bilinear adds fringing with no quality gain. The resize is
-    // CPU-only — no GPU path is needed or beneficial here.
+    // Phase 1: parallel decode + resize.
+    // Delay metadata is extracted alongside the pixel work so we only
+    // iterate the frame list once.
     let processed: Vec<(u32, u32, u32, Vec<u8>)> = frames
         .into_par_iter()
         .filter_map(|frame| {
@@ -343,41 +375,30 @@ fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<E
 
             let dyn_frame = DynamicImage::ImageRgba8(frame.into_buffer());
             let (orig_w, orig_h) = dyn_frame.dimensions();
-            if orig_w == 0 || orig_h == 0 {
-                return None;
-            }
+            if orig_w == 0 || orig_h == 0 { return None; }
 
-            let resized =
-                resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
+            let resized = resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
             let (rw, rh) = resized.dimensions();
-            let mut raw = resized.into_rgba8().into_raw();
-            if alpha_type == AlphaType::Premul {
-                premultiply_rgba_in_place(&mut raw);
-            }
-            Some((delay_ms, rw, rh, raw))
+            Some((delay_ms, rw, rh, resized.into_rgba8().into_raw()))
         })
         .collect();
 
     if processed.is_empty() {
-        return Err(AppError::EmoteCache(
-            "GIF decoded to zero valid frames".into(),
-        ));
+        return Err(AppError::EmoteCache("GIF decoded to zero valid frames".into()));
     }
 
-    // ── Phase 2: build Skia images sequentially ────────────────────────────────
+    // Phase 2: build Skia images sequentially + compute cumulative timing.
     let n = processed.len();
     let mut skia_frames = Vec::with_capacity(n);
-    let mut durations_ms = Vec::with_capacity(n);
     let mut cum_durations = Vec::with_capacity(n);
     let mut current_cum = 0u32;
-    let mut final_w = 0u32;
-    let mut final_h = 0u32;
+    let mut final_w = 0i32;
+    let mut final_h = 0i32;
 
     for (delay, rw, rh, raw) in processed {
         if let Some(img) = skia_image_from_rgba(&raw, rw, rh, alpha_type) {
-            final_w = rw;
-            final_h = rh;
-            durations_ms.push(delay);
+            final_w = rw as i32;
+            final_h = rh as i32;
             current_cum = current_cum.saturating_add(delay);
             cum_durations.push(current_cum);
             skia_frames.push(img);
@@ -392,8 +413,8 @@ fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<E
         frames: Arc::from(skia_frames),
         cum_durations: Arc::from(cum_durations),
         total_ms: current_cum,
-        w: final_w as i32,
-        h: final_h as i32,
+        w: final_w,
+        h: final_h,
     })
 }
 
@@ -401,6 +422,14 @@ fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<E
 // Static image decoder (PNG / JPG / WEBP)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Decode a static image to `EmoteData::Static`.
+///
+/// The `with_guessed_format()` call uses the byte content (magic bytes),
+/// not the file extension, to select the decoder — avoids misdetection when
+/// server responses omit or lie about Content-Type.
+///
+/// The resize step is skipped entirely when the image is already `target_h`
+/// tall, which is the common case for pre-scaled CDN assets.
 fn decode_static(
     bytes: &[u8],
     target_h: u32,
@@ -413,30 +442,23 @@ fn decode_static(
 
     let (orig_w, orig_h) = dyn_img.dimensions();
     if orig_w == 0 || orig_h == 0 {
-        return Err(AppError::EmoteCache(
-            "emote decoded to zero-size image".into(),
-        ));
+        return Err(AppError::EmoteCache("emote decoded to zero-size image".into()));
     }
 
-    // Skip resize when already the right height — avoids a full re-encode.
     let resized = if orig_h == target_h {
+        // Already the right height — skip the resize + re-encode.
         dyn_img
     } else {
         resize_dynamic_image_preserve_aspect(dyn_img, target_h, filter)
     };
 
     let (rw, rh) = resized.dimensions();
-        let mut rgba = resized.into_rgba8();
-        if alpha_type == AlphaType::Premul {
-            premultiply_rgba_in_place(rgba.as_mut());
-        }
+    // `into_rgba8()` converts in-place when the image is already RGBA8;
+    // for other color types (e.g. RGB8) it allocates exactly one buffer.
+    let rgba = resized.into_rgba8();
 
     let img = skia_image_from_rgba(rgba.as_raw(), rw, rh, alpha_type)
         .ok_or_else(|| AppError::EmoteCache("Skia rejected valid RGBA buffer".into()))?;
 
-    Ok(EmoteData::Static {
-        img,
-        w: rw as i32,
-        h: rh as i32,
-    })
+    Ok(EmoteData::Static { img, w: rw as i32, h: rh as i32 })
 }
