@@ -1,3 +1,16 @@
+use crate::core::chat_renderer::args::{
+    BackgroundMode, EvictionStrategy, QualityPreset, RenderVideoArgs, TimelineMismatchStrategy,
+};
+use crate::core::chat_renderer::emote_providers::{
+    clear_token_cache, tokenise, EmoteNameMap, MessageToken, ResolvedEmote,
+};
+use crate::core::chat_renderer::helpers::{ease_out, get_user_color};
+use crate::core::chat_renderer::types::{
+    EmoteCache, EmoteData, ImageCache, LayoutLine, LayoutToken,
+};
+use crate::core::AppTask;
+use crate::error::AppError;
+use crate::types::AppResult;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use skia_safe::{
@@ -14,20 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use stream_extractor::MessageSaved;
 use tauri::{AppHandle, Emitter};
-use crate::core::AppTask;
-use crate::core::chat_renderer::args::{
-    BackgroundMode, EvictionStrategy, QualityPreset, RenderVideoArgs,
-    TimelineMismatchStrategy,
-};
-use crate::core::chat_renderer::emote_providers::{
-    clear_token_cache, tokenise, EmoteNameMap, MessageToken, ResolvedEmote,
-};
-use crate::core::chat_renderer::helpers::{ease_out, get_user_color};
-use crate::core::chat_renderer::types::{
-    EmoteCache, EmoteData, ImageCache, LayoutLine, LayoutToken,
-};
-use crate::error::AppError;
-use crate::types::AppResult;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -171,7 +170,10 @@ struct PixelBufferPool {
 
 impl PixelBufferPool {
     fn new(max_buffers: usize) -> Self {
-        Self { inner: Mutex::new(Vec::with_capacity(max_buffers)), max_buffers }
+        Self {
+            inner: Mutex::new(Vec::with_capacity(max_buffers)),
+            max_buffers,
+        }
     }
 
     fn acquire(&self, min_len: usize) -> Vec<u8> {
@@ -219,7 +221,10 @@ impl Drop for ReusableBuffer {
 
 impl ReusableBuffer {
     fn new(pool: Arc<PixelBufferPool>, len: usize) -> Self {
-        Self { data: Some(pool.acquire(len)), pool }
+        Self {
+            data: Some(pool.acquire(len)),
+            pool,
+        }
     }
 }
 
@@ -263,7 +268,18 @@ impl ScheduledMessage {
         is_highlighted: bool,
         visual_key: u64,
     ) -> Self {
-        Self::new_inner(spawn_frame, 0, lines, bubble_w, bubble_h, bg_color, user_color, is_grouped, is_highlighted, visual_key)
+        Self::new_inner(
+            spawn_frame,
+            0,
+            lines,
+            bubble_w,
+            bubble_h,
+            bg_color,
+            user_color,
+            is_grouped,
+            is_highlighted,
+            visual_key,
+        )
     }
 
     fn new_prefill(
@@ -277,7 +293,18 @@ impl ScheduledMessage {
         is_highlighted: bool,
         visual_key: u64,
     ) -> Self {
-        Self::new_inner(0, age_offset_frames, lines, bubble_w, bubble_h, bg_color, user_color, is_grouped, is_highlighted, visual_key)
+        Self::new_inner(
+            0,
+            age_offset_frames,
+            lines,
+            bubble_w,
+            bubble_h,
+            bg_color,
+            user_color,
+            is_grouped,
+            is_highlighted,
+            visual_key,
+        )
     }
 
     fn new_inner(
@@ -292,7 +319,9 @@ impl ScheduledMessage {
         is_highlighted: bool,
         mut visual_key: u64,
     ) -> Self {
-        if is_highlighted { visual_key ^= 0x9E37_79B9_7F4A_7C15; }
+        if is_highlighted {
+            visual_key ^= 0x9E37_79B9_7F4A_7C15;
+        }
         let mut has_animated_emotes = false;
         let mut anim_period_ms: Option<u32> = None;
 
@@ -380,11 +409,16 @@ fn get_user_color_cached(username: &str, hex_color: &str) -> Color {
     };
     USER_COLOR_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
-        if let Some(&c) = cache.get(&key) { return c; }
+        if let Some(&c) = cache.get(&key) {
+            return c;
+        }
         let color = get_user_color(username, hex_color);
         if cache.len() >= USER_COLOR_CACHE_MAX {
             let mut keep = false;
-            cache.retain(|_, _| { keep = !keep; keep });
+            cache.retain(|_, _| {
+                keep = !keep;
+                keep
+            });
         }
         cache.insert(key, color);
         color
@@ -402,8 +436,12 @@ fn measure_cached(
     gen: u32,
 ) -> f32 {
     let k = measure_key(s, font_bits);
-    if let Some(&(w, _)) = cache.get(&k) { return w; }
-    if cache.len() >= MEASURE_CACHE_MAX { evict_old_measure_entries(cache, gen); }
+    if let Some(&(w, _)) = cache.get(&k) {
+        return w;
+    }
+    if cache.len() >= MEASURE_CACHE_MAX {
+        evict_old_measure_entries(cache, gen);
+    }
     let (w, _) = font.measure_str(s, None);
     cache.insert(k, (w, gen));
     w
@@ -424,11 +462,16 @@ fn text_blob_cached(s: &str, font: &Font, font_bits: u32) -> Option<TextBlob> {
     let key = measure_key(s, font_bits);
     TEXT_BLOB_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
-        if let Some(blob) = cache.get(&key) { return Some(blob.clone()); }
+        if let Some(blob) = cache.get(&key) {
+            return Some(blob.clone());
+        }
         let blob = TextBlob::from_str(s, font)?;
         if cache.len() >= TEXT_BLOB_CACHE_MAX {
             let mut keep = false;
-            cache.retain(|_, _| { keep = !keep; keep });
+            cache.retain(|_, _| {
+                keep = !keep;
+                keep
+            });
         }
         cache.insert(key, blob.clone());
         Some(blob)
@@ -494,7 +537,9 @@ fn split_into_fragments<'a>(
                 lo = mid + 1;
             } else {
                 hi = mid.saturating_sub(1);
-                if mid == 0 { break; }
+                if mid == 0 {
+                    break;
+                }
             }
         }
 
@@ -641,7 +686,8 @@ fn layout_message_blocking(
                     }
                     let mut first_word = true;
                     for raw_word in para.split_ascii_whitespace() {
-                        let word_w = measure_cached(message_font, mf_bits, raw_word, measure_cache, gen);
+                        let word_w =
+                            measure_cached(message_font, mf_bits, raw_word, measure_cache, gen);
                         let needed_space = if first_word { 0.0 } else { space_w };
                         if cur_w + needed_space + word_w <= max_w {
                             if !first_word {
@@ -656,11 +702,24 @@ fn layout_message_blocking(
                                 cur_w = 0.0;
                             }
                             if word_w > max_w {
-                                let frags = split_into_fragments(raw_word, message_font, mf_bits, max_w, measure_cache, gen);
+                                let frags = split_into_fragments(
+                                    raw_word,
+                                    message_font,
+                                    mf_bits,
+                                    max_w,
+                                    measure_cache,
+                                    gen,
+                                );
                                 let flen = frags.len();
                                 for (fi, f) in frags.into_iter().enumerate() {
                                     current_line.push(MessageToken::Text(f));
-                                    cur_w += measure_cached(message_font, mf_bits, f, measure_cache, gen);
+                                    cur_w += measure_cached(
+                                        message_font,
+                                        mf_bits,
+                                        f,
+                                        measure_cache,
+                                        gen,
+                                    );
                                     if fi < flen - 1 {
                                         lines.push(std::mem::take(&mut current_line));
                                         cur_w = 0.0;
@@ -677,7 +736,9 @@ fn layout_message_blocking(
                 }
             }
             MessageToken::KickEmote { id } => {
-                if !flags.kick { continue; }
+                if !flags.kick {
+                    continue;
+                }
                 let ew = emote_cache
                     .get(*id)
                     .map(|ed| ed.width() as f32)
@@ -691,7 +752,9 @@ fn layout_message_blocking(
                 cur_w += padded;
                 last_was_zero_width = false;
             }
-            MessageToken::ProviderEmote(ResolvedEmote { url, zero_width, .. }) => {
+            MessageToken::ProviderEmote(ResolvedEmote {
+                url, zero_width, ..
+            }) => {
                 let mw = image_cache
                     .get(url)
                     .map(|ed| ed.width() as f32)
@@ -712,7 +775,9 @@ fn layout_message_blocking(
             }
         }
     }
-    if !current_line.is_empty() { lines.push(current_line); }
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
 
     // ── Measure + bake TextBlobs ──────────────────────────────────────────────
     let bubble_pad = args.bubble_padding.max(0) as f32;
@@ -733,10 +798,16 @@ fn layout_message_blocking(
                         .unwrap_or(emote_cache.target_height() as f32);
                     lh = lh.max(h);
                 }
-                MessageToken::ProviderEmote(ResolvedEmote { url, zero_width, .. }) => {
-                    let h = image_cache.get(url).map(|ed| ed.height() as f32)
-                                       .unwrap_or(image_cache.target_height() as f32);
-                    if !zero_width { lh = lh.max(h + 8.0); }
+                MessageToken::ProviderEmote(ResolvedEmote {
+                    url, zero_width, ..
+                }) => {
+                    let h = image_cache
+                        .get(url)
+                        .map(|ed| ed.height() as f32)
+                        .unwrap_or(image_cache.target_height() as f32);
+                    if !zero_width {
+                        lh = lh.max(h + 8.0);
+                    }
                 }
             }
         }
@@ -749,7 +820,11 @@ fn layout_message_blocking(
         // First line: username prefix (unless grouped).
         if li == 0 && !is_grouped {
             if let Some(blob) = text_blob_cached(prefix_str, username_font, uf_bits) {
-                layout_tokens.push(LayoutToken::Glyph { blob, x: x_cursor, y: baseline });
+                layout_tokens.push(LayoutToken::Glyph {
+                    blob,
+                    x: x_cursor,
+                    y: baseline,
+                });
             }
             x_cursor += prefix_w;
         }
@@ -759,7 +834,11 @@ fn layout_message_blocking(
                 MessageToken::Text(s) => {
                     let w = measure_cached(message_font, mf_bits, s, measure_cache, gen);
                     if let Some(blob) = text_blob_cached(s, message_font, mf_bits) {
-                        layout_tokens.push(LayoutToken::Glyph { blob, x: x_cursor, y: baseline });
+                        layout_tokens.push(LayoutToken::Glyph {
+                            blob,
+                            x: x_cursor,
+                            y: baseline,
+                        });
                     }
                     x_cursor += w;
                 }
@@ -769,34 +848,54 @@ fn layout_message_blocking(
                         let ew = ed.width() as f32;
                         let draw_y = if args.center_emotes_vertically {
                             y_cursor + (lh - ed.height() as f32) / 2.0
-                        } else { y_cursor };
+                        } else {
+                            y_cursor
+                        };
                         layout_tokens.push(LayoutToken::Emote {
-                            data: ed, x: x_cursor + (EMOTE_MARGIN / 2.0), y: draw_y,
+                            data: ed,
+                            x: x_cursor + (EMOTE_MARGIN / 2.0),
+                            y: draw_y,
                         });
                         x_cursor += ew + EMOTE_MARGIN;
                     } else {
                         x_cursor += fallback_w + EMOTE_MARGIN;
                     }
                 }
-                MessageToken::ProviderEmote(ResolvedEmote { url, zero_width, .. }) => {
+                MessageToken::ProviderEmote(ResolvedEmote {
+                    url, zero_width, ..
+                }) => {
                     let fallback_w = image_cache.target_height() as f32;
                     if let Some(ed) = image_cache.get(url) {
                         let sw = ed.width() as f32;
                         let target_x = if *zero_width && x_cursor > bubble_pad {
                             x_cursor - sw - (EMOTE_MARGIN / 2.0)
-                        } else { x_cursor + (EMOTE_MARGIN / 2.0) };
+                        } else {
+                            x_cursor + (EMOTE_MARGIN / 2.0)
+                        };
                         let draw_y = if args.center_emotes_vertically {
                             y_cursor + (lh - ed.height() as f32) / 2.0
-                        } else { y_cursor };
-                        layout_tokens.push(LayoutToken::Emote { data: ed, x: target_x, y: draw_y });
-                        if !zero_width { x_cursor += sw + EMOTE_MARGIN; }
-                    } else if !zero_width { x_cursor += fallback_w + EMOTE_MARGIN; }
+                        } else {
+                            y_cursor
+                        };
+                        layout_tokens.push(LayoutToken::Emote {
+                            data: ed,
+                            x: target_x,
+                            y: draw_y,
+                        });
+                        if !zero_width {
+                            x_cursor += sw + EMOTE_MARGIN;
+                        }
+                    } else if !zero_width {
+                        x_cursor += fallback_w + EMOTE_MARGIN;
+                    }
                 }
             }
         }
 
         measured_max_w = measured_max_w.max(x_cursor - bubble_pad);
-        layout_lines.push(LayoutLine { tokens: layout_tokens });
+        layout_lines.push(LayoutLine {
+            tokens: layout_tokens,
+        });
         y_cursor += lh;
     }
 
@@ -855,7 +954,9 @@ fn draw_frame(
     outline_usernames: bool,
 ) {
     canvas.clear(bg_color);
-    if bubbles.is_empty() { return; }
+    if bubbles.is_empty() {
+        return;
+    }
 
     let t_ms = ((frame_id as f64 * 1000.0) / fps_f32 as f64) as u64;
 
@@ -868,18 +969,20 @@ fn draw_frame(
                 PAINT_TEXT.with(|pt| {
                     PAINT_EMOTE.with(|pe| {
                         PAINT_EMOTE_MASK.with(|pem| {
-                            let mut paint_bg       = pb.borrow_mut();
+                            let mut paint_bg = pb.borrow_mut();
                             let mut paint_highlight = ph.borrow_mut();
-                            let mut mask_bg        = pm.borrow_mut();
-                            let mut text_paint     = pt.borrow_mut();
-                            let mut emote_paint    = pe.borrow_mut();
+                            let mut mask_bg = pm.borrow_mut();
+                            let mut text_paint = pt.borrow_mut();
+                            let mut emote_paint = pe.borrow_mut();
                             let mut emote_mask_paint = pem.borrow_mut();
 
                             for bubble in bubbles {
                                 // ── Viewport culling ──────────────────────────
                                 // y_cursor is the bottom edge of the next bubble.
                                 // If it's already above the canvas top we're done.
-                                if y_cursor < 0.0 { break; }
+                                if y_cursor < 0.0 {
+                                    break;
+                                }
 
                                 let age_secs = bubble.effective_age(frame_id, fps_f32);
 
@@ -889,8 +992,11 @@ fn draw_frame(
                                     if anim_fade && age_secs < 0.5 {
                                         a *= age_secs / 0.5;
                                     }
-                                    if matches!(eviction, EvictionStrategy::Timed) && age_secs > hold_secs {
-                                        a *= 1.0 - ((age_secs - hold_secs) / fade_out_f).clamp(0.0, 1.0);
+                                    if matches!(eviction, EvictionStrategy::Timed)
+                                        && age_secs > hold_secs
+                                    {
+                                        a *= 1.0
+                                            - ((age_secs - hold_secs) / fade_out_f).clamp(0.0, 1.0);
                                     }
                                     a
                                 };
@@ -905,7 +1011,9 @@ fn draw_frame(
                                 let top = y_cursor - bubble.bubble_h as f32;
 
                                 let x_translate = if anim_slide && age_secs < 0.5 {
-                                    padding_f + (1.0 - ease_out(age_secs / 0.5)) * (canvas_width_f - padding_f)
+                                    padding_f
+                                        + (1.0 - ease_out(age_secs / 0.5))
+                                            * (canvas_width_f - padding_f)
                                 } else {
                                     padding_f
                                 };
@@ -919,11 +1027,21 @@ fn draw_frame(
                                 canvas.translate((x_translate, top));
 
                                 paint_bg.set_color(bubble.bg_color.with_a(byte_alpha));
-                                canvas.draw_round_rect(rect, bubble_radius, bubble_radius, &paint_bg);
+                                canvas.draw_round_rect(
+                                    rect,
+                                    bubble_radius,
+                                    bubble_radius,
+                                    &paint_bg,
+                                );
 
                                 if bubble.is_highlighted {
                                     paint_highlight.set_color(hi_color.with_a(byte_alpha));
-                                    canvas.draw_round_rect(rect, bubble_radius, bubble_radius, &paint_highlight);
+                                    canvas.draw_round_rect(
+                                        rect,
+                                        bubble_radius,
+                                        bubble_radius,
+                                        &paint_highlight,
+                                    );
                                 }
 
                                 if is_luma {
@@ -933,24 +1051,45 @@ fn draw_frame(
                                     canvas.save();
                                     canvas.translate((canvas_width_f, 0.0));
                                     mask_bg.set_color(Color::WHITE.with_a(byte_alpha));
-                                    canvas.draw_round_rect(rect, bubble_radius, bubble_radius, &mask_bg);
+                                    canvas.draw_round_rect(
+                                        rect,
+                                        bubble_radius,
+                                        bubble_radius,
+                                        &mask_bg,
+                                    );
                                     canvas.restore();
 
                                     // Single-pass combined draw: colour left half + mask right half
                                     // in one token-list walk. Halves token-iteration cost vs the
                                     // previous two-pass approach for the default luma-matte mode.
                                     draw_bubble_tokens_luma(
-                                        canvas, bubble,
-                                        &mut text_paint, &mut emote_paint, &mut emote_mask_paint,
-                                        t_ms, alpha, byte_alpha, msg_color,
-                                        outline_w, canvas_width_f,
-                                        username_shadow, outline_usernames,
+                                        canvas,
+                                        bubble,
+                                        &mut text_paint,
+                                        &mut emote_paint,
+                                        &mut emote_mask_paint,
+                                        t_ms,
+                                        alpha,
+                                        byte_alpha,
+                                        msg_color,
+                                        outline_w,
+                                        canvas_width_f,
+                                        username_shadow,
+                                        outline_usernames,
                                     );
                                 } else {
                                     draw_bubble_tokens(
-                                        canvas, bubble, &mut text_paint, &mut emote_paint,
-                                        t_ms, alpha, byte_alpha, msg_color,
-                                        outline_w, username_shadow, outline_usernames,
+                                        canvas,
+                                        bubble,
+                                        &mut text_paint,
+                                        &mut emote_paint,
+                                        t_ms,
+                                        alpha,
+                                        byte_alpha,
+                                        msg_color,
+                                        outline_w,
+                                        username_shadow,
+                                        outline_usernames,
                                         false,
                                     );
                                 }
@@ -1000,14 +1139,20 @@ fn draw_bubble_tokens(
                         text_paint.set_color(Color::from_argb(byte_alpha, 255, 255, 255));
                         canvas.draw_text_blob(blob, (*x, *y), text_paint);
                     } else {
-                        let base_color = if is_username { bubble.user_color } else { msg_color };
-                        let final_color = base_color.with_a(
-                            (base_color.a() as f32 * alpha).min(255.0) as u8,
-                        );
+                        let base_color = if is_username {
+                            bubble.user_color
+                        } else {
+                            msg_color
+                        };
+                        let final_color =
+                            base_color.with_a((base_color.a() as f32 * alpha).min(255.0) as u8);
                         if is_username && byte_alpha > 5 {
                             if username_shadow {
                                 text_paint.set_color(Color::from_argb(
-                                    (180.0 * alpha) as u8, 0, 0, 0,
+                                    (180.0 * alpha) as u8,
+                                    0,
+                                    0,
+                                    0,
                                 ));
                                 canvas.draw_text_blob(blob, (*x + 2.0, *y + 2.0), text_paint);
                             }
@@ -1015,7 +1160,10 @@ fn draw_bubble_tokens(
                                 text_paint.set_style(skia_safe::paint::Style::Stroke);
                                 text_paint.set_stroke_width(outline_w);
                                 text_paint.set_color(Color::from_argb(
-                                    (200.0 * alpha) as u8, 0, 0, 0,
+                                    (200.0 * alpha) as u8,
+                                    0,
+                                    0,
+                                    0,
                                 ));
                                 canvas.draw_text_blob(blob, (*x, *y), text_paint);
                                 text_paint.set_style(skia_safe::paint::Style::Fill);
@@ -1027,11 +1175,8 @@ fn draw_bubble_tokens(
                 }
                 LayoutToken::Emote { data, x, y } => {
                     if let Some(img) = data.frame_at(t_ms) {
-                        let dest = Rect::new(
-                            *x, *y,
-                            *x + data.width() as f32,
-                            *y + data.height() as f32,
-                        );
+                        let dest =
+                            Rect::new(*x, *y, *x + data.width() as f32, *y + data.height() as f32);
                         emote_paint.set_alpha(byte_alpha);
                         canvas.draw_image_rect(img, None, dest, emote_paint);
                     }
@@ -1075,23 +1220,22 @@ fn draw_bubble_tokens_luma(
                     let is_username = !bubble.is_grouped && li == 0 && ti == 0;
 
                     // ── colour draw ───────────────────────────────────────────
-                    let base_color = if is_username { bubble.user_color } else { msg_color };
-                    let final_color = base_color.with_a(
-                        (base_color.a() as f32 * alpha).min(255.0) as u8,
-                    );
+                    let base_color = if is_username {
+                        bubble.user_color
+                    } else {
+                        msg_color
+                    };
+                    let final_color =
+                        base_color.with_a((base_color.a() as f32 * alpha).min(255.0) as u8);
                     if is_username && byte_alpha > 5 {
                         if username_shadow {
-                            text_paint.set_color(Color::from_argb(
-                                (180.0 * alpha) as u8, 0, 0, 0,
-                            ));
+                            text_paint.set_color(Color::from_argb((180.0 * alpha) as u8, 0, 0, 0));
                             canvas.draw_text_blob(blob, (*x + 2.0, *y + 2.0), text_paint);
                         }
                         if outline_usernames {
                             text_paint.set_style(skia_safe::paint::Style::Stroke);
                             text_paint.set_stroke_width(outline_w);
-                            text_paint.set_color(Color::from_argb(
-                                (200.0 * alpha) as u8, 0, 0, 0,
-                            ));
+                            text_paint.set_color(Color::from_argb((200.0 * alpha) as u8, 0, 0, 0));
                             canvas.draw_text_blob(blob, (*x, *y), text_paint);
                             text_paint.set_style(skia_safe::paint::Style::Fill);
                         }
@@ -1159,7 +1303,9 @@ fn frame_signature_deque(
         h.write_u32(b.age_offset_frames);
         let age = b.effective_age(frame_id, fps_f32);
         let mut a = 1.0f32;
-        if (anim_slide || anim_fade) && age < 0.5 { a = age / 0.5; }
+        if (anim_slide || anim_fade) && age < 0.5 {
+            a = age / 0.5;
+        }
         if matches!(eviction, EvictionStrategy::Timed) && age > hold_secs {
             a = 1.0 - ((age - hold_secs) / fade_secs).clamp(0.0, 1.0);
         }
@@ -1181,9 +1327,19 @@ fn frame_signature_deque(
 fn probe_video_frames(path: &str, fps: u32) -> Option<u32> {
     let try_probe = |show_entries: &str| -> Option<f64> {
         let out = hidden_command("ffprobe")
-            .args(["-v", "error", "-select_streams", "v:0", "-show_entries",
-                show_entries, "-of", "default=noprint_wrappers=1:nokey=1", path])
-            .output().ok()?;
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                show_entries,
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ])
+            .output()
+            .ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
         let line = s.lines().find(|l| !l.trim().is_empty())?;
         line.trim().parse().ok()
@@ -1203,7 +1359,13 @@ fn probe_nvenc() -> bool {
 
 #[inline]
 fn ffmpeg_encode_threads(cpus: usize, worker_threads: usize, has_nvenc: bool) -> usize {
-    if has_nvenc { 1 } else { cpus.saturating_sub(worker_threads).saturating_sub(1).clamp(1, 2) }
+    if has_nvenc {
+        1
+    } else {
+        cpus.saturating_sub(worker_threads)
+            .saturating_sub(1)
+            .clamp(1, 2)
+    }
 }
 
 /// Convert a RAM budget into a bounded pixel-buffer count.
@@ -1212,9 +1374,19 @@ fn ffmpeg_encode_threads(cpus: usize, worker_threads: usize, has_nvenc: bool) ->
 /// don't accidentally allocate hundreds of buffers just because the machine
 /// has many cores.
 #[inline]
-fn pixel_pool_buffer_count(frame_bytes: usize, worker_threads: usize, budget_mb: Option<usize>) -> usize {
-    let budget = budget_mb.unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB).clamp(64, 4096) * 1024 * 1024;
-    if frame_bytes == 0 { return worker_threads + IO_CHANNEL_DEPTH + POOL_HEADROOM; }
+fn pixel_pool_buffer_count(
+    frame_bytes: usize,
+    worker_threads: usize,
+    budget_mb: Option<usize>,
+) -> usize {
+    let budget = budget_mb
+        .unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB)
+        .clamp(64, 4096)
+        * 1024
+        * 1024;
+    if frame_bytes == 0 {
+        return worker_threads + IO_CHANNEL_DEPTH + POOL_HEADROOM;
+    }
     let frame_capacity = (budget / frame_bytes).max(1);
     let floor = (worker_threads + POOL_HEADROOM).min(frame_capacity);
     frame_capacity.max(floor).min(128)
@@ -1229,20 +1401,43 @@ fn build_overlay_ffmpeg_args(
     encode_threads: usize,
 ) -> Vec<String> {
     let mut a = vec!["-y".to_string()];
-    if has_nvenc { a.extend(["-hwaccel".into(), "auto".into()]); }
+    if has_nvenc {
+        a.extend(["-hwaccel".into(), "auto".into()]);
+    }
     let base_video = args.overlay_video_path.as_ref().unwrap();
-    a.extend(["-thread_queue_size".into(), "512".into(), "-i".into(), base_video.clone()]);
     a.extend([
         "-thread_queue_size".into(),
-        args.ffmpeg_input_queue_frames.unwrap_or(16).clamp(4, MAX_FFMPEG_RAW_QUEUE_FRAMES).to_string(),
-        "-f".into(), "rawvideo".into(), "-pix_fmt".into(), "bgra".into(),
-        "-s".into(), format!("{}x{}", actual_width, args.height),
-        "-r".into(), args.fps.to_string(), "-i".into(), "-".into(),
+        "512".into(),
+        "-i".into(),
+        base_video.clone(),
+    ]);
+    a.extend([
+        "-thread_queue_size".into(),
+        args.ffmpeg_input_queue_frames
+            .unwrap_or(16)
+            .clamp(4, MAX_FFMPEG_RAW_QUEUE_FRAMES)
+            .to_string(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "bgra".into(),
+        "-s".into(),
+        format!("{}x{}", actual_width, args.height),
+        "-r".into(),
+        args.fps.to_string(),
+        "-i".into(),
+        "-".into(),
     ]);
     let img_input_start = 2usize;
     for ov in &args.image_overlays {
-        a.extend(["-thread_queue_size".into(), "64".into(), "-loop".into(), "1".into(),
-            "-i".into(), ov.asset_path.clone()]);
+        a.extend([
+            "-thread_queue_size".into(),
+            "64".into(),
+            "-loop".into(),
+            "1".into(),
+            "-i".into(),
+            ov.asset_path.clone(),
+        ]);
     }
     let ox = args.overlay_x.unwrap_or(0);
     let oy = args.overlay_y.unwrap_or(0);
@@ -1265,9 +1460,19 @@ fn build_overlay_ffmpeg_args(
         let shape_filter = format!(
             "color=c=0x{:02X}{:02X}{:02X}@{:.4}:s={}x{}:r={},setpts=PTS-STARTPTS[shape{}]; \
              {}[shape{}]overlay={}:{}:format=auto{}",
-            r, g, b, alpha_f,
-            shape.width as u32, shape.height as u32, args.fps, label_idx - 1,
-            current_base, label_idx - 1, shape.x as i32, shape.y as i32, next_label
+            r,
+            g,
+            b,
+            alpha_f,
+            shape.width as u32,
+            shape.height as u32,
+            args.fps,
+            label_idx - 1,
+            current_base,
+            label_idx - 1,
+            shape.x as i32,
+            shape.y as i32,
+            next_label
         );
         filter_parts.push(shape_filter);
         current_base = next_label;
@@ -1286,7 +1491,10 @@ fn build_overlay_ffmpeg_args(
             (None, None)       => format!("[{}:v]setpts=PTS-STARTPTS,format=rgba,colorchannelmixer=aa={:.4}{}", input_idx, alpha_f, img_label),
         };
         filter_parts.push(scale_filter);
-        let img_overlay = format!("{}{}overlay={}:{}:format=auto{}", current_base, img_label, ov.x as i32, ov.y as i32, next_label);
+        let img_overlay = format!(
+            "{}{}overlay={}:{}:format=auto{}",
+            current_base, img_label, ov.x as i32, ov.y as i32, next_label
+        );
         filter_parts.push(img_overlay);
         current_base = next_label;
     }
@@ -1324,15 +1532,39 @@ fn build_overlay_ffmpeg_args(
     filter_parts.push(filter_string);
     let full_filter = filter_parts.join("; ");
 
-    a.extend(["-filter_complex".into(), full_filter, "-map".into(), "[outv]".into(),
-        "-map".into(), "0:a?".into(), "-c:a".into(), "copy".into()]);
+    a.extend([
+        "-filter_complex".into(),
+        full_filter,
+        "-map".into(),
+        "[outv]".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-c:a".into(),
+        "copy".into(),
+    ]);
 
     if has_nvenc {
-        a.extend(["-c:v".into(), "h264_nvenc".into(), "-preset".into(), ffmpeg_preset.into(), "-cq".into(), "20".into()]);
+        a.extend([
+            "-c:v".into(),
+            "h264_nvenc".into(),
+            "-preset".into(),
+            ffmpeg_preset.into(),
+            "-cq".into(),
+            "20".into(),
+        ]);
     } else {
-        a.extend(["-c:v".into(), "libx264".into(), "-preset".into(), ffmpeg_preset.into(),
-            "-crf".into(), "20".into(), "-pix_fmt".into(), "yuv420p".into(),
-            "-threads".into(), encode_threads.to_string()]);
+        a.extend([
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            ffmpeg_preset.into(),
+            "-crf".into(),
+            "20".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-threads".into(),
+            encode_threads.to_string(),
+        ]);
     }
     a.push(args.output_path.clone());
     a
@@ -1348,22 +1580,50 @@ fn build_standalone_ffmpeg_args(
     let mut a = vec!["-y".to_string()];
     let (vcodec, pix_fmt) = match args.background_mode {
         BackgroundMode::Transparent => ("prores_ks", "yuva444p10le"),
-        _ => if has_nvenc { ("h264_nvenc", "yuv420p") } else { ("libx264", "yuv420p") },
+        _ => {
+            if has_nvenc {
+                ("h264_nvenc", "yuv420p")
+            } else {
+                ("libx264", "yuv420p")
+            }
+        }
     };
     a.extend([
         "-thread_queue_size".into(),
-        args.ffmpeg_input_queue_frames.unwrap_or(16).clamp(4, MAX_FFMPEG_RAW_QUEUE_FRAMES).to_string(),
-        "-f".into(), "rawvideo".into(), "-pix_fmt".into(), "bgra".into(),
-        "-s".into(), format!("{}x{}", actual_width, args.height),
-        "-r".into(), args.fps.to_string(), "-i".into(), "-".into(),
-        "-c:v".into(), vcodec.into(), "-pix_fmt".into(), pix_fmt.into(),
+        args.ffmpeg_input_queue_frames
+            .unwrap_or(16)
+            .clamp(4, MAX_FFMPEG_RAW_QUEUE_FRAMES)
+            .to_string(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "bgra".into(),
+        "-s".into(),
+        format!("{}x{}", actual_width, args.height),
+        "-r".into(),
+        args.fps.to_string(),
+        "-i".into(),
+        "-".into(),
+        "-c:v".into(),
+        vcodec.into(),
+        "-pix_fmt".into(),
+        pix_fmt.into(),
     ]);
     if vcodec == "prores_ks" {
         a.extend(["-profile:v".into(), "4444".into()]);
     } else {
-        a.extend(["-preset".into(), ffmpeg_preset.into(),
-            "-cq".into(), "20".into(), "-crf".into(), "20".into(),
-            "-threads".into(), encode_threads.to_string()]);
+        a.extend([
+            "-preset".into(),
+            ffmpeg_preset.into(),
+            // Both flags passed: NVENC uses -cq, libx264 uses -crf.
+            // FFmpeg silently ignores whichever doesn't apply to the chosen codec.
+            "-cq".into(),
+            "20".into(),
+            "-crf".into(),
+            "20".into(),
+            "-threads".into(),
+            encode_threads.to_string(),
+        ]);
     }
     a.push(args.output_path.clone());
     a
@@ -1430,7 +1690,9 @@ pub async fn process_chat_render(
     let video_path_for_probe = args.overlay_video_path.clone();
     let fps_for_probe = args.fps;
     let video_frames_probe = std::thread::spawn(move || {
-        video_path_for_probe.as_deref().and_then(|p| probe_video_frames(p, fps_for_probe))
+        video_path_for_probe
+            .as_deref()
+            .and_then(|p| probe_video_frames(p, fps_for_probe))
     });
 
     let has_nvenc = nvenc_probe.join().unwrap_or(false);
@@ -1440,21 +1702,31 @@ pub async fn process_chat_render(
 
     // ── Thread / chunk sizing ─────────────────────────────────────────────────
     let max_threads = args.max_render_threads;
-    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     // Leave 2 logical CPUs free for FFmpeg, the OS, and other desktop apps.
     let background_default = |cap: usize| cpus.saturating_sub(2).clamp(1, cap);
 
     let (mut worker_threads, ffmpeg_preset) = if args.use_immediate_pipe_overlay {
-        (max_threads.unwrap_or_else(|| background_default(4)),
-         if has_nvenc { "p1" } else { "ultrafast" })
+        (
+            max_threads.unwrap_or_else(|| background_default(4)),
+            if has_nvenc { "p1" } else { "ultrafast" },
+        )
     } else {
         match args.quality_preset {
-            QualityPreset::Draft    => (max_threads.unwrap_or(1).max(1),
-                                        if has_nvenc { "p1" } else { "ultrafast" }),
-            QualityPreset::Standard => (max_threads.unwrap_or_else(|| background_default(6)),
-                                        if has_nvenc { "p3" } else { "ultrafast" }),
-            QualityPreset::High     => (max_threads.unwrap_or_else(|| background_default(8)),
-                                        if has_nvenc { "p5" } else { "veryfast" }),
+            QualityPreset::Draft => (
+                max_threads.unwrap_or(1).max(1),
+                if has_nvenc { "p1" } else { "ultrafast" },
+            ),
+            QualityPreset::Standard => (
+                max_threads.unwrap_or_else(|| background_default(6)),
+                if has_nvenc { "p3" } else { "ultrafast" },
+            ),
+            QualityPreset::High => (
+                max_threads.unwrap_or_else(|| background_default(8)),
+                if has_nvenc { "p5" } else { "veryfast" },
+            ),
         }
     };
 
@@ -1462,14 +1734,20 @@ pub async fn process_chat_render(
     let frame_bytes = (actual_width as usize)
         .saturating_mul(args.height.max(1) as usize)
         .saturating_mul(4);
-    let memory_budget_bytes = args.render_memory_budget_mb
-                                  .unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB).clamp(64, 4096) * 1024 * 1024;
+    let memory_budget_bytes = args
+        .render_memory_budget_mb
+        .unwrap_or(DEFAULT_PIXEL_POOL_BUDGET_MB)
+        .clamp(64, 4096)
+        * 1024
+        * 1024;
     if max_threads.is_none() && frame_bytes > 0 {
         let by_memory = (memory_budget_bytes / frame_bytes / 2).clamp(1, worker_threads);
         worker_threads = worker_threads.min(by_memory.max(1));
     }
 
-    let chunk_size = worker_threads.saturating_mul(2).clamp(CHUNK_SIZE_MIN, CHUNK_SIZE_MAX);
+    let chunk_size = worker_threads
+        .saturating_mul(2)
+        .clamp(CHUNK_SIZE_MIN, CHUNK_SIZE_MAX);
     let encode_threads = ffmpeg_encode_threads(cpus, worker_threads, has_nvenc);
 
     let render_pool = Arc::new(
@@ -1481,9 +1759,22 @@ pub async fn process_chat_render(
     );
 
     let ffmpeg_args = if args.overlay_video_path.is_some() {
-        build_overlay_ffmpeg_args(&args, actual_width, is_luma, has_nvenc, ffmpeg_preset, encode_threads)
+        build_overlay_ffmpeg_args(
+            &args,
+            actual_width,
+            is_luma,
+            has_nvenc,
+            ffmpeg_preset,
+            encode_threads,
+        )
     } else {
-        build_standalone_ffmpeg_args(&args, actual_width, has_nvenc, ffmpeg_preset, encode_threads)
+        build_standalone_ffmpeg_args(
+            &args,
+            actual_width,
+            has_nvenc,
+            ffmpeg_preset,
+            encode_threads,
+        )
     };
 
     // ── IO writer + FFmpeg spawn ──────────────────────────────────────────────
@@ -1504,44 +1795,30 @@ pub async fn process_chat_render(
 
     let (io_tx, io_rx) = crossbeam_channel::bounded::<Arc<ReusableBuffer>>(IO_CHANNEL_DEPTH);
 
-    // The IO thread owns either the FFmpeg child stdin or raw stdout.
-    // It returns the FFmpeg ExitStatus on join (or a synthetic success for direct pipe).
-    let (mut ffmpeg_child_opt, io_thread) = if args.use_immediate_pipe_overlay {
-        // Direct pipe mode — no FFmpeg child.
-        let t = std::thread::spawn(move || {
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, std::io::stdout());
-            while let Ok(frame) = io_rx.recv() {
-                if let Some(data) = &frame.data {
-                    if writer.write_all(data).is_err() { break; }
+    let mut ffmpeg_child = hidden_command("ffmpeg")
+        .args(&ffmpeg_args)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
+
+    let ff_stdin = ffmpeg_child.stdin.take().unwrap();
+
+    // Dedicated OS thread with an 8 MiB BufWriter. This thread owns the
+    // FFmpeg stdin pipe and is the only writer. Rayon workers never touch it.
+    let io_thread = std::thread::spawn(move || {
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, ff_stdin);
+        while let Ok(frame) = io_rx.recv() {
+            if let Some(data) = &frame.data {
+                if writer.write_all(data).is_err() {
+                    break;
                 }
             }
-            let _ = writer.flush();
-            for _ in io_rx {}
-        });
-        (None::<std::process::Child>, t)
-    } else {
-        let mut child = hidden_command("ffmpeg")
-            .args(&ffmpeg_args)
-            .stdin(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| AppError::Ffmpeg(e.to_string()))?;
-        let ff_stdin = child.stdin.take().unwrap();
-        // Dedicated OS thread with an 8 MiB BufWriter.
-        // Rayon workers never touch the pipe — zero contention on the hot path.
-        let t = std::thread::spawn(move || {
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, ff_stdin);
-            while let Ok(frame) = io_rx.recv() {
-                if let Some(data) = &frame.data {
-                    if writer.write_all(data).is_err() { break; }
-                }
-            }
-            let _ = writer.flush();
-            drop(writer);
-            for _ in io_rx {} // drain so senders can unblock
-        });
-        (Some(child), t)
-    };
+        }
+        let _ = writer.flush();
+        drop(writer);
+        for _ in io_rx {} // drain so senders can unblock
+    });
 
     // ── Scan pass ─────────────────────────────────────────────────────────────
     // Streams the JSONL file line-by-line using a 2 MiB BufReader — never
@@ -1595,47 +1872,66 @@ pub async fn process_chat_render(
                 Ok(n) => n,
                 Err(_) => break,
             };
-            if read == 0 { break; }
-            if scan_cancel.load(Ordering::Relaxed) { break; }
+            if read == 0 {
+                break;
+            }
+            if scan_cancel.load(Ordering::Relaxed) {
+                break;
+            }
 
-            let msg: MessageSaved = match serde_json::from_str(line.trim_end_matches(['\r', '\n'])) {
+            let msg: MessageSaved = match serde_json::from_str(line.trim_end_matches(['\r', '\n']))
+            {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if scan_skip.contains(&msg.sender.username) { continue; }
+            if scan_skip.contains(&msg.sender.username) {
+                continue;
+            }
 
             if let Some(start) = scan_args.start_ms {
-                if (msg.created_at_secs as u64 * 1000) < start { continue; }
+                if (msg.created_at_secs as u64 * 1000) < start {
+                    continue;
+                }
             }
             if let Some(end) = scan_args.end_ms {
-                if (msg.created_at_secs as u64 * 1000) > end { break; }
+                if (msg.created_at_secs as u64 * 1000) > end {
+                    break;
+                }
             }
 
             let offset = msg.range_offset_secs as f64;
-            if offset > max_offset_sec { max_offset_sec = offset; }
+            if offset > max_offset_sec {
+                max_offset_sec = offset;
+            }
 
             // Collect asset references from this message's tokens.
-            let mut collect_assets = |tok: &MessageToken| {
-                match tok {
-                    MessageToken::KickEmote { id } => {
-                        if flags.kick { emote_ids.insert(*id); }
+            let mut collect_assets = |tok: &MessageToken| match tok {
+                MessageToken::KickEmote { id } => {
+                    if flags.kick {
+                        emote_ids.insert(*id);
                     }
-                    MessageToken::ProviderEmote(e) => { provider_image_urls.insert(e.url.to_string()); }
-                    MessageToken::Text(_) => {}
                 }
+                MessageToken::ProviderEmote(e) => {
+                    provider_image_urls.insert(e.url.to_string());
+                }
+                MessageToken::Text(_) => {}
             };
 
             if do_prefill && offset < 0.0 {
                 let age_secs = -offset;
                 if age_secs <= prefill_window_secs as f64 {
                     let age_offset_frames = (age_secs * scan_args.fps as f64).round() as u32;
-                    for tok in tokenise(&msg.content, map_opt) { collect_assets(&tok); }
+                    for tok in tokenise(&msg.content, map_opt) {
+                        collect_assets(&tok);
+                    }
                     let _ = prefill_tx.send((msg, false, age_offset_frames));
                 }
                 continue;
             }
 
-            for tok in tokenise(&msg.content, map_opt) { collect_assets(&tok); }
+            for tok in tokenise(&msg.content, map_opt) {
+                collect_assets(&tok);
+            }
 
             let is_grouped = group_enabled
                 && msg.sender.username == last_user
@@ -1644,7 +1940,9 @@ pub async fn process_chat_render(
             last_user.push_str(&msg.sender.username);
             last_time = msg.range_offset_secs;
 
-            if loader_tx.send((msg, is_grouped)).is_err() { break; }
+            if loader_tx.send((msg, is_grouped)).is_err() {
+                break;
+            }
         }
 
         let _ = meta_tx.send((
@@ -1716,8 +2014,7 @@ pub async fn process_chat_render(
         .max(1);
 
     let guaranteed_visible_capacity =
-        ((canvas_max_h.max(1) / cull_min_bubble_h) as usize)
-            .saturating_add(3);
+        ((canvas_max_h.max(1) / cull_min_bubble_h) as usize).saturating_add(3);
 
     // ── Layout thread ─────────────────────────────────────────────────────────
     //
@@ -1770,21 +2067,37 @@ pub async fn process_chat_render(
                                     *tg = 0;
                                     let is_highlighted = hl.contains(&msg.sender.username);
                                     match layout_message_blocking(
-                                        &msg.content, &msg.sender.username,
+                                        &msg.content,
+                                        &msg.sender.username,
                                         &msg.sender.identity.color,
-                                        &uf, &mf,
+                                        &uf,
+                                        &mf,
                                         (args_c.width - 2 * args_c.padding) as f32,
-                                        mh, ma, &ec, &ic, &args_c, &em,
-                                        &mut mc, 0, false,
+                                        mh,
+                                        ma,
+                                        &ec,
+                                        &ic,
+                                        &args_c,
+                                        &em,
+                                        &mut mc,
+                                        0,
+                                        false,
                                     ) {
                                         Ok((lines, bw, bh, uc)) => {
-                                            if lines.is_empty() || lines.iter().all(|l| l.tokens.is_empty()) {
+                                            if lines.is_empty()
+                                                || lines.iter().all(|l| l.tokens.is_empty())
+                                            {
                                                 return None;
                                             }
                                             Some(ScheduledMessage::new_prefill(
-                                                age_offset, lines, bw, bh,
-                                                Color::from(&args_c.bubble_color), uc,
-                                                false, is_highlighted,
+                                                age_offset,
+                                                lines,
+                                                bw,
+                                                bh,
+                                                Color::from(&args_c.bubble_color),
+                                                uc,
+                                                false,
+                                                is_highlighted,
                                                 message_layout_key(&msg, false),
                                             ))
                                         }
@@ -1821,7 +2134,7 @@ pub async fn process_chat_render(
                             gen: u32,
                             pool: &rayon::ThreadPool,
                             max_per_frame: usize|
-            -> crossbeam_channel::Receiver<BatchResult> {
+         -> crossbeam_channel::Receiver<BatchResult> {
             let (tx, rx) = crossbeam_channel::bounded::<BatchResult>(1);
             let args_c = args_pr.clone();
             let ec = emote_cache_pr.clone();
@@ -1859,15 +2172,17 @@ pub async fn process_chat_render(
                     // For each frame, only keep the last max_per_frame.
                     let mut seen: FxHashMap<i64, usize> =
                         FxHashMap::with_capacity_and_hasher(frame_counts.len(), Default::default());
-                    msgs.into_iter().filter(|(msg, _)| {
-                        let base = (msg.range_offset_secs as f64).max(0.0) as i64;
-                        let total = *frame_counts.get(&base).unwrap_or(&1);
-                        let skip = total.saturating_sub(max_per_frame);
-                        let idx = seen.entry(base).or_insert(0);
-                        let keep = *idx >= skip;
-                        *idx += 1;
-                        keep
-                    }).collect()
+                    msgs.into_iter()
+                        .filter(|(msg, _)| {
+                            let base = (msg.range_offset_secs as f64).max(0.0) as i64;
+                            let total = *frame_counts.get(&base).unwrap_or(&1);
+                            let skip = total.saturating_sub(max_per_frame);
+                            let idx = seen.entry(base).or_insert(0);
+                            let keep = *idx >= skip;
+                            *idx += 1;
+                            keep
+                        })
+                        .collect()
                 } else {
                     msgs
                 };
@@ -1907,22 +2222,41 @@ pub async fn process_chat_render(
 
                                 // Per-thread layout cache: check before calling
                                 // layout_message_blocking (which involves text shaping).
-                                let cached = LAYOUT_CACHE.with(|cell| cell.borrow().get(&layout_key).cloned());
+                                let cached = LAYOUT_CACHE
+                                    .with(|cell| cell.borrow().get(&layout_key).cloned());
                                 let layout = if let Some(c) = cached {
                                     Ok(c)
                                 } else {
                                     let result = layout_message_blocking(
-                                        &msg.content, &msg.sender.username,
+                                        &msg.content,
+                                        &msg.sender.username,
                                         &msg.sender.identity.color,
-                                        &uf, &mf,
+                                        &uf,
+                                        &mf,
                                         (args_c.width - 2 * args_c.padding) as f32,
-                                        mh, ma, &ec, &ic, &args_c, &em,
-                                        &mut mc, gen, is_grouped,
-                                    ).map(|(lines, width, height, user_color)| CachedLayout {
-                                        lines, width, height, user_color, gen,
-                                    });
+                                        mh,
+                                        ma,
+                                        &ec,
+                                        &ic,
+                                        &args_c,
+                                        &em,
+                                        &mut mc,
+                                        gen,
+                                        is_grouped,
+                                    )
+                                    .map(
+                                        |(lines, width, height, user_color)| CachedLayout {
+                                            lines,
+                                            width,
+                                            height,
+                                            user_color,
+                                            gen,
+                                        },
+                                    );
                                     if let Ok(ref c) = result {
-                                        if !c.lines.is_empty() && c.lines.iter().any(|l| !l.tokens.is_empty()) {
+                                        if !c.lines.is_empty()
+                                            && c.lines.iter().any(|l| !l.tokens.is_empty())
+                                        {
                                             LAYOUT_CACHE.with(|cell| {
                                                 let mut cache = cell.borrow_mut();
                                                 // Generational eviction: retain entries from the
@@ -1941,14 +2275,25 @@ pub async fn process_chat_render(
 
                                 match layout {
                                     Ok(c) => {
-                                        if c.lines.is_empty() || c.lines.iter().all(|l| l.tokens.is_empty()) {
+                                        if c.lines.is_empty()
+                                            || c.lines.iter().all(|l| l.tokens.is_empty())
+                                        {
                                             return None;
                                         }
-                                        Some((base_frame, ScheduledMessage::new(
-                                            0, c.lines, c.width, c.height,
-                                            Color::from(&args_c.bubble_color),
-                                            c.user_color, is_grouped, is_highlighted, layout_key,
-                                        )))
+                                        Some((
+                                            base_frame,
+                                            ScheduledMessage::new(
+                                                0,
+                                                c.lines,
+                                                c.width,
+                                                c.height,
+                                                Color::from(&args_c.bubble_color),
+                                                c.user_color,
+                                                is_grouped,
+                                                is_highlighted,
+                                                layout_key,
+                                            ),
+                                        ))
                                     }
                                     Err(_) => None,
                                 }
@@ -1957,9 +2302,10 @@ pub async fn process_chat_render(
                     })
                     .collect();
 
-                let results: BatchResult = remap.into_iter()
-                                                .map(|idx| unique_results[idx].clone())
-                                                .collect();
+                let results: BatchResult = remap
+                    .into_iter()
+                    .map(|idx| unique_results[idx].clone())
+                    .collect();
                 let _ = tx.send(results);
             });
             rx
@@ -1968,21 +2314,28 @@ pub async fn process_chat_render(
         let drain_one = |rx: crossbeam_channel::Receiver<BatchResult>,
                          last_frame: &mut i64,
                          stamp: &crossbeam_channel::Sender<(u32, Arc<ScheduledMessage>)>|
-            -> bool {
-            let results = match rx.recv() { Ok(r) => r, Err(_) => return false };
+         -> bool {
+            let results = match rx.recv() {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
             let mut cursor = *last_frame;
             for (base_frame, mut sched) in results.into_iter().flatten() {
                 let assigned = base_frame.max(cursor);
                 cursor = assigned;
                 sched.spawn_frame = assigned as u32;
-                if stamp.send((sched.spawn_frame, Arc::new(sched))).is_err() { return false; }
+                if stamp.send((sched.spawn_frame, Arc::new(sched))).is_err() {
+                    return false;
+                }
             }
             *last_frame = cursor;
             true
         };
 
         loop {
-            if pr_cancel.load(Ordering::Relaxed) { break; }
+            if pr_cancel.load(Ordering::Relaxed) {
+                break;
+            }
 
             match loader_rx.try_recv() {
                 Ok(msg_tuple) => {
@@ -1990,18 +2343,27 @@ pub async fn process_chat_render(
                     if batch.len() >= BATCH_SIZE {
                         if in_flight.len() >= MAX_BATCHES_IN_FLIGHT {
                             if let Some(rx) = in_flight.pop_front() {
-                                if !drain_one(rx, &mut last_assigned_frame, &stamp_tx) { break; }
+                                if !drain_one(rx, &mut last_assigned_frame, &stamp_tx) {
+                                    break;
+                                }
                             }
                         }
                         layout_gen = layout_gen.wrapping_add(1);
-                        let rx = submit_batch(std::mem::take(&mut batch), layout_gen, &render_pool_pr, layout_max_per_frame);
+                        let rx = submit_batch(
+                            std::mem::take(&mut batch),
+                            layout_gen,
+                            &render_pool_pr,
+                            layout_max_per_frame,
+                        );
                         in_flight.push_back(rx);
                         batch.reserve(BATCH_SIZE);
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     if let Some(rx) = in_flight.pop_front() {
-                        if !drain_one(rx, &mut last_assigned_frame, &stamp_tx) { break; }
+                        if !drain_one(rx, &mut last_assigned_frame, &stamp_tx) {
+                            break;
+                        }
                     } else {
                         match loader_rx.recv_timeout(std::time::Duration::from_millis(5)) {
                             Ok(msg_tuple) => batch.push(msg_tuple),
@@ -2020,7 +2382,9 @@ pub async fn process_chat_render(
             in_flight.push_back(rx);
         }
         for rx in in_flight {
-            if !drain_one(rx, &mut last_assigned_frame, &stamp_tx) { break; }
+            if !drain_one(rx, &mut last_assigned_frame, &stamp_tx) {
+                break;
+            }
         }
     });
 
@@ -2051,7 +2415,9 @@ pub async fn process_chat_render(
     let num_bytes = (actual_width * args.height * 4) as usize;
 
     let pixel_pool = Arc::new(PixelBufferPool::new(pixel_pool_buffer_count(
-        num_bytes, worker_threads, args.render_memory_budget_mb,
+        num_bytes,
+        worker_threads,
+        args.render_memory_budget_mb,
     )));
 
     let mut active_bubbles: VecDeque<Arc<ScheduledMessage>> = VecDeque::new();
@@ -2067,10 +2433,10 @@ pub async fn process_chat_render(
     let anim_fade = args.anim_fade_in;
     let eviction = args.eviction_strategy.clone();
 
-    let cull_cutoff     = args.height + args.padding;
-    let cull_spacing    = args.message_spacing;
+    let cull_cutoff = args.height + args.padding;
+    let cull_spacing = args.message_spacing;
     // Scalar copy used inside the rayon closure — avoids cloning RenderVideoArgs.
-    let canvas_height   = args.height;
+    let canvas_height = args.height;
 
     let mut last_sig: u64 = u64::MAX;
     let mut last_buf: Option<Arc<ReusableBuffer>> = None;
@@ -2084,23 +2450,25 @@ pub async fn process_chat_render(
 
     // Constant draw parameters computed once for the entire render job.
     // Hoisted here so draw_frame never repeats Color::from / field access work.
-    let draw_msg_color  = Color::from(&args.message_color);
-    let draw_hi_color   = Color::from(&args.highlight_color);
-    let draw_outline_w  = args.username_outline_width.unwrap_or(1.5);
+    let draw_msg_color = Color::from(&args.message_color);
+    let draw_hi_color = Color::from(&args.highlight_color);
+    let draw_outline_w = args.username_outline_width.unwrap_or(1.5);
     let draw_fade_out_f = args.message_fade_out_seconds as f32;
-    let draw_y_start    = (args.height - args.padding) as f32;
-    let draw_padding_f  = args.padding as f32;
-    let draw_spacing_f  = args.message_spacing as f32;
-    let draw_width_f    = args.width as f32;
-    let draw_radius     = args.bubble_radius;
-    let draw_username_shadow  = args.username_shadow;
+    let draw_y_start = (args.height - args.padding) as f32;
+    let draw_padding_f = args.padding as f32;
+    let draw_spacing_f = args.message_spacing as f32;
+    let draw_width_f = args.width as f32;
+    let draw_radius = args.bubble_radius;
+    let draw_username_shadow = args.username_shadow;
     let draw_outline_usernames = args.outline_usernames;
 
     emit_progress(10.0, "Rendering frames...");
     let mut last_progress_emit = std::time::Instant::now();
 
     'frame: for f_idx in 0..total_frames {
-        if cancel_flag.load(Ordering::Relaxed) { break; }
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Drain newly spawned bubbles whose frame has arrived.
         // The capacity check happens here, not after, so excess bubbles from
@@ -2111,7 +2479,9 @@ pub async fn process_chat_render(
         // Using it here means we never hold more than ~screen_height/min_bubble_h + 3
         // bubbles in active_bubbles at any point, even during a 500-msg/frame burst.
         loop {
-            if next_stamp.is_none() { next_stamp = stamp_rx.try_recv().ok(); }
+            if next_stamp.is_none() {
+                next_stamp = stamp_rx.try_recv().ok();
+            }
             match &next_stamp {
                 Some((spawn_frame, _)) if *spawn_frame <= f_idx => {
                     let bubble = next_stamp.take().unwrap().1;
@@ -2145,12 +2515,21 @@ pub async fn process_chat_render(
         // The signature hash covers all visible state: bubble identity, alpha,
         // slide offset (bucketed), and animated-emote frame index.
         let sig = frame_signature_deque(
-            &active_bubbles, f_idx, fps_f32, anim_slide, anim_fade, &eviction, hold_secs, fade_secs,
+            &active_bubbles,
+            f_idx,
+            fps_f32,
+            anim_slide,
+            anim_fade,
+            &eviction,
+            hold_secs,
+            fade_secs,
         );
         let dirty = sig != last_sig || last_buf.is_none();
         // Record only whether this frame needs a new render — no snapshot Vec.
         frame_chunk.push((f_idx, dirty));
-        if dirty { last_sig = sig; }
+        if dirty {
+            last_sig = sig;
+        }
 
         if frame_chunk.len() < chunk_size && f_idx < total_frames - 1 {
             continue;
@@ -2177,56 +2556,71 @@ pub async fn process_chat_render(
         // entire duration of `render_pool.install()` — which is synchronous —
         // so no Arc ref-count churn and no per-frame Vec allocation.
         if !dirty_frame_ids.is_empty() {
-            let bubbles_slice: &[Arc<ScheduledMessage>] =
-                active_bubbles.make_contiguous();
+            let bubbles_slice: &[Arc<ScheduledMessage>] = active_bubbles.make_contiguous();
 
             let pool = Arc::clone(&pixel_pool);
             let info_clone = info.clone();
 
             let rendered_jobs: Vec<Arc<ReusableBuffer>> = render_pool.install(|| {
-                dirty_frame_ids.par_iter().copied().map(|frame_id| {
-                    let mut buf = ReusableBuffer::new(pool.clone(), num_bytes);
+                dirty_frame_ids
+                    .par_iter()
+                    .copied()
+                    .map(|frame_id| {
+                        let mut buf = ReusableBuffer::new(pool.clone(), num_bytes);
 
-                    SKIA_SURFACE.with(|surf_cell| {
-                        let mut surf_opt = surf_cell.borrow_mut();
+                        SKIA_SURFACE.with(|surf_cell| {
+                            let mut surf_opt = surf_cell.borrow_mut();
 
-                        // Lazily initialise the per-thread Skia raster surface.
-                        // `canvas_height` is a plain i32 copy — no args clone needed.
-                        if surf_opt.is_none()
-                            || surf_opt.as_ref().unwrap().width()  != actual_width
-                            || surf_opt.as_ref().unwrap().height() != canvas_height
-                        {
-                            *surf_opt = Some(
-                                surfaces::raster(&info_clone, None, None).unwrap(),
+                            // Lazily initialise the per-thread Skia raster surface.
+                            // `canvas_height` is a plain i32 copy — no args clone needed.
+                            if surf_opt.is_none()
+                                || surf_opt.as_ref().unwrap().width() != actual_width
+                                || surf_opt.as_ref().unwrap().height() != canvas_height
+                            {
+                                *surf_opt =
+                                    Some(surfaces::raster(&info_clone, None, None).unwrap());
+                            }
+
+                            let surface = surf_opt.as_mut().unwrap();
+                            let canvas = surface.canvas();
+
+                            draw_frame(
+                                canvas,
+                                bubbles_slice,
+                                bg_color,
+                                is_luma,
+                                frame_id,
+                                fps_f32,
+                                hold_secs,
+                                draw_fade_out_f,
+                                anim_slide,
+                                anim_fade,
+                                &eviction,
+                                draw_msg_color,
+                                draw_hi_color,
+                                draw_outline_w,
+                                draw_y_start,
+                                draw_padding_f,
+                                draw_spacing_f,
+                                draw_width_f,
+                                draw_radius,
+                                draw_username_shadow,
+                                draw_outline_usernames,
                             );
-                        }
 
-                        let surface = surf_opt.as_mut().unwrap();
-                        let canvas = surface.canvas();
+                            // read_pixels writes directly into the pool buffer —
+                            // no intermediate copy; stride = actual_width * 4.
+                            surface.read_pixels(
+                                &info_clone,
+                                buf.data.as_mut().unwrap().as_mut_slice(),
+                                (actual_width * 4) as usize,
+                                (0, 0),
+                            );
+                        });
 
-                        draw_frame(
-                            canvas, bubbles_slice,
-                            bg_color, is_luma,
-                            frame_id, fps_f32, hold_secs, draw_fade_out_f,
-                            anim_slide, anim_fade, &eviction,
-                            draw_msg_color, draw_hi_color, draw_outline_w,
-                            draw_y_start, draw_padding_f, draw_spacing_f,
-                            draw_width_f, draw_radius,
-                            draw_username_shadow, draw_outline_usernames,
-                        );
-
-                        // read_pixels writes directly into the pool buffer —
-                        // no intermediate copy; stride = actual_width * 4.
-                        surface.read_pixels(
-                            &info_clone,
-                            buf.data.as_mut().unwrap().as_mut_slice(),
-                            (actual_width * 4) as usize,
-                            (0, 0),
-                        );
-                    });
-
-                    Arc::new(buf)
-                }).collect()
+                        Arc::new(buf)
+                    })
+                    .collect()
             });
 
             // ── Dispatch to IO thread ─────────────────────────────────────────
@@ -2250,12 +2644,16 @@ pub async fn process_chat_render(
                     break;
                 }
             }
-            if channel_closed { break 'frame; }
+            if channel_closed {
+                break 'frame;
+            }
         } else if let Some(ref buf) = last_buf {
             // Entire chunk was identical — blast the same Arc N times.
             let buf = Arc::clone(buf);
             for _ in &sequence {
-                if io_tx.send(Arc::clone(&buf)).is_err() { break 'frame; }
+                if io_tx.send(Arc::clone(&buf)).is_err() {
+                    break 'frame;
+                }
             }
         }
 
@@ -2276,26 +2674,14 @@ pub async fn process_chat_render(
 
     let cancelled = cancel_flag.load(Ordering::SeqCst);
 
-    // For direct pipe mode there is no FFmpeg child to wait on.
-    // Join the IO thread (flushes stdout), then return immediately.
-    if args.use_immediate_pipe_overlay {
-        let _ = tokio::task::spawn_blocking(move || { let _ = io_thread.join(); }).await;
-        return if cancelled {
-            emit_progress(100.0, "Render Cancelled");
-            Err(AppError::InternalError("Cancelled by user".into()))
-        } else {
-            emit_progress(100.0, "Complete");
-            Ok(())
-        };
-    }
-
-    // FFmpeg file-output path — wait for the child process to finish encoding.
     let shutdown_result = tokio::task::spawn_blocking(move || {
-        let mut child = ffmpeg_child_opt.expect("ffmpeg child must be Some in file-output mode");
-        if cancelled { let _ = child.kill(); }
+        if cancelled {
+            let _ = ffmpeg_child.kill();
+        }
         let _ = io_thread.join();
-        child.wait()
-    }).await;
+        ffmpeg_child.wait()
+    })
+    .await;
 
     if cancelled {
         emit_progress(100.0, "Render Cancelled");
@@ -2303,10 +2689,16 @@ pub async fn process_chat_render(
     }
 
     match shutdown_result {
-        Ok(Ok(status)) if status.success() => { emit_progress(100.0, "Complete"); Ok(()) }
+        Ok(Ok(status)) if status.success() => {
+            emit_progress(100.0, "Complete");
+            Ok(())
+        }
         Ok(Ok(status)) => {
             emit_progress(100.0, "Encoding failed");
-            Err(AppError::Ffmpeg(format!("FFmpeg exited with status {}", status)))
+            Err(AppError::Ffmpeg(format!(
+                "FFmpeg exited with status {}",
+                status
+            )))
         }
         Ok(Err(e)) => {
             emit_progress(100.0, "Encoding failed");
@@ -2314,7 +2706,10 @@ pub async fn process_chat_render(
         }
         Err(e) => {
             emit_progress(100.0, "Encoding failed");
-            Err(AppError::InternalError(format!("spawn_blocking panicked: {}", e)))
+            Err(AppError::InternalError(format!(
+                "spawn_blocking panicked: {}",
+                e
+            )))
         }
     }
 }

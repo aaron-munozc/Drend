@@ -1,9 +1,15 @@
-use std::collections::HashSet;
 use crate::error::AppError;
-use crate::types::{ // Adjust import paths as necessary
-                    AppResult, Chapter, Metadata, NormalizedFormat, NormalizedMetadata, YtDlpMetadata,
+use crate::types::{
+    // Adjust import paths as necessary
+    AppResult,
+    Chapter,
+    Metadata,
+    NormalizedFormat,
+    NormalizedMetadata,
+    YtDlpMetadata,
 };
 use crate::{tools, AppCache}; // Adjust import paths as necessary
+use std::collections::HashSet;
 use stream_extractor::{fetch_stream, StreamClient};
 use tauri::{AppHandle, State};
 use tokio::process::Command;
@@ -43,8 +49,10 @@ pub async fn analyze_url_core(
     let extractor = yt_meta.extractor.as_deref().unwrap_or("").to_lowercase();
     let is_chat_supported = extractor.contains("twitch") || extractor.contains("kick");
 
-    let is_live = yt_meta.live_status.as_deref() == Some("is_live") || yt_meta.is_live.unwrap_or(false);
-    let was_live = yt_meta.live_status.as_deref() == Some("was_live") || yt_meta.was_live.unwrap_or(false);
+    let is_live =
+        yt_meta.live_status.as_deref() == Some("is_live") || yt_meta.is_live.unwrap_or(false);
+    let was_live =
+        yt_meta.live_status.as_deref() == Some("was_live") || yt_meta.was_live.unwrap_or(false);
     let is_upcoming = yt_meta.live_status.as_deref() == Some("is_upcoming");
 
     let chapters = yt_meta
@@ -76,7 +84,9 @@ pub async fn analyze_url_core(
         .filter_map(|f| {
             // Some extractors use manifest_url instead of url
             let format_url = f.url.clone().or_else(|| f.manifest_url.clone())?;
-            if format_url.is_empty() { return None; }
+            if format_url.is_empty() {
+                return None;
+            }
 
             let ext = f.ext.clone().unwrap_or_else(|| "unknown".to_string());
             if ext == "mhtml" || f.format_id.starts_with("sb") {
@@ -153,31 +163,45 @@ pub async fn analyze_url_core(
     formats.sort_by(|a, b| {
         let score_a = (a.has_video as u8 * 2) + (a.has_audio as u8);
         let score_b = (b.has_video as u8 * 2) + (b.has_audio as u8);
-        score_b.cmp(&score_a)
-               .then_with(|| b.resolution_label.cmp(&a.resolution_label))
-               .then_with(|| b.fps.unwrap_or(0.0).partial_cmp(&a.fps.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal))
+        score_b
+            .cmp(&score_a)
+            .then_with(|| b.resolution_label.cmp(&a.resolution_label))
+            .then_with(|| {
+                b.fps
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.fps.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     // --- 🚀 UPGRADE: Cross-Platform Metadata Coalescing ---
-    let display_creator = yt_meta.artist.clone()
-                                 .or_else(|| yt_meta.channel.clone())
-                                 .or_else(|| yt_meta.uploader.clone())
-                                 .unwrap_or_else(|| "Unknown Creator".to_string());
+    let display_creator = yt_meta
+        .artist
+        .clone()
+        .or_else(|| yt_meta.channel.clone())
+        .or_else(|| yt_meta.uploader.clone())
+        .unwrap_or_else(|| "Unknown Creator".to_string());
 
-    let display_title = yt_meta.track.clone()
-                               .or_else(|| yt_meta.episode.clone())
-                               .or_else(|| yt_meta.title.clone())
-                               .or_else(|| yt_meta.fulltitle.clone())
-                               .unwrap_or_else(|| "Unknown Title".to_string());
+    let display_title = yt_meta
+        .track
+        .clone()
+        .or_else(|| yt_meta.episode.clone())
+        .or_else(|| yt_meta.title.clone())
+        .or_else(|| yt_meta.fulltitle.clone())
+        .unwrap_or_else(|| "Unknown Title".to_string());
 
-    let series_context = if let (Some(s_num), Some(e_num)) = (yt_meta.season_number, yt_meta.episode_number) {
-        Some(format!("Season {}, Episode {}", s_num, e_num))
-    } else if let Some(playlist) = &yt_meta.playlist {
-        let index = yt_meta.playlist_index.map(|i| i.to_string()).unwrap_or_else(|| "?".to_string());
-        Some(format!("Playlist: {} (#{})", playlist, index))
-    } else {
-        None
-    };
+    let series_context =
+        if let (Some(s_num), Some(e_num)) = (yt_meta.season_number, yt_meta.episode_number) {
+            Some(format!("Season {}, Episode {}", s_num, e_num))
+        } else if let Some(playlist) = &yt_meta.playlist {
+            let index = yt_meta
+                .playlist_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            Some(format!("Playlist: {} (#{})", playlist, index))
+        } else {
+            None
+        };
 
     let media_type = if yt_meta.track.is_some() || yt_meta.artist.is_some() {
         "Music".to_string()
@@ -198,7 +222,10 @@ pub async fn analyze_url_core(
         series_context,
 
         // Original standard fields
-        title: yt_meta.title.or(yt_meta.fulltitle).unwrap_or_else(|| "Unknown Title".to_string()),
+        title: yt_meta
+            .title
+            .or(yt_meta.fulltitle)
+            .unwrap_or_else(|| "Unknown Title".to_string()),
         description: yt_meta.description,
         duration: yt_meta.duration,
         uploader: yt_meta.uploader.or(yt_meta.channel),

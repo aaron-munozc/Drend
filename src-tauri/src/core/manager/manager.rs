@@ -279,7 +279,11 @@ impl TaskManager {
             .unwrap_or_else(|| "Chat Render".to_string());
 
         let task_id = self.resolve_task_id(task_id, "render");
-        self.setup_task(&task_id, TaskType::ChatRender, format!("Rendering: {}", title));
+        self.setup_task(
+            &task_id,
+            TaskType::ChatRender,
+            format!("Rendering: {}", title),
+        );
 
         let app = self.app.clone();
         let tasks = Arc::clone(&self.tasks);
@@ -327,11 +331,11 @@ impl TaskManager {
                 &args.channel_ids,
                 &args.provider_credentials,
             )
-                .await
-                .unwrap_or_else(|e| {
-                    log::warn!("[Render {}] Emote fetch failed: {}", tid, e);
-                    EmoteNameMap::new()
-                });
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("[Render {}] Emote fetch failed: {}", tid, e);
+                EmoteNameMap::new()
+            });
 
             let result = process_chat_render(
                 &app,
@@ -343,7 +347,7 @@ impl TaskManager {
                 emote_map,
                 cancel_flag,
             )
-                .await;
+            .await;
 
             Self::finalize_task(&app, &tasks, &cancellations, &event_tx, &tid, result);
         });
@@ -357,9 +361,7 @@ impl TaskManager {
     ) -> Vec<String> {
         items
             .into_iter()
-            .map(|(id, path, args, cache)| {
-                self.enqueue_chat_render(Some(id), path, args, cache)
-            })
+            .map(|(id, path, args, cache)| self.enqueue_chat_render(Some(id), path, args, cache))
             .collect()
     }
 
@@ -379,12 +381,13 @@ impl TaskManager {
 
         let title = title_opt.unwrap_or("Unknown Stream");
 
-        let task_id = task_id
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| match chat_id_opt {
-                Some(id) => format!("chat_{id}"),
-                None => format!("chat_{}", Self::timestamp_id()),
-            });
+        let task_id =
+            task_id
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| match chat_id_opt {
+                    Some(id) => format!("chat_{id}"),
+                    None => format!("chat_{}", Self::timestamp_id()),
+                });
 
         self.setup_task(&task_id, TaskType::ChatDownload, title.to_string());
 
@@ -402,21 +405,28 @@ impl TaskManager {
             };
 
             let _permit = tokio::select! {
-            permit = limits.acquire_download() => permit,
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    Self::mark_cancelled_waiting(&app, &tasks, &event_tx, &tid);
-                    return;
+                permit = limits.acquire_download() => permit,
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        Self::mark_cancelled_waiting(&app, &tasks, &event_tx, &tid);
+                        return;
+                    }
+                    limits.acquire_download().await
                 }
-                limits.acquire_download().await
-            }
-        };
+            };
 
             Self::mark_processing(&app, &tasks, &event_tx, &tid, "Connecting...");
 
-            let result =
-                Self::process_chat_inner(&app, tasks.clone(), &event_tx, &tid, meta, options, cancel_rx)
-                    .await;
+            let result = Self::process_chat_inner(
+                &app,
+                tasks.clone(),
+                &event_tx,
+                &tid,
+                meta,
+                options,
+                cancel_rx,
+            )
+            .await;
 
             Self::finalize_task(&app, &tasks, &cancellations, &event_tx, &tid, result);
         });
@@ -460,9 +470,16 @@ impl TaskManager {
 
             Self::mark_processing(&app, &tasks, &event_tx, &tid, "Starting download...");
 
-            let result =
-                Self::process_vod_inner(&app, tasks.clone(), &event_tx, &tid, url, options, cancel_rx)
-                    .await;
+            let result = Self::process_vod_inner(
+                &app,
+                tasks.clone(),
+                &event_tx,
+                &tid,
+                url,
+                options,
+                cancel_rx,
+            )
+            .await;
 
             Self::finalize_task(&app, &tasks, &cancellations, &event_tx, &tid, result);
         });
@@ -663,7 +680,10 @@ impl TaskManager {
             }
         } else {
             args.push("-f".into());
-            match (opts.video_format_id.as_deref(), opts.audio_format_id.as_deref()) {
+            match (
+                opts.video_format_id.as_deref(),
+                opts.audio_format_id.as_deref(),
+            ) {
                 (Some(vid), Some(aid)) => args.push(format!("{}+{}", vid, aid)),
                 (Some(vid), None) => args.push(vid.to_string()),
                 (None, Some(aid)) => args.push(format!("bv*+{}", aid)),

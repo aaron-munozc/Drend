@@ -14,7 +14,10 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::core::{analyze_url_core, AppTask, FrontendChatOptions, FrontendVodOptions, QueueSettings, RenderVideoArgs, TaskManager};
+use crate::core::{
+    analyze_url_core, AppTask, FrontendChatOptions, FrontendVodOptions, QueueSettings,
+    RenderVideoArgs, TaskManager,
+};
 use stream_extractor::StreamClient;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -170,22 +173,20 @@ async fn stream_task_events(
             match rx.recv().await {
                 Ok(task) => return Some((task, rx)),
                 Err(RecvError::Lagged(_)) => continue, // Automatically skip lagged frames
-                Err(RecvError::Closed) => return None,  // Channel closed, terminate stream
+                Err(RecvError::Closed) => return None, // Channel closed, terminate stream
             }
         }
     })
-        .map(|task| {
-            Ok(Event::default()
-                .json_data(&task)
-                .unwrap_or_else(|_| Event::default().comment("serialization error")))
-        });
+    .map(|task| {
+        Ok(Event::default()
+            .json_data(&task)
+            .unwrap_or_else(|_| Event::default().comment("serialization error")))
+    });
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
-async fn get_queue_settings_handler(
-    State(state): State<ServerState>,
-) -> Json<QueueSettings> {
+async fn get_queue_settings_handler(State(state): State<ServerState>) -> Json<QueueSettings> {
     Json(state.manager.get_settings())
 }
 
@@ -247,8 +248,8 @@ async fn trigger_video_download(
             &state.stream_client,
             &cache,
         )
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     let task_id = state.manager.enqueue_vod_download(
@@ -291,8 +292,8 @@ async fn trigger_chat_download(
             &state.stream_client,
             &cache,
         )
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     let stream_metadata = meta.stream_metadata.ok_or_else(|| {

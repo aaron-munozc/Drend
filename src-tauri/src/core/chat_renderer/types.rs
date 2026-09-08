@@ -66,11 +66,7 @@ pub enum LayoutToken {
 #[derive(Clone)]
 pub enum EmoteData {
     /// A single decoded Skia image. Uploaded once; zero per-frame cost.
-    Static {
-        img: Image,
-        w: i32,
-        h: i32,
-    },
+    Static { img: Image, w: i32, h: i32 },
 
     /// All GIF frames pre-decoded into Skia Images upfront.
     ///
@@ -135,7 +131,12 @@ impl EmoteData {
         match self {
             Self::Static { img, .. } => Some(img),
 
-            Self::Animated { frames, cum_durations, total_ms, .. } => {
+            Self::Animated {
+                frames,
+                cum_durations,
+                total_ms,
+                ..
+            } => {
                 if *total_ms == 0 {
                     return frames.first();
                 }
@@ -199,7 +200,9 @@ pub struct EmoteFreq {
 
 impl EmoteFreq {
     fn new() -> Self {
-        Self { count: AtomicU32::new(1) }
+        Self {
+            count: AtomicU32::new(1),
+        }
     }
     /// Increment and return the new count. Uses `Relaxed` ordering — we only
     /// need approximate frequency, not strict happens-before ordering.
@@ -285,9 +288,10 @@ impl EmoteCache {
 
         let (hot_pin_threshold, hot_tier_max) = match policy {
             EmoteCachePolicy::Standard => (u32::MAX, 0),
-            EmoteCachePolicy::HotPin { hot_pin_threshold, hot_tier_max_entries } => {
-                (*hot_pin_threshold, *hot_tier_max_entries)
-            }
+            EmoteCachePolicy::HotPin {
+                hot_pin_threshold,
+                hot_tier_max_entries,
+            } => (*hot_pin_threshold, *hot_tier_max_entries),
         };
 
         Self {
@@ -433,7 +437,11 @@ impl EmoteCache {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
             let decoded = decode_emote_bytes_to_emote_data(
-                &bytes, target_h, premultiply, &quality, eager_gif_decode,
+                &bytes,
+                target_h,
+                premultiply,
+                &quality,
+                eager_gif_decode,
             )
             .map_err(|e| AppError::EmoteCache(e.to_string()))
             .map(Arc::new);
@@ -489,7 +497,10 @@ impl EmoteCache {
 
                 if let Some(rx) = rx_opt {
                     return match rx.await {
-                        Ok(Ok(arc)) => { ec.insert(id, arc); Ok(()) }
+                        Ok(Ok(arc)) => {
+                            ec.insert(id, arc);
+                            Ok(())
+                        }
                         Ok(Err(err)) => Err(AppError::EmoteCache(err)),
                         Err(_) => Err(AppError::InternalError("inflight leader dropped".into())),
                     };
@@ -499,8 +510,13 @@ impl EmoteCache {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
                     let arc = Self::decode_bytes_rayon(
-                        bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode,
-                    ).await?;
+                        bytes,
+                        target_h,
+                        ec.quality.clone(),
+                        true,
+                        ec.eager_gif_decode,
+                    )
+                    .await?;
                     ec.write_sidecar_blocking(id, arc.width(), arc.height());
                     ec.notify_inflight(id, arc);
                     return Ok(());
@@ -540,8 +556,13 @@ impl EmoteCache {
 
                 let target_h = ec.target_height();
                 let arc = Self::decode_bytes_rayon(
-                    bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode,
-                ).await?;
+                    bytes,
+                    target_h,
+                    ec.quality.clone(),
+                    true,
+                    ec.eager_gif_decode,
+                )
+                .await?;
                 ec.write_sidecar_blocking(id, arc.width(), arc.height());
                 ec.notify_inflight(id, arc);
                 Ok(())
@@ -634,9 +655,10 @@ impl ImageCache {
 
         let (hot_pin_threshold, hot_tier_max) = match policy {
             EmoteCachePolicy::Standard => (u32::MAX, 0),
-            EmoteCachePolicy::HotPin { hot_pin_threshold, hot_tier_max_entries } => {
-                (*hot_pin_threshold, *hot_tier_max_entries)
-            }
+            EmoteCachePolicy::HotPin {
+                hot_pin_threshold,
+                hot_tier_max_entries,
+            } => (*hot_pin_threshold, *hot_tier_max_entries),
         };
 
         Self {
@@ -689,17 +711,23 @@ impl ImageCache {
         let now = Instant::now();
         let mut miss = self.missing_disk.lock();
         if let Some(&until) = miss.get(&hash) {
-            if until > now { return true; }
+            if until > now {
+                return true;
+            }
         }
         miss.pop(&hash);
         false
     }
 
     fn disk_any_path_by_hash(&self, hash: u64) -> Option<PathBuf> {
-        if self.is_missing_disk_cached(hash) { return None; }
+        if self.is_missing_disk_cached(hash) {
+            return None;
+        }
         for ext in ["png", "gif", "webp", "jpg", "jpeg", "bin"] {
             let p = self.disk_path_for_hash(hash, ext);
-            if p.exists() { return Some(p); }
+            if p.exists() {
+                return Some(p);
+            }
         }
         self.remember_missing_disk(hash);
         None
@@ -783,7 +811,11 @@ impl ImageCache {
         let (tx, rx) = oneshot::channel();
         rayon::spawn(move || {
             let decoded = decode_emote_bytes_to_emote_data(
-                &bytes, target_h, premultiply, &quality, eager_gif_decode,
+                &bytes,
+                target_h,
+                premultiply,
+                &quality,
+                eager_gif_decode,
             )
             .map_err(|e| AppError::EmoteCache(e.to_string()))
             .map(Arc::new);
@@ -796,7 +828,9 @@ impl ImageCache {
     pub(crate) async fn ensure_cached(&self, urls: &[String]) -> AppResult<()> {
         tokio::fs::create_dir_all(&self.base).await?;
 
-        if urls.is_empty() { return Ok(()); }
+        if urls.is_empty() {
+            return Ok(());
+        }
 
         let uncached: Vec<String> = urls
             .iter()
@@ -804,7 +838,9 @@ impl ImageCache {
             .cloned()
             .collect();
 
-        if uncached.is_empty() { return Ok(()); }
+        if uncached.is_empty() {
+            return Ok(());
+        }
 
         let download_limit = std::cmp::min(8usize, uncached.len().max(1));
         let download_sem = Arc::new(Semaphore::new(download_limit));
@@ -816,7 +852,9 @@ impl ImageCache {
             async move {
                 let key = ec.hash_url(&url);
 
-                if ec.get(&url).is_some() { return Ok(()); }
+                if ec.get(&url).is_some() {
+                    return Ok(());
+                }
 
                 let rx_opt = {
                     let mut infl = ec.inflight.lock();
@@ -832,7 +870,10 @@ impl ImageCache {
 
                 if let Some(rx) = rx_opt {
                     return match rx.await {
-                        Ok(Ok(arc)) => { ec.insert(key, arc); Ok(()) }
+                        Ok(Ok(arc)) => {
+                            ec.insert(key, arc);
+                            Ok(())
+                        }
                         Ok(Err(err)) => Err(AppError::EmoteCache(err)),
                         Err(_) => Err(AppError::InternalError("inflight leader dropped".into())),
                     };
@@ -842,8 +883,13 @@ impl ImageCache {
                     let target_h = ec.target_height();
                     let bytes = tokio::fs::read(&path).await?;
                     let arc = Self::decode_bytes_rayon(
-                        bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode,
-                    ).await?;
+                        bytes,
+                        target_h,
+                        ec.quality.clone(),
+                        true,
+                        ec.eager_gif_decode,
+                    )
+                    .await?;
                     let (w, h) = (arc.width(), arc.height());
                     ec.store_sidecar_blocking(key, w, h);
                     ec.notify_inflight(key, arc);
@@ -883,8 +929,13 @@ impl ImageCache {
 
                 let target_h = ec.target_height();
                 let arc = Self::decode_bytes_rayon(
-                    bytes, target_h, ec.quality.clone(), true, ec.eager_gif_decode,
-                ).await?;
+                    bytes,
+                    target_h,
+                    ec.quality.clone(),
+                    true,
+                    ec.eager_gif_decode,
+                )
+                .await?;
                 let (w, h) = (arc.width(), arc.height());
                 ec.store_sidecar_blocking(key, w, h);
                 ec.notify_inflight(key, arc);
@@ -894,7 +945,9 @@ impl ImageCache {
 
         let results: Vec<Result<(), AppError>> =
             stream.buffer_unordered(download_limit).collect().await;
-        for r in results { r?; }
+        for r in results {
+            r?;
+        }
         Ok(())
     }
 
@@ -902,14 +955,18 @@ impl ImageCache {
         self.insert(key, arc.clone());
         let mut infl = self.inflight.lock();
         if let Some(waiters) = infl.remove(&key) {
-            for tx in waiters { let _ = tx.send(Ok(arc.clone())); }
+            for tx in waiters {
+                let _ = tx.send(Ok(arc.clone()));
+            }
         }
     }
 
     fn fail_inflight(&self, key: u64, msg: String) {
         let mut infl = self.inflight.lock();
         if let Some(waiters) = infl.remove(&key) {
-            for tx in waiters { let _ = tx.send(Err(msg.clone())); }
+            for tx in waiters {
+                let _ = tx.send(Err(msg.clone()));
+            }
         }
     }
 }

@@ -1,4 +1,6 @@
-use crate::core::chat_renderer::args::{ChannelIdentifiers, EmoteProviderFlags, ProviderCredentials};
+use crate::core::chat_renderer::args::{
+    ChannelIdentifiers, EmoteProviderFlags, ProviderCredentials,
+};
 use crate::core::chat_renderer::regex::{text_may_have_kick_emote, EMOTE_REGEX};
 use crate::types::AppResult;
 use rustc_hash::FxHashMap;
@@ -77,14 +79,25 @@ struct TwitchEmote {
 impl TwitchEmote {
     /// Build the best CDN URL for this emote (animated > static, dark > light, 2× > 1×).
     fn cdn_url(&self) -> String {
-        let format = if self.format.iter().any(|f| f == "animated") { "animated" } else { "static" };
-        let theme = if self.theme_mode.iter().any(|t| t == "dark") { "dark" } else { "light" };
+        let format = if self.format.iter().any(|f| f == "animated") {
+            "animated"
+        } else {
+            "static"
+        };
+        let theme = if self.theme_mode.iter().any(|t| t == "dark") {
+            "dark"
+        } else {
+            "light"
+        };
         let scale = if self.scale.iter().any(|s| s == "2.0") {
             "2.0"
         } else {
             self.scale.first().map(|s| s.as_str()).unwrap_or("2.0")
         };
-        format!("https://static-cdn.jtvnw.net/emoticons/v2/{}/{}/{}/{}", self.id, format, theme, scale)
+        format!(
+            "https://static-cdn.jtvnw.net/emoticons/v2/{}/{}/{}/{}",
+            self.id, format, theme, scale
+        )
     }
 }
 
@@ -163,43 +176,57 @@ impl EmoteNameMap {
         let twitch_id = channel_ids.twitch_id.as_deref().unwrap_or("");
 
         let seven_tv_fut = async {
-            if !flags.seven_tv { return vec![]; }
+            if !flags.seven_tv {
+                return vec![];
+            }
             if twitch_id.is_empty() {
                 log::warn!("[emotes] 7TV: channel_ids.twitch_id not set — skipping");
                 return vec![];
             }
-            Self::fetch_7tv(client, twitch_id).await.unwrap_or_else(|e| {
-                log::warn!("[emotes] 7TV fetch error: {}", e);
-                vec![]
-            })
+            Self::fetch_7tv(client, twitch_id)
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("[emotes] 7TV fetch error: {}", e);
+                    vec![]
+                })
         };
 
         let bttv_fut = async {
-            if !flags.bttv { return vec![]; }
+            if !flags.bttv {
+                return vec![];
+            }
             if twitch_id.is_empty() {
                 log::warn!("[emotes] BTTV: channel_ids.twitch_id not set — skipping");
                 return vec![];
             }
-            Self::fetch_bttv(client, twitch_id).await.unwrap_or_else(|e| {
-                log::warn!("[emotes] BTTV fetch error: {}", e);
-                vec![]
-            })
+            Self::fetch_bttv(client, twitch_id)
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("[emotes] BTTV fetch error: {}", e);
+                    vec![]
+                })
         };
 
         let ffz_fut = async {
-            if !flags.ffz { return vec![]; }
+            if !flags.ffz {
+                return vec![];
+            }
             if twitch_id.is_empty() {
                 log::warn!("[emotes] FFZ: channel_ids.twitch_id not set — skipping");
                 return vec![];
             }
-            Self::fetch_ffz(client, twitch_id).await.unwrap_or_else(|e| {
-                log::warn!("[emotes] FFZ fetch error: {}", e);
-                vec![]
-            })
+            Self::fetch_ffz(client, twitch_id)
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("[emotes] FFZ fetch error: {}", e);
+                    vec![]
+                })
         };
 
         let twitch_fut = async {
-            if !flags.twitch_global { return (Vec::new(), Vec::new()); }
+            if !flags.twitch_global {
+                return (Vec::new(), Vec::new());
+            }
             let token = credentials.twitch_token.as_deref().unwrap_or("");
             let client_id = credentials.twitch_client_id.as_deref().unwrap_or("");
             if token.is_empty() || client_id.is_empty() {
@@ -226,11 +253,21 @@ impl EmoteNameMap {
 
         // Insertion order determines last-writer-wins priority:
         //   7TV → BTTV → FFZ → TwitchGlobal → TwitchChannel
-        if !seven_tv_emotes.is_empty() { map.add_7tv(&seven_tv_emotes); }
-        if !bttv_emotes.is_empty() { map.add_bttv(&bttv_emotes); }
-        if !ffz_emotes.is_empty() { map.add_ffz(&ffz_emotes); }
-        if !twitch_global.is_empty() { map.add_twitch(&twitch_global, EmoteProvider::TwitchGlobal); }
-        if !twitch_channel.is_empty() { map.add_twitch(&twitch_channel, EmoteProvider::TwitchChannel); }
+        if !seven_tv_emotes.is_empty() {
+            map.add_7tv(&seven_tv_emotes);
+        }
+        if !bttv_emotes.is_empty() {
+            map.add_bttv(&bttv_emotes);
+        }
+        if !ffz_emotes.is_empty() {
+            map.add_ffz(&ffz_emotes);
+        }
+        if !twitch_global.is_empty() {
+            map.add_twitch(&twitch_global, EmoteProvider::TwitchGlobal);
+        }
+        if !twitch_channel.is_empty() {
+            map.add_twitch(&twitch_channel, EmoteProvider::TwitchChannel);
+        }
 
         Ok(map)
     }
@@ -247,20 +284,45 @@ impl EmoteNameMap {
         channel_id: &str,
     ) -> Result<Vec<(String, String, bool)>, reqwest::Error> {
         let url = format!("https://7tv.io/v3/users/twitch/{}", channel_id);
-        let res: SevenTvResponse = client.get(&url).send().await?.error_for_status()?.json().await?;
-        Ok(res.emote_set.emotes.into_iter().map(|e| {
-            let is_zero_width = (e.data.flags & 256) != 0;
-            (e.name, e.id, is_zero_width)
-        }).collect())
+        let res: SevenTvResponse = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(res
+            .emote_set
+            .emotes
+            .into_iter()
+            .map(|e| {
+                let is_zero_width = (e.data.flags & 256) != 0;
+                (e.name, e.id, is_zero_width)
+            })
+            .collect())
     }
 
     async fn fetch_bttv(
         client: &reqwest::Client,
         channel_id: &str,
     ) -> Result<Vec<(String, String, bool)>, reqwest::Error> {
-        let url = format!("https://api.betterttv.net/3/cached/users/twitch/{}", channel_id);
-        let res: BttvResponse = client.get(&url).send().await?.error_for_status()?.json().await?;
-        Ok(res.channel_emotes.into_iter().chain(res.shared_emotes).map(|e| (e.code, e.id, false)).collect())
+        let url = format!(
+            "https://api.betterttv.net/3/cached/users/twitch/{}",
+            channel_id
+        );
+        let res: BttvResponse = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(res
+            .channel_emotes
+            .into_iter()
+            .chain(res.shared_emotes)
+            .map(|e| (e.code, e.id, false))
+            .collect())
     }
 
     async fn fetch_ffz(
@@ -268,8 +330,19 @@ impl EmoteNameMap {
         channel_id: &str,
     ) -> Result<Vec<(String, String)>, reqwest::Error> {
         let url = format!("https://api.frankerfacez.com/v1/room/id/{}", channel_id);
-        let res: FfzResponse = client.get(&url).send().await?.error_for_status()?.json().await?;
-        Ok(res.sets.into_values().flat_map(|s| s.emoticons).map(|e| (e.name, e.id.to_string())).collect())
+        let res: FfzResponse = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(res
+            .sets
+            .into_values()
+            .flat_map(|s| s.emoticons)
+            .map(|e| (e.name, e.id.to_string()))
+            .collect())
     }
 
     async fn fetch_twitch_global(
@@ -281,7 +354,11 @@ impl EmoteNameMap {
             .get("https://api.twitch.tv/helix/chat/emotes/global")
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Client-Id", client_id)
-            .send().await?.error_for_status()?.json().await?;
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(res.data)
     }
 
@@ -296,7 +373,11 @@ impl EmoteNameMap {
             .query(&[("broadcaster_id", channel_id)])
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Client-Id", client_id)
-            .send().await?.error_for_status()?.json().await?;
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(res.data)
     }
 
@@ -305,52 +386,70 @@ impl EmoteNameMap {
     pub fn add_7tv(&mut self, entries: &[(String, String, bool)]) {
         self.map.reserve(entries.len());
         for (name, id, zero_width) in entries {
-            self.map.insert(name.clone(), EmoteEntry {
-                emote: ResolvedEmote {
-                    url: Arc::from(format!("https://cdn.7tv.app/emote/{}/2x.webp", id).as_str()),
-                    zero_width: *zero_width,
+            self.map.insert(
+                name.clone(),
+                EmoteEntry {
+                    emote: ResolvedEmote {
+                        url: Arc::from(
+                            format!("https://cdn.7tv.app/emote/{}/2x.webp", id).as_str(),
+                        ),
+                        zero_width: *zero_width,
+                    },
+                    provider: EmoteProvider::SevenTv,
                 },
-                provider: EmoteProvider::SevenTv,
-            });
+            );
         }
     }
 
     pub fn add_bttv(&mut self, entries: &[(String, String, bool)]) {
         self.map.reserve(entries.len());
         for (name, hash, zero_width) in entries {
-            self.map.insert(name.clone(), EmoteEntry {
-                emote: ResolvedEmote {
-                    url: Arc::from(format!("https://cdn.betterttv.net/emote/{}/2x", hash).as_str()),
-                    zero_width: *zero_width,
+            self.map.insert(
+                name.clone(),
+                EmoteEntry {
+                    emote: ResolvedEmote {
+                        url: Arc::from(
+                            format!("https://cdn.betterttv.net/emote/{}/2x", hash).as_str(),
+                        ),
+                        zero_width: *zero_width,
+                    },
+                    provider: EmoteProvider::Bttv,
                 },
-                provider: EmoteProvider::Bttv,
-            });
+            );
         }
     }
 
     pub fn add_ffz(&mut self, entries: &[(String, String)]) {
         self.map.reserve(entries.len());
         for (name, id) in entries {
-            self.map.insert(name.clone(), EmoteEntry {
-                emote: ResolvedEmote {
-                    url: Arc::from(format!("https://cdn.frankerfacez.com/emoticon/{}/2", id).as_str()),
-                    zero_width: false,
+            self.map.insert(
+                name.clone(),
+                EmoteEntry {
+                    emote: ResolvedEmote {
+                        url: Arc::from(
+                            format!("https://cdn.frankerfacez.com/emoticon/{}/2", id).as_str(),
+                        ),
+                        zero_width: false,
+                    },
+                    provider: EmoteProvider::Ffz,
                 },
-                provider: EmoteProvider::Ffz,
-            });
+            );
         }
     }
 
     pub fn add_twitch(&mut self, entries: &[TwitchEmote], provider: EmoteProvider) {
         self.map.reserve(entries.len());
         for emote in entries {
-            self.map.insert(emote.name.clone(), EmoteEntry {
-                emote: ResolvedEmote {
-                    url: Arc::from(emote.cdn_url().as_str()),
-                    zero_width: false,
+            self.map.insert(
+                emote.name.clone(),
+                EmoteEntry {
+                    emote: ResolvedEmote {
+                        url: Arc::from(emote.cdn_url().as_str()),
+                        zero_width: false,
+                    },
+                    provider,
                 },
-                provider,
-            });
+            );
         }
     }
 
@@ -373,7 +472,11 @@ impl EmoteNameMap {
             EmoteProvider::Ffz => flags.ffz,
             EmoteProvider::TwitchGlobal | EmoteProvider::TwitchChannel => flags.twitch_global,
         };
-        if allowed { Some(entry.emote.clone()) } else { None }
+        if allowed {
+            Some(entry.emote.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -391,7 +494,9 @@ pub enum MessageToken<'a> {
     Text(&'a str),
     /// Kick platform emote — `id` is pre-parsed at tokenisation time so
     /// `layout_message_blocking` never calls `.parse::<i32>()` at all.
-    KickEmote { id: i32 },
+    KickEmote {
+        id: i32,
+    },
     /// A resolved third-party emote (7TV / BTTV / FFZ / Twitch).
     ProviderEmote(ResolvedEmote),
 }
@@ -438,7 +543,14 @@ pub fn tokenise<'a>(
     // Fast path: no Kick emote tags — word-split only.
     if !has_kick {
         let mut tokens = Vec::with_capacity(8);
-        push_text_segment(text, emote_map, &mut last_word, &mut last_resolution, &mut word_cache, &mut tokens);
+        push_text_segment(
+            text,
+            emote_map,
+            &mut last_word,
+            &mut last_resolution,
+            &mut word_cache,
+            &mut tokens,
+        );
         return tokens;
     }
 
@@ -582,7 +694,11 @@ fn push_word_cached<'a>(
 
     // Level 3: global emote map probe.
     let resolved = map_flags.and_then(|(m, f)| {
-        if f.any_name_provider_enabled() { m.lookup(word, f) } else { None }
+        if f.any_name_provider_enabled() {
+            m.lookup(word, f)
+        } else {
+            None
+        }
     });
 
     word_cache.insert(word, resolved.clone());

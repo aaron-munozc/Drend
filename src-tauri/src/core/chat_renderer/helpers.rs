@@ -163,7 +163,10 @@ fn skia_image_from_rgba(pixels: &[u8], w: u32, h: u32, alpha_type: AlphaType) ->
         pixels.len(),
         (w * h * 4) as usize,
         "pixel buffer size mismatch: expected {}×{}×4 = {} bytes, got {}",
-        w, h, w * h * 4, pixels.len()
+        w,
+        h,
+        w * h * 4,
+        pixels.len()
     );
     let data = Data::new_copy(pixels);
     let info = ImageInfo::new((w as i32, h as i32), ColorType::RGBA8888, alpha_type, None);
@@ -206,7 +209,11 @@ pub fn decode_emote_bytes_to_emote_data(
     quality: &QualityPreset,
     eager_gif_decode: bool,
 ) -> AppResult<EmoteData> {
-    let alpha_type = if premultiply { AlphaType::Premul } else { AlphaType::Unpremul };
+    let alpha_type = if premultiply {
+        AlphaType::Premul
+    } else {
+        AlphaType::Unpremul
+    };
     let filter = quality_to_filter(quality);
 
     match guess_ext(bytes) {
@@ -243,7 +250,9 @@ fn decode_gif_lazy(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppRes
 
     let (src_w, src_h) = first.buffer().dimensions();
     if src_w == 0 || src_h == 0 {
-        return Err(AppError::EmoteCache("LazyGif: zero-sized first frame".into()));
+        return Err(AppError::EmoteCache(
+            "LazyGif: zero-sized first frame".into(),
+        ));
     }
 
     let scale = target_h as f32 / src_h as f32;
@@ -255,7 +264,11 @@ fn decode_gif_lazy(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppRes
 
     let first_delay = {
         let (n, d) = first.delay().numer_denom_ms();
-        if d != 0 { (n / d).max(10) } else { n.max(10) }
+        if d != 0 {
+            (n / d).max(10)
+        } else {
+            n.max(10)
+        }
     };
     cum_durations.push(first_delay);
     let mut current_cum = first_delay;
@@ -311,7 +324,9 @@ pub fn decode_gif_to_skia_frames(
     let frames = decoder.into_frames().collect_frames()?;
 
     if frames.is_empty() {
-        return Err(AppError::EmoteCache("LazyGif decoded to zero frames".into()));
+        return Err(AppError::EmoteCache(
+            "LazyGif decoded to zero frames".into(),
+        ));
     }
 
     // Phase 1: decode + resize on rayon workers.
@@ -326,7 +341,8 @@ pub fn decode_gif_to_skia_frames(
                 return None;
             }
             // GIF-specific: always Nearest to avoid palette fringing.
-            let resized = resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
+            let resized =
+                resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
             let (rw, rh) = resized.dimensions();
             Some((rw, rh, resized.into_rgba8().into_raw()))
         })
@@ -341,7 +357,9 @@ pub fn decode_gif_to_skia_frames(
     }
 
     if skia_frames.is_empty() {
-        return Err(AppError::EmoteCache("LazyGif: Skia rejected all frames".into()));
+        return Err(AppError::EmoteCache(
+            "LazyGif: Skia rejected all frames".into(),
+        ));
     }
 
     Ok(Arc::from(skia_frames))
@@ -375,16 +393,21 @@ fn decode_gif(bytes: &[u8], target_h: u32, alpha_type: AlphaType) -> AppResult<E
 
             let dyn_frame = DynamicImage::ImageRgba8(frame.into_buffer());
             let (orig_w, orig_h) = dyn_frame.dimensions();
-            if orig_w == 0 || orig_h == 0 { return None; }
+            if orig_w == 0 || orig_h == 0 {
+                return None;
+            }
 
-            let resized = resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
+            let resized =
+                resize_dynamic_image_preserve_aspect(dyn_frame, target_h, FilterType::Nearest);
             let (rw, rh) = resized.dimensions();
             Some((delay_ms, rw, rh, resized.into_rgba8().into_raw()))
         })
         .collect();
 
     if processed.is_empty() {
-        return Err(AppError::EmoteCache("GIF decoded to zero valid frames".into()));
+        return Err(AppError::EmoteCache(
+            "GIF decoded to zero valid frames".into(),
+        ));
     }
 
     // Phase 2: build Skia images sequentially + compute cumulative timing.
@@ -442,7 +465,9 @@ fn decode_static(
 
     let (orig_w, orig_h) = dyn_img.dimensions();
     if orig_w == 0 || orig_h == 0 {
-        return Err(AppError::EmoteCache("emote decoded to zero-size image".into()));
+        return Err(AppError::EmoteCache(
+            "emote decoded to zero-size image".into(),
+        ));
     }
 
     let resized = if orig_h == target_h {
@@ -460,5 +485,9 @@ fn decode_static(
     let img = skia_image_from_rgba(rgba.as_raw(), rw, rh, alpha_type)
         .ok_or_else(|| AppError::EmoteCache("Skia rejected valid RGBA buffer".into()))?;
 
-    Ok(EmoteData::Static { img, w: rw as i32, h: rh as i32 })
+    Ok(EmoteData::Static {
+        img,
+        w: rw as i32,
+        h: rh as i32,
+    })
 }

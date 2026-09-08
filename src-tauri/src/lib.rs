@@ -1,14 +1,10 @@
-use std::fs;
 use crate::core::{
-    analyze_url, get_download_queue,
-    queue_chat_download, queue_chat_render,
-    queue_vod_download, cancel_task,
-    update_queue_settings,
-    get_queue_settings,
-    queue_batch_chat_render,
+    analyze_url, cancel_task, get_download_queue, get_queue_settings, queue_batch_chat_render,
+    queue_chat_download, queue_chat_render, queue_vod_download, update_queue_settings,
 };
 use crate::types::Metadata;
 use lru::LruCache;
+use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Mutex;
@@ -28,8 +24,6 @@ pub struct AppCache {
     pub streams: Mutex<LruCache<String, Metadata>>,
 }
 
-
-
 #[tauri::command]
 fn read_directory_files(path: String) -> Result<Vec<String>, String> {
     let dir = Path::new(&path);
@@ -42,14 +36,13 @@ fn read_directory_files(path: String) -> Result<Vec<String>, String> {
         return Err(format!("Path is not a directory: {}", path));
     }
 
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read directory '{}': {}", path, e))?;
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("Failed to read directory '{}': {}", path, e))?;
 
     let mut files = Vec::new();
 
     for entry in entries {
-        let entry = entry
-            .map_err(|e| format!("Failed to read directory entry: {}", e))?;
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
 
         let entry_path = entry.path();
 

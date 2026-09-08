@@ -120,7 +120,6 @@ pub struct YtDlpMetadata {
     // repost_count intentionally omitted — too platform-specific (Twitter/X,
     // SoundCloud) and not meaningful enough across yt-dlp's extractor surface
     // to expose to the frontend.
-
     pub timestamp: Option<f64>,
     pub upload_date: Option<String>,
     pub live_status: Option<String>,

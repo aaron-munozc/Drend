@@ -1,12 +1,14 @@
 use crate::core::chat_renderer::RenderVideoArgs;
 
+use crate::core::manager::manager::{
+    BatchRenderItem, FrontendChatOptions, FrontendVodOptions, QueueSettings,
+};
 use crate::core::{AppTask, TaskManager};
 use crate::error::AppError;
 use crate::types::{AppResult, Metadata};
 use crate::AppCache;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
-use crate::core::manager::manager::{BatchRenderItem, FrontendChatOptions, FrontendVodOptions, QueueSettings};
 
 #[tauri::command]
 pub async fn queue_chat_download(
@@ -95,18 +97,13 @@ pub async fn get_download_queue(manager: State<'_, TaskManager>) -> AppResult<Ve
 }
 
 #[tauri::command]
-pub async fn cancel_task(
-    manager: State<'_, TaskManager>,
-    task_id: String,
-) -> AppResult<()> {
+pub async fn cancel_task(manager: State<'_, TaskManager>, task_id: String) -> AppResult<()> {
     manager.cancel_task(&task_id).map_err(AppError::Generic)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_queue_settings(
-    manager: State<'_, TaskManager>,
-) -> AppResult<QueueSettings> {
+pub async fn get_queue_settings(manager: State<'_, TaskManager>) -> AppResult<QueueSettings> {
     Ok(manager.get_settings())
 }
 

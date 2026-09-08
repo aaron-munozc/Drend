@@ -16,19 +16,39 @@ pub struct ObjectColor {
 impl ObjectColor {
     #[inline(always)]
     pub fn black() -> Self {
-        Self { alpha: 255, red: 20, green: 20, blue: 20 }
+        Self {
+            alpha: 255,
+            red: 20,
+            green: 20,
+            blue: 20,
+        }
     }
     #[inline(always)]
     pub fn white() -> Self {
-        Self { alpha: 255, red: 240, green: 240, blue: 240 }
+        Self {
+            alpha: 255,
+            red: 240,
+            green: 240,
+            blue: 240,
+        }
     }
     #[inline(always)]
     pub fn solid_black() -> Self {
-        Self { alpha: 255, red: 0, green: 0, blue: 0 }
+        Self {
+            alpha: 255,
+            red: 0,
+            green: 0,
+            blue: 0,
+        }
     }
     #[inline(always)]
     pub fn highlight_gold() -> Self {
-        Self { alpha: 255, red: 255, green: 215, blue: 0 }
+        Self {
+            alpha: 255,
+            red: 255,
+            green: 215,
+            blue: 0,
+        }
     }
 }
 
